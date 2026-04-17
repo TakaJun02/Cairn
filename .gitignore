@@ -30,3 +30,4 @@ plugins/lorart/dist/
 
 backend/logs/
 OC_guidanceLLM/
+.codex
