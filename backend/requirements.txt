@@ -1,6 +1,6 @@
 # =========================
 # Backend unified requirements.txt
-# Python 3.11 / FastAPI + PostGIS + RAG + Ollama
+# Python 3.11 / FastAPI + PostGIS + RAG + vLLM (OpenAI互換API)
 # =========================
 
 # --- Web API ---
@@ -39,8 +39,8 @@ chromadb==0.6.3          # サーバはコンテナ，クライアントはPytho
 python-frontmatter       # import frontmatter
 PyYAML>=6.0.1
 
-# --- LLM / Embeddings client ---
-ollama                   # Pythonクライアント（OLLAMA_API_URLで接続）
+# --- LLM ---
+# テキスト生成は vLLM の OpenAI互換API (.env の Inference_server) を httpx で直接叩く
 langgraph>=0.0.40,<0.1
 
 # --- Optional: polyline decode（OSRMをpolylineで受ける場合のみ） ---
@@ -49,10 +49,6 @@ polyline
 # --- Logging / Retry（必要に応じて） ---
 loguru>=0.7.2
 tenacity>=8.3.0
-
-# ========== 将来Celeryに切替える場合（今は不要ならコメントのまま） ==========
-celery[redis]==5.4.0
-redis>=5.0.0
 
 pyproj>=3.5,<3.7
 

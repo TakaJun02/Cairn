@@ -3,7 +3,7 @@ services:
   chromadb:
     image: chromadb/chroma:0.6.3   # バージョンを明示推奨
     ports:
-      - "8000:8000"
+      - "8001:8000"   # ホスト8000はvLLMが使用するため8001に公開
     volumes:
       - chromadb_data:/chroma/chroma  # データ永続化フォルダ
     environment:
@@ -165,11 +165,6 @@ services:
     depends_on:
       - api
 
-  redis:
-    image: redis:7.2-alpine
-    ports: ["6379:6379"]
-    restart: unless-stopped
-
   # === Worker側のマイクロサービス===
   svc-routing:
     build: { context: ., dockerfile: ./backend/Dockerfile }
@@ -196,9 +191,11 @@ services:
     command: bash -lc "uvicorn backend.worker.app.services.llm.main:app --host 0.0.0.0 --port 9103"
     environment:
       KNOWLEDGE_DIR: /app/backend/worker/data/knowledge
-      OLLAMA_URL: http://ollama-generation:11434
-      COLLECTION_PREFIX: guidance_
-    volumes: 
+      # コンテナ内からホストのvLLMへ (.env の 127.0.0.1 はコンテナ内では自分自身を指すため上書き)
+      Inference_server: http://host.docker.internal:8000/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
       - ./backend:/app/backend
       - ./backend/worker/data:/app/backend/worker/data:ro
     ports: ["9103:9103"]
@@ -231,7 +228,7 @@ services:
     volumes:
       - ./backend:/app/backend
       - /var/www/packs:/packs
-    depends_on: [svc-routing, svc-alongpoi, svc-llm, svc-voice, redis]
+    depends_on: [svc-routing, svc-alongpoi, svc-llm, svc-voice]
     ports: ["9100:9100"]
 
   # === AI Agent Service ===
@@ -240,13 +237,16 @@ services:
     command: bash -lc "uvicorn backend.worker.agent_app.api:app --host 0.0.0.0 --port 9200"
     env_file:
       - .env
+    environment:
+      # コンテナ内からホストのvLLMへ (.env の 127.0.0.1 はコンテナ内では自分自身を指すため上書き)
+      Inference_server: http://host.docker.internal:8000/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./backend:/app/backend
     depends_on:
       - app-db
-      - redis
       - chromadb
-      # Celery workers are on another machine, so no depends_on
     ports: ["9200:9200"]
     restart: unless-stopped
   

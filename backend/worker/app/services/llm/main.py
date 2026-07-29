@@ -1,44 +1,33 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
-from backend.worker.celery_app import celery_app
-from backend.worker.app.services.llm.tasks import DescribeRequest, DescribeResponse
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
+
+from fastapi import FastAPI, HTTPException
+
+from backend.worker.app.services.llm.describe import describe_job
+from backend.worker.app.services.llm.schemas import DescribeRequest, DescribeResponse
 
 logger = logging.getLogger(__name__)
 
+# vLLMは継続バッチングで並行リクエストを捌けるため、ジョブは並列で投げる
+MAX_CONCURRENCY = int(os.getenv("LLM_DESCRIBE_CONCURRENCY", "4"))
+
 app = FastAPI(title="llm service")
 
+
 @app.post("/describe", response_model=DescribeResponse)
-def describe_endpoint(req: DescribeRequest):
-    """
-    Accepts a description request, forwards it to a Celery worker,
-    and waits for the result.
-    """
-    async_results = []
+def describe_endpoint(req: DescribeRequest) -> DescribeResponse:
+    """スポットごとのナレーション生成をvLLMに投げ、結果をまとめて返す。"""
     try:
-        for job in req.jobs:
-            payload = {
-                "job_id": job.job_id,
-                "spot": job.spot.model_dump(),
-                "language": req.language,
-            }
-            async_results.append(
-                celery_app.send_task(
-                    "llm.describe_job",
-                    args=[payload],
-                    queue="generation",
-                )
-            )
-
-        items = []
-        for ar in async_results:
-            items.append(ar.get(timeout=3000))
-
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
+            items = list(executor.map(lambda job: describe_job(job, req.language), req.jobs))
         return DescribeResponse(items=items)
     except Exception as e:
-        logger.exception("Failed to get result from Celery tasks")
+        logger.exception("Failed to generate descriptions")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/health")
 def health():

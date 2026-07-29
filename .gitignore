@@ -6,7 +6,6 @@ __pycache__/
 *.pyc
 
 # Dockerが生成するファイルを無視する
-ollama_data/
 packs/
 
 .env*

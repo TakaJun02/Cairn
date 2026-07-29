@@ -12,9 +12,8 @@ router = APIRouter()
 @router.post("/route", response_model=RoutePlanResponse, status_code=status.HTTP_200_OK)
 def create_route_plan(req: RoutePlanRequest):
     """
-    【新規】経路計画エンドポイント。
-    - Routingサービスに直接リクエストを転送し、同期的に結果を返す。
-    - Celeryタスクは使わない。
+    経路計画エンドポイント。
+    Routingサービスに直接リクエストを転送し、同期的に結果を返す。
     """
     try:
         # Routingサービスへのリクエストボディを作成

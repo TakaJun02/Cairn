@@ -2,7 +2,7 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from worker.app_db_models import User, Conversation, LanguageEnum, SpotRealtime
+from backend.worker.app_db_models import User, Conversation, LanguageEnum, SpotRealtime
 
 # 環境変数からデータベース接続情報を取得
 DB_USER = os.getenv("APP_DB_USER", "app_user")

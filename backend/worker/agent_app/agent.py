@@ -12,7 +12,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from . import db_client
 from . import recommender
 from . import vector_store_client
-from .llm_tasks import generate_text
+from backend.worker.llm_client import generate_text
 from .prompts import (
     get_intent_parser_prompt,
     get_intent_parser_retry_prompt,
@@ -769,6 +769,9 @@ def _strip_llm_artifacts(text: str) -> str:
     text = text.strip()
     if text.startswith("<json>") and text.endswith("</json>"):
         text = text[len("<json>"):-len("</json>")].strip()
+    fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, flags=re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1).strip()
     return text
 
 
@@ -806,11 +809,10 @@ def _extract_profile_from_text(user_input: str, awaiting_fields: List[str], lang
         lines.append(focus_clause)
     user_prompt = "\n".join(lines)
 
-    task = generate_text.delay(system_prompt, user_prompt)
     try:
-        raw_response = task.get(timeout=180)
+        raw_response = generate_text(system_prompt, user_prompt, temperature=0.0, json_mode=True)
     except Exception as exc:
-        print(f"[WARN] profile extractor timeout/error: {exc}")
+        print(f"[WARN] profile extractor failed: {exc}")
         return {}
 
     cleaned = _strip_llm_artifacts(raw_response)
@@ -857,10 +859,8 @@ def _generate_profile_question(fields: List[str], language: Optional[str]) -> st
         return locale["question_fallback"]
     system_prompt = get_profile_question_prompt(language)
     user_prompt = json.dumps({"missing_fields": fields}, ensure_ascii=False)
-    task = generate_text.delay(system_prompt, user_prompt)
     try:
-        text = task.get(timeout=180)
-        text = text.strip()
+        text = generate_text(system_prompt, user_prompt).strip()
         if text:
             return text
     except Exception as exc:
@@ -1142,13 +1142,17 @@ def parse_intent(state: AgentState):
             prompt_to_send = f"""{retry_instruction}
 {base_prompt}"""
 
-        task = generate_text.delay(
-            system_prompt,
-            prompt_to_send,
-            options={"temperature": 0.0},
-            response_format="json",
-        )
-        model_output = task.get(timeout=180)
+        try:
+            model_output = generate_text(
+                system_prompt,
+                prompt_to_send,
+                temperature=0.0,
+                json_mode=True,
+            )
+        except Exception as exc:
+            print(f"[ERROR] Intent parser LLM call failed (attempt {attempt + 1}): {exc}")
+            continue
+
         last_output = model_output
         parsed_intent = _parse_intent_payload(model_output)
         if parsed_intent:
@@ -1188,16 +1192,21 @@ def get_recommendations(state: AgentState):
     print(f"[Recommender] Output: {recs}")
     return {"recommendations": recs}
 
+LLM_ERROR_MESSAGES = {
+    "ja": "申し訳ありません、現在AIアシスタントでエラーが発生しています。しばらくしてからもう一度お試しください。",
+    "en": "We're sorry—the AI assistant is currently experiencing an error. Please try again shortly.",
+    "zh": "非常抱歉，AI助手目前出现错误，请稍后再试。",
+}
+
+
 def generate_response(state: AgentState):
     print("--- Node: generate_response ---")
     system_prompt = get_response_generator_prompt(state)
-    task = generate_text.delay(system_prompt, state['user_input'], state['chat_history'])
-    response_text = task.get(timeout=180)
-
-    def _remove_think_blocks(text: str) -> str:
-        if not text:
-            return text
-        return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    try:
+        response_text = generate_text(system_prompt, state['user_input'], state['chat_history'])
+    except Exception as exc:
+        print(f"[ERROR] Response generation failed: {exc}")
+        return {"response_text": LLM_ERROR_MESSAGES[_select_language(state.get("language"))]}
 
     cleaned_response = _remove_think_blocks(response_text)
     cleaned_response = _replace_spot_ids_with_names(cleaned_response, state.get("language"))

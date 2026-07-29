@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import os
-from typing import Dict, List
+from typing import Dict
 
-from backend.worker.app.services.llm import retriever, prompt as prompt_mod, ollama
+from backend.worker import llm_client
+from backend.worker.app.services.llm import retriever, prompt as prompt_mod
 
 
 def retrieve_context(spot_ref: Dict, lang: str):
@@ -12,9 +12,8 @@ def retrieve_context(spot_ref: Dict, lang: str):
 
 
 def generate_text(prompt: str) -> str:
-    # Ollama で生成
-    model = os.getenv("OLLAMA_GENERATION_MODEL") or ollama.DEFAULT_MODEL
-    return ollama.generate(prompt, model=model)
+    # vLLM (OpenAI互換API) で生成
+    return llm_client.chat([{"role": "user", "content": prompt}])
 
 
 def generate_for_spot(spot: Dict, lang: str, style: str = "narration") -> str:

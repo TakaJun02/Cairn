@@ -62,7 +62,7 @@ CONDITION_HINTS = {
 # 通常のガイダンスプロンプトのテンプレート
 GUIDANCE_PROMPT_TEMPLATES = {
     "ja": """
-[LANGUAGE={lang}|{lang_label}] [STYLE=guidance]
+[LANGUAGE={lang}|{lang_label}] [STYLE={style}]
 あなたは鳥海山エリアを訪れる観光客向けのプロのツアーガイドです。
 
 スポット名: {name}
@@ -81,7 +81,7 @@ GUIDANCE_PROMPT_TEMPLATES = {
 {safety_footer}
 """.strip(),
     "en": """
-[LANGUAGE={lang}|{lang_label}] [STYLE=guidance]
+[LANGUAGE={lang}|{lang_label}] [STYLE={style}]
 You are a professional tour guide for tourists visiting the Mount Chokai area.
 
 Spot Name: {name}
@@ -100,7 +100,7 @@ Constraints:
 {safety_footer}
 """.strip(),
     "zh": """
-[LANGUAGE={lang}|{lang_label}] [STYLE=guidance]
+[LANGUAGE={lang}|{lang_label}] [STYLE={style}]
 你是一位为游览鸟海山地区的游客服务的专业导游。
 
 景点名称: {name}
@@ -187,7 +187,7 @@ def _join_context(ctx: List[Dict], max_chars: int = 8000) -> str:
     return "\n\n".join(texts)
 
 
-def build_prompt(spot: Dict, ctx: List[Dict], lang: str,) -> str:
+def build_prompt(spot: Dict, ctx: List[Dict], lang: str, style: str = "narration") -> str:
     """
     音声ナレーション向けのプロンプトを構築。
     spot辞書に situation が含まれるかで、生成するプロンプトを切り替える。
@@ -242,6 +242,7 @@ def build_prompt(spot: Dict, ctx: List[Dict], lang: str,) -> str:
             spot_id=spot_id,
             facts_txt=facts_txt,
             context_note=context_note or "",
+            style=style,
             style_note=style_note,
             safety_footer=safety_footer
         )
