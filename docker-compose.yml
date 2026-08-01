@@ -101,15 +101,17 @@ services:
       "
   
   # === OSRM (car / foot) ===
+  # データは scripts/build_osrm.sh で鳥海山エリアに切り出したもの（ADR-0014 / Docs/50_operations/osrm.md）
   osrm-car:
     image: osrm/osrm-backend
-    command: ["osrm-routed", "--algorithm", "mld", "/data/japan-latest.osrm"]
+    command: ["osrm-routed", "--algorithm", "mld", "--max-table-size", "200", "/data/chokai.osrm"]
     volumes:
-      - ./backend/worker/data/map/car:/data:ro
+      - ./backend/data/map/car:/data:ro
     ports:
       - "5001:5000"
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:5000/"]
+      # 静的な ok ではなく実際のルート照会で見る（22 §6-11）。あがりこ大王 → 鳥海高原家族旅行村
+      test: ["CMD-SHELL", "curl -sf 'http://localhost:5000/route/v1/car/140.0244,39.1594;140.0354,39.0342' | grep -q '\"code\":\"Ok\"'"]
       interval: 30s
       timeout: 5s
       retries: 10
@@ -117,13 +119,13 @@ services:
 
   osrm-foot:
     image: osrm/osrm-backend
-    command: ["osrm-routed", "--algorithm", "mld", "/data/japan-latest-foot.osrm"]
+    command: ["osrm-routed", "--algorithm", "mld", "--max-table-size", "200", "/data/chokai.osrm"]
     volumes:
-      - ./backend/worker/data/map/foot:/data:ro
+      - ./backend/data/map/foot:/data:ro
     ports:
       - "5002:5000"
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:5000/"]
+      test: ["CMD-SHELL", "curl -sf 'http://localhost:5000/route/v1/foot/140.0244,39.1594;140.0354,39.0342' | grep -q '\"code\":\"Ok\"'"]
       interval: 30s
       timeout: 5s
       retries: 10

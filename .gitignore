@@ -9,9 +9,16 @@ __pycache__/
 packs/
 
 .env*
+!.env.example
 
 backend/worker/data/map/car/*
 backend/worker/data/map/foot/*
+
+# OSRM の地図データ（scripts/build_osrm.sh で作る。ADR-0014）
+# BUILD だけは追跡する — 「今のリポジトリが想定している地図データはどれか」を残すため
+# ディレクトリごと除外すると中の BUILD を再包含できない（git の仕様）ので /* にする
+backend/data/map/*
+!backend/data/map/BUILD
 
 chromadb_data/
 
