@@ -115,10 +115,7 @@ async def respond(
 
 
 def response_mode(state: TurnState) -> ResponseMode:
-    if (
-        state.understand_action is UnderstandAction.ASK_USER
-        and state.clarification is not None
-    ):
+    if state.understand_action is UnderstandAction.ASK_USER and state.clarification is not None:
         return ResponseMode.CLARIFICATION
     if state.should_end_turn:
         return ResponseMode.QUESTION
@@ -172,15 +169,34 @@ def _allowed_spot_ids(state: TurnState) -> set[str]:
         spot_id = result.data.get("spot_id")
         if isinstance(spot_id, str):
             values.add(spot_id)
+        diff = result.data.get("diff")
+        if isinstance(diff, dict):
+            for field in ("added", "removed", "retimed"):
+                raw_ids = diff.get(field)
+                if isinstance(raw_ids, list):
+                    values.update(value for value in raw_ids if isinstance(value, str))
+            moved = diff.get("moved")
+            if isinstance(moved, list):
+                values.update(
+                    value["spot_id"]
+                    for value in moved
+                    if isinstance(value, dict) and isinstance(value.get("spot_id"), str)
+                )
+        concessions = result.data.get("concessions")
+        if isinstance(concessions, list):
+            values.update(
+                _concession_spot_ids(
+                    concessions,
+                    known_spot_ids=set(state.spot_names),
+                )
+            )
         itinerary = result.data.get("itinerary")
         if isinstance(itinerary, dict):
             for day in itinerary.get("days", []):
                 if isinstance(day, dict):
                     for endpoint_name in ("origin", "destination"):
                         endpoint = day.get(endpoint_name)
-                        if isinstance(endpoint, dict) and isinstance(
-                            endpoint.get("spot_id"), str
-                        ):
+                        if isinstance(endpoint, dict) and isinstance(endpoint.get("spot_id"), str):
                             values.add(endpoint["spot_id"])
                     values.update(
                         item["spot_id"]
@@ -197,7 +213,42 @@ def _allowed_spot_ids(state: TurnState) -> set[str]:
     values.update(
         result.data.get("spot_id")
         for result in state.step_results.values()
-        if result.tool is ToolName.SEARCH_KNOWLEDGE
-        and isinstance(result.data.get("spot_id"), str)
+        if result.tool is ToolName.SEARCH_KNOWLEDGE and isinstance(result.data.get("spot_id"), str)
     )
     return values
+
+
+def _concession_spot_ids(
+    value: Any,
+    *,
+    known_spot_ids: set[str],
+    field_name: str | None = None,
+) -> set[str]:
+    """concession の `args.target` 等に含まれる既知地点も拾う。"""
+
+    if isinstance(value, str):
+        is_spot_field = field_name == "spot_id" or field_name == "spot_ids"
+        return {value} if is_spot_field or value in known_spot_ids else set()
+    if isinstance(value, dict):
+        result: set[str] = set()
+        for key, child in value.items():
+            result.update(
+                _concession_spot_ids(
+                    child,
+                    known_spot_ids=known_spot_ids,
+                    field_name=key,
+                )
+            )
+        return result
+    if isinstance(value, list):
+        result = set()
+        for child in value:
+            result.update(
+                _concession_spot_ids(
+                    child,
+                    known_spot_ids=known_spot_ids,
+                    field_name=field_name,
+                )
+            )
+        return result
+    return set()

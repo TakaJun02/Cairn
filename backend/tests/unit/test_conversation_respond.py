@@ -3,7 +3,7 @@
 from typing import Any
 
 from app.domains.conversation.events import MemoryEventSink
-from app.domains.conversation.respond import respond
+from app.domains.conversation.respond import _allowed_spot_ids, respond
 from app.domains.conversation.state import (
     CandidateReference,
     ItineraryState,
@@ -18,6 +18,12 @@ class StaticResponseClient:
     async def generate(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
         del messages, kwargs
         return "起点・終点は道の駅象潟で、直前の候補は鶴間池です。"
+
+
+class RemovedSpotResponseClient:
+    async def generate(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+        del messages, kwargs
+        return "ご指定どおり、二ノ滝を旅程から外しました。"
 
 
 def _itinerary() -> dict[str, Any]:
@@ -45,9 +51,7 @@ async def test_itinerary_endpoints_and_last_candidates_are_allowed_in_response()
         utterance="旅程を作って",
         profile=ProfileState(),
         spot_names={"spot_011": "道の駅象潟", "spot_012": "鶴間池"},
-        last_candidates=[
-            CandidateReference(spot_id="spot_012", name_ja="鶴間池", rank=1)
-        ],
+        last_candidates=[CandidateReference(spot_id="spot_012", name_ja="鶴間池", rank=1)],
         step_results={
             1: ToolResult(
                 step_id=1,
@@ -75,9 +79,7 @@ async def test_current_itinerary_endpoints_are_allowed_in_response() -> None:
             itinerary=Itinerary.model_validate(_itinerary()),
         ),
         spot_names={"spot_011": "道の駅象潟", "spot_012": "鶴間池"},
-        last_candidates=[
-            CandidateReference(spot_id="spot_012", name_ja="鶴間池", rank=1)
-        ],
+        last_candidates=[CandidateReference(spot_id="spot_012", name_ja="鶴間池", rank=1)],
     )
     sink = MemoryEventSink()
 
@@ -85,3 +87,81 @@ async def test_current_itinerary_endpoints_are_allowed_in_response() -> None:
 
     assert state.degraded == []
     assert [event.event for event in sink.events] == ["token"]
+
+
+async def test_removed_spot_is_allowed_in_edit_response() -> None:
+    state = TurnState(
+        turn_id="turn-edit-removed",
+        thread_id=1,
+        user_id=1,
+        utterance="1つ目の滝を外して",
+        profile=ProfileState(),
+        spot_names={"spot_010": "二ノ滝"},
+        step_results={
+            1: ToolResult(
+                step_id=1,
+                tool=ToolName.EDIT_ITINERARY,
+                data={
+                    "itinerary": _itinerary(),
+                    "diff": {
+                        "added": [],
+                        "removed": ["spot_010"],
+                        "moved": [],
+                        "retimed": [],
+                    },
+                    "concessions": [],
+                },
+            )
+        },
+    )
+    sink = MemoryEventSink()
+
+    await respond(state, client=RemovedSpotResponseClient(), event_sink=sink)
+
+    assert state.degraded == []
+    assert [event.event for event in sink.events] == ["token"]
+
+
+def test_diff_and_concession_spot_ids_are_all_allowed() -> None:
+    state = TurnState(
+        turn_id="turn-edit-all-diff-fields",
+        thread_id=1,
+        user_id=1,
+        utterance="旅程を調整して",
+        profile=ProfileState(),
+        spot_names={
+            "spot_added": "追加地点",
+            "spot_removed": "削除地点",
+            "spot_moved": "移動地点",
+            "spot_retimed": "時刻変更地点",
+            "spot_concession": "譲歩地点",
+        },
+        step_results={
+            1: ToolResult(
+                step_id=1,
+                tool=ToolName.EDIT_ITINERARY,
+                data={
+                    "diff": {
+                        "added": ["spot_added"],
+                        "removed": ["spot_removed"],
+                        "moved": [{"spot_id": "spot_moved"}],
+                        "retimed": ["spot_retimed"],
+                    },
+                    "concessions": [
+                        {
+                            "pred": "require",
+                            "args": {"target": "spot_concession"},
+                        }
+                    ],
+                },
+            )
+        },
+    )
+
+    assert {
+        "spot_added",
+        "spot_removed",
+        "spot_moved",
+        "spot_retimed",
+        "spot_concession",
+    } <= _allowed_spot_ids(state)
