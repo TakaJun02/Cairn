@@ -164,6 +164,7 @@ async def _stream_or_generate(
 
 def _allowed_spot_ids(state: TurnState) -> set[str]:
     values: set[str] = {reference.spot_id for reference in state.references}
+    values.update(candidate.spot_id for candidate in state.last_candidates)
     for result in state.step_results.values():
         raw_ids = result.data.get("spot_ids")
         if isinstance(raw_ids, list):
@@ -175,6 +176,12 @@ def _allowed_spot_ids(state: TurnState) -> set[str]:
         if isinstance(itinerary, dict):
             for day in itinerary.get("days", []):
                 if isinstance(day, dict):
+                    for endpoint_name in ("origin", "destination"):
+                        endpoint = day.get(endpoint_name)
+                        if isinstance(endpoint, dict) and isinstance(
+                            endpoint.get("spot_id"), str
+                        ):
+                            values.add(endpoint["spot_id"])
                     values.update(
                         item["spot_id"]
                         for item in day.get("items", [])
@@ -182,11 +189,10 @@ def _allowed_spot_ids(state: TurnState) -> set[str]:
                     )
     # QA 以外でも現在旅程の説明は入力事実なので許可する。
     if state.itinerary is not None:
-        values.update(
-            item.spot_id
-            for day in state.itinerary.itinerary.days
-            for item in day.items
-        )
+        for day in state.itinerary.itinerary.days:
+            values.add(day.origin.spot_id)
+            values.update(item.spot_id for item in day.items)
+            values.add(day.destination.spot_id)
     # ask_user は地点を扱わないが、Tool 型の比較を明示する。
     values.update(
         result.data.get("spot_id")

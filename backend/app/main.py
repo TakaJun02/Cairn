@@ -8,7 +8,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
+from app.api.routers.chat import ActiveTurnRegistry, router as chat_router
 from app.api.routers.health import router as health_router
+from app.api.routers.itinerary import router as itinerary_router
 from app.api.routers.routes import router as routes_router
 from app.api.routers.spots import router as spots_router
 from app.api.routers.users import router as users_router
@@ -39,6 +41,7 @@ def create_app() -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    application.state.active_turn_registry = ActiveTurnRegistry()
     application.add_middleware(RequestIdMiddleware)
     application.add_middleware(
         CORSMiddleware,
@@ -49,6 +52,8 @@ def create_app() -> FastAPI:
     )
     application.include_router(health_router)
     application.include_router(users_router)
+    application.include_router(chat_router)
+    application.include_router(itinerary_router)
     application.include_router(spots_router)
     application.include_router(routes_router)
     return application

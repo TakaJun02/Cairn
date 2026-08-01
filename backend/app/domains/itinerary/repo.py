@@ -118,25 +118,39 @@ class ItineraryRepository:
         await self.session.flush()
         return _version_from_row(row)
 
-    async def revert(self, user_id: int, *, to_version: int | None = None) -> ItineraryVersion:
+    async def revert(
+        self,
+        user_id: int,
+        *,
+        to_version: int | None = None,
+        expected_current_version: int | None = None,
+    ) -> ItineraryVersion:
         """行を作らず、現在位置だけを親版または指定版へ移す。"""
 
         await self._lock_user(user_id)
         current = await self.get_current(user_id, for_update=True)
         if current is None:
             raise ItineraryNotFoundError("戻す旅程がありません")
+        _check_expected_current(current, expected_current_version)
         target_version = to_version if to_version is not None else current.parent_version
         if target_version is None:
             raise ItineraryNotFoundError("これ以上前の旅程版はありません")
         return await self._move_current(user_id, current.version, target_version)
 
-    async def redo(self, user_id: int, *, to_version: int | None = None) -> ItineraryVersion:
+    async def redo(
+        self,
+        user_id: int,
+        *,
+        to_version: int | None = None,
+        expected_current_version: int | None = None,
+    ) -> ItineraryVersion:
         """行を作らず、現在版を親とする既存子版へ現在位置を進める。"""
 
         await self._lock_user(user_id)
         current = await self.get_current(user_id, for_update=True)
         if current is None:
             raise ItineraryNotFoundError("進める旅程がありません")
+        _check_expected_current(current, expected_current_version)
         if to_version is None:
             children = (
                 await self.session.scalars(
@@ -283,3 +297,20 @@ def _constraint_json(value: Constraint | dict[str, Any]) -> dict[str, Any]:
     if isinstance(value, Constraint):
         return value.model_dump(mode="json")
     return deepcopy(value)
+
+
+def _check_expected_current(
+    current: ItineraryVersion,
+    expected_current_version: int | None,
+) -> None:
+    if (
+        expected_current_version is not None
+        and current.version != expected_current_version
+    ):
+        raise ItineraryVersionConflictError(
+            (
+                f"現在版は v{expected_current_version} ではなく "
+                f"v{current.version} です"
+            ),
+            current_version=current.version,
+        )

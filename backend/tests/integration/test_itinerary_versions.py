@@ -10,6 +10,7 @@ from app.core.db import dispose_engine, session_scope
 from app.db_models import Itinerary as ItineraryRow
 from app.db_models import Thread, User
 from app.domains.itinerary.repo import ItineraryRepository
+from app.domains.itinerary.repo_types import ItineraryVersionConflictError
 from app.domains.itinerary.types import Constraint, Itinerary, PredEnum
 
 pytestmark = pytest.mark.skipif(
@@ -55,7 +56,14 @@ async def test_append_only_revert_branch_and_constraint_ids() -> None:
             assert v2.parent_version == 1
             assert v2.constraints[0]["id"] == "c_014"
 
-            reverted = await repository.revert(user.id)
+            with pytest.raises(ItineraryVersionConflictError):
+                await repository.revert(user.id, expected_current_version=1)
+            assert (await repository.get_current(user.id)).version == 2
+
+            reverted = await repository.revert(
+                user.id,
+                expected_current_version=2,
+            )
             assert reverted.version == 1
             assert len(await repository.list_versions(user.id)) == 2
 

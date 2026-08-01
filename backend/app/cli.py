@@ -286,6 +286,33 @@ def validate_knowledge_command() -> None:
     _emit({"command": "validate-knowledge", **summary.as_dict()})
 
 
+@cli.command("export-openapi")
+def export_openapi_command(
+    output: Path = typer.Option(
+        Path("openapi.json"),
+        "--output",
+        "-o",
+        help="出力する openapi.json のパス",
+    ),
+) -> None:
+    """フロントエンド型生成用の OpenAPI 文書を書き出す。"""
+
+    from app.main import create_app
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(create_app().openapi(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _emit(
+        {
+            "command": "export-openapi",
+            "status": "ok",
+            "output": str(output),
+        }
+    )
+
+
 async def _reset_user(user_name: str) -> int:
     async with session_scope() as session:
         user_id = await session.scalar(select(User.id).where(User.user_name == user_name))

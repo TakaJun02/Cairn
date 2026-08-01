@@ -1,5 +1,12 @@
 """外部へ公開する Pydantic スキーマ。"""
 
+from app.api.schemas.chat import (
+    ChatEvent,
+    ChatRequest,
+    ItineraryConflictResponse,
+    ItineraryState,
+    ItineraryVersionRequest,
+)
 from app.api.schemas.health import (
     DependencyHealth,
     GeoDataHealth,
@@ -18,6 +25,8 @@ from app.api.schemas.users import (
 )
 
 __all__ = [
+    "ChatEvent",
+    "ChatRequest",
     "DependencyHealth",
     "GeoDataHealth",
     "HealthDependencies",
@@ -28,6 +37,9 @@ __all__ = [
     "ProfileResponse",
     "RouteRequest",
     "RouteResponse",
+    "ItineraryState",
+    "ItineraryConflictResponse",
+    "ItineraryVersionRequest",
     "SpotResponse",
     "ThreadResponse",
     "UserNameRequest",

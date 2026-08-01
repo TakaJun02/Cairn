@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     )
     inference_model: str = Field(default="", alias="INFERENCE_MODEL")
     inference_timeout_sec: float = Field(default=120, gt=0, alias="INFERENCE_TIMEOUT_SEC")
+    chat_sse_heartbeat_sec: float = Field(
+        default=15.0,
+        gt=0,
+        alias="CHAT_SSE_HEARTBEAT_SEC",
+    )
     recommendation_rerank_enabled: bool = Field(
         default=True, alias="RECOMMENDATION_RERANK_ENABLED"
     )

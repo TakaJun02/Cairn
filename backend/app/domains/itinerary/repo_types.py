@@ -20,6 +20,10 @@ class ItineraryNotFoundError(ItineraryRepositoryError):
 class ItineraryVersionConflictError(ItineraryRepositoryError):
     """同じユーザーに対する並行編集で親版が変わった。"""
 
+    def __init__(self, message: str, *, current_version: int | None = None) -> None:
+        super().__init__(message)
+        self.current_version = current_version
+
 
 @dataclass(frozen=True, slots=True)
 class ItineraryVersion:
