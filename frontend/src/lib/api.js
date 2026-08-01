@@ -109,9 +109,38 @@ export async function getRoute(routeId) {
   return body
 }
 
-// Phase 1-10 ではパック生成契約を接続しない。既存呼び出しには明示的に失敗を返す。
-export async function createPlan() {
-  throw new Error('ナビゲーション資材の生成は現在利用できません')
+export async function createPack(itineraryVersion, options = null) {
+  const payload = { itinerary_version: itineraryVersion }
+  if (options) payload.options = options
+  const { status, body } = await apiFetch('/packs', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+  if (status !== 202) throw new Error(`unexpected status ${status}`)
+  return body
+}
+
+export async function getPackJob(jobId) {
+  const { status, body } = await apiFetch(`/jobs/${encodeURIComponent(jobId)}`)
+  if (status !== 200) throw new Error(`unexpected status ${status}`)
+  return body
+}
+
+export async function getPack(packId) {
+  const { status, body } = await apiFetch(`/packs/${encodeURIComponent(packId)}`)
+  if (status !== 200) throw new Error(`unexpected status ${status}`)
+  return body
+}
+
+export async function fetchPackJson(path) {
+  const response = await fetch(path, { cache: 'no-cache' })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  return response.json()
+}
+
+// 既存の NavStore 呼び出し名は残し、非同期パック API へ接続する。
+export async function createPlan(itineraryVersion, options = null) {
+  return createPack(itineraryVersion, options)
 }
 
 // --- Realtime (計画フェーズ表示用) ---

@@ -41,6 +41,11 @@ from app.domains.knowledge import (
     index_knowledge,
     validate_knowledge,
 )
+from app.domains.packs.storage import (
+    DEFAULT_GC_KEEP,
+    PackStorage,
+    garbage_collect_packs,
+)
 from app.seeds import (
     SeedValidationError,
     load_seed_bundle,
@@ -284,6 +289,37 @@ def validate_knowledge_command() -> None:
         typer.echo(f"validate-knowledge failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     _emit({"command": "validate-knowledge", **summary.as_dict()})
+
+
+async def _gc_packs(keep: int, dry_run: bool) -> dict[str, Any]:
+    settings = get_settings()
+    async with session_scope(settings) as session:
+        return await garbage_collect_packs(
+            session,
+            PackStorage(settings.packs_root),
+            keep=keep,
+            dry_run=dry_run,
+        )
+
+
+@cli.command("gc-packs")
+def gc_packs_command(
+    keep: int = typer.Option(
+        DEFAULT_GC_KEEP,
+        "--keep",
+        min=0,
+        help="ユーザーごとに残す新しいパック数",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="DB・ファイルを削除せず対象と孤児だけを表示する",
+    ),
+) -> None:
+    """古いパックを明示操作でだけ削除し、孤児ディレクトリを報告する。"""
+
+    result = _run_async(_gc_packs(keep, dry_run))
+    _emit({"command": "gc-packs", "status": "ok", **result})
 
 
 @cli.command("export-openapi")

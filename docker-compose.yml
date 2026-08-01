@@ -232,14 +232,13 @@ services:
   # === Frontend (Vite dev server) ===
   frontend:
     image: node:20-alpine
+    network_mode: host
     working_dir: /app/frontend
     environment:
       VITE_API_BASE: ${VITE_API_BASE:-}
     volumes:
       - ./frontend:/app/frontend
       - frontend_node_modules:/app/frontend/node_modules
-    ports:
-      - "5173:5173"
     command: sh -lc "npm install && npm run dev -- --host 0.0.0.0"
     depends_on:
       - app

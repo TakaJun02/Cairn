@@ -6,7 +6,7 @@ __pycache__/
 *.pyc
 
 # Dockerが生成するファイルを無視する
-packs/
+/packs/
 
 .env*
 !.env.example

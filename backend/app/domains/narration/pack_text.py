@@ -6,12 +6,13 @@ import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Any, Literal, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.schemas.packs import PackAssetRole as NarrationRole
+from app.api.schemas.packs import PackAssetVariant as NarrationVariant
 from app.core.llm import GenerationClient
 
 PACK_TEXT_MAX_TOKENS = 512
@@ -23,19 +24,6 @@ FORBIDDEN_EXPRESSIONS = (
     "文脈から",
     "以下に示します",
 )
-
-
-class NarrationRole(StrEnum):
-    VISIT = "visit"
-    PASS_BY = "pass_by"
-
-
-class NarrationVariant(StrEnum):
-    BASE = "base"
-    WEATHER_CLOUDY = "weather_cloudy"
-    WEATHER_RAIN = "weather_rain"
-    CONGESTION_MID = "congestion_mid"
-    CONGESTION_HIGH = "congestion_high"
 
 
 TARGET_LENGTH_LIMITS: dict[tuple[NarrationRole, NarrationVariant], tuple[int, int]] = {

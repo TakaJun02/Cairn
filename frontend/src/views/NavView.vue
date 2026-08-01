@@ -162,8 +162,9 @@
 
       <div class="top-left-ui-area">
         <div class="controls">
-          <div v-if="!isNavigationReady" class="start-nav-panel">
+          <div v-if="!isNavigationReady || packJob" class="start-nav-panel">
             <button
+              v-if="!packJob || ['partial', 'failed'].includes(packJob.state)"
               @click="startGuidance"
               :disabled="isNavigating"
               class="start-nav-button"
@@ -188,22 +189,49 @@
                   <path d="M9 18h6" />
                 </svg>
                 <span class="start-nav-button__label">
-                  <template v-if="isNavigating">Preparing Route…</template>
-                  <template v-else>Start Navigation</template>
+                  <template v-if="isNavigating">パックを生成中…</template>
+                  <template v-else-if="packJob?.state === 'partial'">不足分を再生成</template>
+                  <template v-else-if="packJob?.state === 'failed'">もう一度生成</template>
+                  <template v-else>端末に取り込む</template>
                 </span>
               </span>
               <span class="start-nav-button__progress" aria-hidden="true">
                 <span></span><span></span><span></span><span></span>
               </span>
             </button>
-            <div
-              v-if="isNavigating"
-              class="start-nav-status"
-              role="status"
-              aria-live="polite"
-            >
-              <span class="start-nav-status__pulse"></span>
-              <span class="start-nav-status__text">Generating your guidance playlist…</span>
+            <div v-if="packJob" class="pack-progress" role="status" aria-live="polite">
+              <div class="pack-progress__header">
+                <span class="pack-state-badge" :class="`is-${packJob.state}`">
+                  {{ packStateLabel }}
+                </span>
+                <span class="pack-progress__elapsed">{{ packElapsedText }}</span>
+              </div>
+              <div class="pack-progress__counts">
+                <strong>{{ packProgress.done }} / {{ packProgress.total }}</strong>
+                <span>失敗 {{ packProgress.failed }} 件</span>
+              </div>
+              <div class="pack-progress__bar" aria-hidden="true">
+                <span :style="{ width: `${packProgressPercent}%` }"></span>
+              </div>
+              <p v-if="packJob.state === 'ready'" class="pack-progress__message is-ready">
+                端末への取り込み準備ができました
+              </p>
+              <p v-else-if="packJob.state === 'partial'" class="pack-progress__message is-partial">
+                一部の案内を作れませんでした（{{ packFailures.length }} 件）
+              </p>
+              <p v-else-if="packJob.state === 'failed'" class="pack-progress__message is-failed">
+                案内パックを作成できませんでした
+              </p>
+              <details v-if="packFailures.length" class="pack-progress__missing">
+                <summary>作れなかった案内の内訳</summary>
+                <ul>
+                  <li v-for="(failure, index) in packFailures" :key="`${failure.spot_id}-${failure.variant}-${index}`">
+                    {{ failure.spot_id || 'パック全体' }}
+                    <template v-if="failure.variant"> / {{ failure.variant }}</template>
+                    — {{ failure.reason }}
+                  </li>
+                </ul>
+              </details>
             </div>
             <div v-if="navError" class="error-box">
               エラー: {{ navError }}
@@ -357,6 +385,9 @@ const {
   isNavigating,
   isNavigationReady,
   error: navError,
+  packJob,
+  packMetadata,
+  packStartedAt,
 } = storeToRefs(navStore)
 
 const navMap = ref(null)
@@ -383,6 +414,28 @@ const {
 } = usePosition()
 const isDebug = computed(() => !!isMock)
 const isDebugPanelVisible = ref(false)
+const progressClock = ref(Date.now())
+let progressClockId = null
+
+const packProgress = computed(() => packJob.value?.progress || { done: 0, total: 0, failed: 0 })
+const packFailures = computed(() => packMetadata.value?.missing || packJob.value?.failures || [])
+const packProgressPercent = computed(() => {
+  const total = Number(packProgress.value.total) || 0
+  if (total <= 0) return 0
+  return Math.min(100, Math.round((Number(packProgress.value.done) || 0) / total * 100))
+})
+const packStateLabel = computed(() => ({
+  queued: '待機中',
+  running: '生成中',
+  ready: '準備完了',
+  partial: '一部失敗',
+  failed: '失敗',
+}[packJob.value?.state] || '未開始'))
+const packElapsedText = computed(() => {
+  if (!packStartedAt.value) return '0:00'
+  const seconds = Math.max(0, Math.floor((progressClock.value - packStartedAt.value) / 1000))
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+})
 
 async function loadFacilityCatalog() {
   try {
@@ -618,6 +671,8 @@ watch(
 )
 
 onMounted(async () => {
+  progressClockId = window.setInterval(() => { progressClock.value = Date.now() }, 1000)
+  navStore.resumePackPolling()
   window.addEventListener('pointerdown', primeOnFirstPointer, { once: true })
 
   if ('serviceWorker' in navigator) {
@@ -634,6 +689,10 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  if (progressClockId != null) {
+    clearInterval(progressClockId)
+    progressClockId = null
+  }
   window.removeEventListener('pointerdown', primeOnFirstPointer)
   rtStore.stopPolling()
   stopLoraPolling()
@@ -830,17 +889,16 @@ watch(currentPos, (newPos) => {
   ];
   if (allSpots.length === 0) return;
 
-  const travelMode = geo.getCurrentTravelMode(newPos, plan.value?.segments ?? plan.value?.route);
-  const bufferM = (travelMode === 'car') ? 350 : 15;
-
   const assetsArray = planAssetsList.value
   if (!assetsArray.length) return
 
   allSpots.forEach((spot) => {
     if (!spot.lat || !spot.lon) return;
     const distance = geo.calculateDistance(newPos, { lat: spot.lat, lng: spot.lon });
+    const triggerRadiusM = Number(spot.trigger_radius_m)
+    if (!Number.isFinite(triggerRadiusM) || triggerRadiusM <= 0) return
 
-    if (distance <= bufferM) {
+    if (distance <= triggerRadiusM) {
       const asset = assetsArray.find((a) => a.spot_id === spot.spot_id && !a.situation);
 
       enqueueAssetAudio(spot.spot_id, spot.name, asset);
@@ -871,23 +929,23 @@ watch(
     const weatherChanged = !Number.isFinite(prevWeather)
       ? Number.isFinite(weatherCode)
       : prevWeather !== weatherCode
-    if (weatherChanged && !isFacilitySpotId(spotId)) {
-      const situationType = WEATHER_SITUATION_MAP[weatherCode]
-      if (situationType) {
-        queueSituationAnnouncement(spotId, situationType)
-      }
-    }
-
     const prevCongestion = Number(event.prev?.c)
     const congestionLevel = Number(event.next?.c)
     const congestionChanged = !Number.isFinite(prevCongestion)
       ? Number.isFinite(congestionLevel)
       : prevCongestion !== congestionLevel
-    if (congestionChanged) {
-      const situationType = CONGESTION_SITUATION_MAP[congestionLevel]
-      if (situationType) {
-        queueSituationAnnouncement(spotId, situationType)
-      }
+    const rules = plan.value?.playback_rules || {}
+    const changedVariants = {
+      weather: weatherChanged && !isFacilitySpotId(spotId)
+        ? rules.weather?.[String(weatherCode)]
+        : null,
+      congestion: congestionChanged
+        ? rules.congestion?.[String(congestionLevel)]
+        : null,
+    }
+    for (const layer of rules.order || []) {
+      const situationType = changedVariants[layer]
+      if (situationType) queueSituationAnnouncement(spotId, situationType)
     }
   }
 );
@@ -1116,26 +1174,23 @@ const CROWD_STATES = [
 ]
 
 const SITUATION_META = {
-  weather_1: {
+  weather_cloudy: {
     title: 'Weather · Cloudy',
     fallback: (spotName) => `${spotName}は現在、雲が広がっています。空模様の変化にご注意ください。`
   },
-  weather_2: {
+  weather_rain: {
     title: 'Weather · Rain',
     fallback: (spotName) => `${spotName}では雨が降っています。足元が滑りやすいのでお気をつけください。`
   },
-  congestion_1: {
+  congestion_mid: {
     title: 'Crowd · Moderate',
     fallback: (spotName) => `${spotName}は現在やや混雑しています。移動には少し時間に余裕を持ってください。`
   },
-  congestion_2: {
+  congestion_high: {
     title: 'Crowd · Heavy',
     fallback: (spotName) => `${spotName}は現在かなり混雑しています。ルートの変更もご検討ください。`
   },
 }
-
-const WEATHER_SITUATION_MAP = { 1: 'weather_1', 2: 'weather_2' }
-const CONGESTION_SITUATION_MAP = { 1: 'congestion_1', 2: 'congestion_2' }
 
 function normalizeCrowd(docOrLevel) {
   const raw = (docOrLevel && typeof docOrLevel === 'object') ? docOrLevel.c : docOrLevel
@@ -1965,7 +2020,7 @@ function latestBySpot(spotId) { return rtStore.getLatest?.(spotId) ?? null }
 }
 
 .start-nav-panel {
-  width: 240px;
+  width: min(290px, calc(100vw - 32px));
   padding: 12px 14px 14px;
   border-radius: 14px;
   background: linear-gradient(135deg, rgba(15, 23, 42, 0.85), rgba(30, 64, 175, 0.92));
@@ -2093,6 +2148,81 @@ function latestBySpot(spotId) { return rtStore.getLatest?.(spotId) ?? null }
 }
 .start-nav-status__text {
   letter-spacing: 0.06em;
+}
+
+.pack-progress {
+  display: grid;
+  gap: 9px;
+  padding: 10px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.68);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  color: #e2e8f0;
+  font-size: 0.78rem;
+}
+.pack-progress__header,
+.pack-progress__counts {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.pack-progress__elapsed {
+  color: #bae6fd;
+  font-variant-numeric: tabular-nums;
+}
+.pack-state-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.18);
+  color: #7dd3fc;
+  font-weight: 700;
+}
+.pack-state-badge.is-partial {
+  background: rgba(245, 158, 11, 0.2);
+  color: #fcd34d;
+}
+.pack-state-badge.is-failed {
+  background: rgba(248, 113, 113, 0.2);
+  color: #fca5a5;
+}
+.pack-state-badge.is-ready {
+  background: rgba(52, 211, 153, 0.2);
+  color: #6ee7b7;
+}
+.pack-progress__bar {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.24);
+}
+.pack-progress__bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #38bdf8, #818cf8);
+  transition: width 0.25s ease;
+}
+.pack-progress__message {
+  margin: 0;
+  line-height: 1.45;
+}
+.pack-progress__message.is-ready { color: #6ee7b7; }
+.pack-progress__message.is-partial { color: #fcd34d; }
+.pack-progress__message.is-failed { color: #fca5a5; }
+.pack-progress__missing summary {
+  cursor: pointer;
+  color: #bae6fd;
+}
+.pack-progress__missing ul {
+  max-height: 110px;
+  margin: 7px 0 0;
+  padding-left: 18px;
+  overflow-y: auto;
+  color: #cbd5e1;
 }
 
 @keyframes statusPulse {

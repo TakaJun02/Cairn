@@ -8,28 +8,35 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
-from app.api.routers.chat import ActiveTurnRegistry, router as chat_router
+from app.api.routers.chat import ActiveTurnRegistry
+from app.api.routers.chat import router as chat_router
 from app.api.routers.health import router as health_router
 from app.api.routers.itinerary import router as itinerary_router
+from app.api.routers.packs import router as packs_router
 from app.api.routers.routes import router as routes_router
 from app.api.routers.spots import router as spots_router
 from app.api.routers.users import router as users_router
 from app.core.config import get_settings
 from app.core.db import dispose_engine
 from app.core.logging import RequestIdMiddleware, configure_logging
+from app.domains.packs.storage import ImmutablePackStaticFiles
+from app.jobs.worker import PackJobWorker
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """将来の MQTT・ジョブワーカーを接続するプロセス寿命の境界。"""
+async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+    """プロセス内パックワーカーをアプリと同じ寿命で管理する。"""
 
     settings = get_settings()
     configure_logging(settings.log_level)
     logging.getLogger("app.lifecycle").info("application_started")
+    worker = PackJobWorker(settings)
+    await worker.start()
+    application.state.pack_job_worker = worker
     try:
-        # Phase 3 で MQTT、Phase 2 でジョブランナーをこの境界へ接続する。
         yield
     finally:
+        await worker.stop()
         await dispose_engine()
         logging.getLogger("app.lifecycle").info("application_stopped")
 
@@ -56,6 +63,12 @@ def create_app() -> FastAPI:
     application.include_router(itinerary_router)
     application.include_router(spots_router)
     application.include_router(routes_router)
+    application.include_router(packs_router)
+    application.mount(
+        "/packs",
+        ImmutablePackStaticFiles(directory=settings.packs_root, check_dir=False),
+        name="packs",
+    )
     return application
 
 
