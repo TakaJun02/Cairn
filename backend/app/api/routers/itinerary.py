@@ -77,13 +77,11 @@ async def undo_itinerary(
         )
     except (ItineraryNotFoundError, ItineraryVersionConflictError) as exc:
         await _raise_conflict(repository, current_user.id, str(exc))
+    diff = calculate_diff(source.itinerary, target.itinerary) if source is not None else Diff()
+    await repository.commit()
     return _itinerary_state(
         target,
-        diff=(
-            calculate_diff(source.itinerary, target.itinerary)
-            if source is not None
-            else Diff()
-        ),
+        diff=diff,
     )
 
 
@@ -113,13 +111,11 @@ async def redo_itinerary(
         )
     except (ItineraryNotFoundError, ItineraryVersionConflictError) as exc:
         await _raise_conflict(repository, current_user.id, str(exc))
+    diff = calculate_diff(source.itinerary, target.itinerary) if source is not None else Diff()
+    await repository.commit()
     return _itinerary_state(
         target,
-        diff=(
-            calculate_diff(source.itinerary, target.itinerary)
-            if source is not None
-            else Diff()
-        ),
+        diff=diff,
     )
 
 

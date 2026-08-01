@@ -71,6 +71,11 @@ class UserRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    async def commit(self) -> None:
+        """応答で公開するユーザー状態を現在のトランザクションで確定する。"""
+
+        await self.session.commit()
+
     async def find_by_token(self, token: str) -> UserData | None:
         user = await self.session.scalar(select(User).where(User.api_token == token))
         return _user_data(user) if user is not None else None

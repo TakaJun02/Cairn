@@ -35,6 +35,10 @@ class MemoryItineraryRepository:
     def __init__(self) -> None:
         self.versions = {1: _version(1, None), 2: _version(2, 1)}
         self.current_version = 2
+        self.commits = 0
+
+    async def commit(self) -> None:
+        self.commits += 1
 
     async def get_current(self, user_id: int):
         assert user_id == 1
@@ -116,3 +120,4 @@ async def test_get_undo_redo_share_itinerary_state_and_use_optimistic_lock() -> 
     assert duplicate_undo.json()["detail"]["current_version"] == 1
     assert no_earlier_version.status_code == 409
     assert no_earlier_version.json()["detail"]["current_version"] == 1
+    assert repository.commits == 2

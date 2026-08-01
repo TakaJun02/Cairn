@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 import httpx
 
 from app.api.auth import get_user_repository
+from app.api.routers.spots import get_catalog_repository
+from app.domains.catalog import SpotsSnapshot
 from app.domains.users import MessageData, ProfileData, ThreadData, UserData
 from app.main import create_app
 
@@ -12,10 +14,14 @@ from app.main import create_app
 class MemoryUserRepository:
     def __init__(self) -> None:
         self.next_id = 1
+        self.commits = 0
         self.users_by_name: dict[str, UserData] = {}
         self.users_by_token: dict[str, UserData] = {}
         self.profiles: dict[int, ProfileData] = {}
         self.threads: dict[int, ThreadData] = {}
+
+    async def commit(self) -> None:
+        self.commits += 1
 
     async def find_by_name(self, user_name: str) -> UserData | None:
         return self.users_by_name.get(user_name)
@@ -74,6 +80,49 @@ class MemoryUserRepository:
         return self.threads[user_id]
 
 
+class CommitGatedMemoryUserRepository(MemoryUserRepository):
+    """commit 前のトークンを別リクエストから不可視にするテストダブル。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.visible_tokens: set[str] = set()
+
+    async def find_by_token(self, token: str) -> UserData | None:
+        if token not in self.visible_tokens:
+            return None
+        return await super().find_by_token(token)
+
+    async def commit(self) -> None:
+        await super().commit()
+        self.visible_tokens.update(self.users_by_token)
+
+
+class EmptyCatalogRepository:
+    async def list_spots(self) -> SpotsSnapshot:
+        return SpotsSnapshot(spots=[], latest_updated_at=None)
+
+
+async def test_login_commits_token_before_immediate_authenticated_request() -> None:
+    repository = CommitGatedMemoryUserRepository()
+    app = create_app()
+    app.dependency_overrides[get_user_repository] = lambda: repository
+    app.dependency_overrides[get_catalog_repository] = EmptyCatalogRepository
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        login = await client.post("/api/v1/login", json={"user_name": "race"})
+        token = login.json()["token"]
+        spots = await client.get(
+            "/api/v1/spots",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert login.status_code == 200
+    assert spots.status_code == 200
+    assert repository.commits == 1
+
+
 async def test_login_token_opens_thread_and_missing_token_is_401() -> None:
     repository = MemoryUserRepository()
     app = create_app()
@@ -98,6 +147,7 @@ async def test_login_token_opens_thread_and_missing_token_is_401() -> None:
     assert thread.json()["itinerary"] is None
     assert thread.json()["pending"] is None
     assert repeated_login.json() == login.json()
+    assert repository.commits == 2
 
 
 async def test_explicit_registration_returns_token_and_rejects_duplicate() -> None:
@@ -115,6 +165,7 @@ async def test_explicit_registration_returns_token_and_rejects_duplicate() -> No
     assert created.json()["user_name"] == "new-user"
     assert len(created.json()["token"]) >= 43
     assert duplicate.status_code == 409
+    assert repository.commits == 1
 
 
 async def test_token_always_scopes_thread_and_me_to_its_owner() -> None:

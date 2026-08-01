@@ -29,6 +29,11 @@ class ItineraryRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    async def commit(self) -> None:
+        """API 境界など、呼び出し側が選んだ時点で変更を確定する。"""
+
+        await self.session.commit()
+
     async def get_current(
         self, user_id: int, *, for_update: bool = False
     ) -> ItineraryVersion | None:

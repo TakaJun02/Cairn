@@ -16,6 +16,7 @@ async def register_user(repository: UserRepository, user_name: str) -> UserData:
     user, created = await _create_with_unique_token(repository, user_name)
     if not created:
         raise UserAlreadyExistsError(f"user_name は登録済みです: {user_name}")
+    await repository.commit()
     return user
 
 
@@ -25,8 +26,10 @@ async def login_user(repository: UserRepository, user_name: str) -> UserData:
     existing = await repository.find_by_name(user_name)
     if existing is not None:
         await repository.ensure_context(existing.id)
-        return existing
-    user, _ = await _create_with_unique_token(repository, user_name)
+        user = existing
+    else:
+        user, _ = await _create_with_unique_token(repository, user_name)
+    await repository.commit()
     return user
 
 
