@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import Coroutine
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -26,6 +27,15 @@ from app.domains.geo.approach import ApproachBuildError, build_spot_approaches
 from app.domains.geo.matrix import MatrixBuildError, build_travel_time_matrix
 from app.domains.geo.osrm import Coordinate, OSRMClient, OSRMError, read_osrm_build
 from app.domains.geo.repo import GeoRepository
+from app.domains.itinerary.repo import ItineraryRepository
+from app.domains.itinerary.solver import (
+    PlanningDay,
+    SolverConfig,
+    SolverInput,
+    itinerary_spot_ids,
+    solve_itinerary,
+    validate_hard_constraints,
+)
 from app.domains.knowledge import (
     KnowledgeIndexError,
     index_knowledge,
@@ -193,6 +203,63 @@ def build_travel_times_command(
         typer.echo(f"build-travel-times failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     _emit({"command": "build-travel-times", "status": "ok", "counts": counts})
+
+
+async def _solve_demo(days: int, origin: str) -> dict[str, object]:
+    async with session_scope() as session:
+        planning = await ItineraryRepository(session).load_planning_data()
+    if origin not in planning.spots:
+        raise SeedValidationError(f"起点の spot_id が見つかりません: {origin}")
+    first_date = date(2026, 8, 10)
+    config = SolverConfig()
+    solver_input = SolverInput(
+        days=tuple(
+            PlanningDay(
+                date=(first_date + timedelta(days=index)).isoformat(),
+                start_min=540,
+                end_min=1020,
+                origin_spot_id=origin,
+                destination_spot_id=origin,
+            )
+            for index in range(days)
+        ),
+        spots=planning.spots,
+        travel_times=planning.travel_times,
+        config=config,
+    )
+    solved = solve_itinerary(solver_input)
+    return {
+        "seed": config.seed,
+        "iterations": solved.iterations_run,
+        "scores": list(solved.scores),
+        "solutions": [
+            {
+                "spot_ids": itinerary_spot_ids(solution),
+                "itinerary": solution.model_dump(mode="json"),
+                "hard_errors": validate_hard_constraints(
+                    solution,
+                    planning.spots,
+                    planning.travel_times,
+                ),
+            }
+            for solution in solved.solutions
+        ],
+    }
+
+
+@cli.command("solve-demo")
+def solve_demo_command(
+    days: int = typer.Option(1, min=1, max=7, help="旅程の日数"),
+    origin: str = typer.Option("spot_004", help="起点・終点にする spot_id"),
+) -> None:
+    """固定日時・固定シードで A/B/C の時間割を検証表示する。"""
+
+    try:
+        result = _run_async(_solve_demo(days, origin))
+    except (SeedValidationError, ValueError) as exc:
+        typer.echo(f"solve-demo failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    _emit({"command": "solve-demo", "status": "ok", **result})
 
 
 @cli.command("index-knowledge")
