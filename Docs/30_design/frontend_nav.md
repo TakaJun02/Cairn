@@ -133,7 +133,7 @@ const res  = await fetch('/api/v1/chat', {
 | 1 | **Pinia 二重初期化**([22 §13-2](../22_current_issues.md))。`app.use(pinia)` の直後に `app.use(createPinia())` があり、**persistedstate プラグインの無い 2 個目で上書きされる** | `main.js` の 1 行を削除 |
 | 2 | **`marked` 出力を `v-html` で直挿し**([22 §13-4](../22_current_issues.md))。`token` の中身は LLM 生成物である | **DOMPurify を通す**([chat_sse.md §5.3](../40_api/chat_sse.md)) |
 | 3 | **SW のタイルキャッシュが空回り**([22 §13-5](../22_current_issues.md))。`TILE_HOSTS` は OSM 公式だが、`NavMap.vue` が使うのは別ホストで拡張子も無い | **`public/sw.js` の URL 判定を `lib/tiles.js` の実際の URL に合わせる。**作り直さない([ADR-0017](../adr/0017-frontend-incremental-change.md)) |
-| 4 | **ハードコードされたバッファ値**(`NavView` の 350 m / 15 m が API の 300 m / 10 m と食い違う: [22 §12-7](../22_current_issues.md)) | **manifest の `trigger_radius_m` を読む**([packs_pipeline.md §7.2](packs_pipeline.md))。定数を 2 か所に持たない |
+| 4 | **ハードコードされたバッファ値**(`NavView` の 350 m / 15 m が API 側の値と食い違う: [22 §12-7](../22_current_issues.md))。**2026-08-02 訂正**: 括弧内に「API の 300 m / 10 m」と書いていたが、**foot バッファは [geo.md §5.2](geo.md) で 10 m → 50 m に変更済み**である。いずれにせよフロントは自前の定数を持たない | **manifest の `trigger_radius_m` を読む**([packs_pipeline.md §7.2](packs_pipeline.md))。定数を 2 か所に持たない |
 | 5 | **デッド UI**(`RTDoc` の `u` / `h` は供給源が無い: [22 §12-4](../22_current_issues.md)) | **表示を消す。**予報は要求に無い([realtime_lora.md §11](realtime_lora.md)) |
 
 ---

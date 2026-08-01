@@ -1,11 +1,25 @@
 import { ref, computed } from 'vue'
 import { defineStore } from 'pinia'
-import * as api from '@/lib/api'
+import * as api from '../lib/api.js'
+import {
+  cacheOfflinePack,
+  loadStoredOfflinePack,
+  verifyOfflinePack,
+} from '../lib/offlinePack.js'
 
-import { getDeviceUUID } from '@/lib/uuid'
+import { getDeviceUUID } from '../lib/uuid.js'
 
 // 30分
 const PLAN_TTL = 30 * 60 * 1000
+
+const emptyPackImport = () => ({
+  state: 'idle',
+  route: { done: 0, total: 1, failed: 0 },
+  audio: { done: 0, total: 0, failed: 0 },
+  tiles: { done: 0, total: 0, failed: 0, quotaExceeded: false },
+  verification: null,
+  error: null,
+})
 
 const createRouteCacheKey = () => {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -34,6 +48,9 @@ export const useNavStore = defineStore('nav', () => {
   const packJob = ref(null)
   const packMetadata = ref(null)
   const packStartedAt = ref(null)
+  const packImport = ref(emptyPackImport())
+  const installedPack = ref(null)
+  const isTourMode = ref(false)
 
   let spotsRequest = null
   let itineraryApplySequence = 0
@@ -43,6 +60,7 @@ export const useNavStore = defineStore('nav', () => {
   const isRouteReady = computed(() => !!plan.value?.route)
   const isNavigationReady = computed(() => !!plan.value?.manifest)
   const isPackGenerating = computed(() => ['queued', 'running'].includes(packJob.value?.state))
+  const isPackImporting = computed(() => ['route', 'audio', 'tiles', 'verify'].includes(packImport.value.state))
   const waypoints = computed(() => plan.value?.waypoints_info || [])
   const alongPois = computed(() => plan.value?.along_pois || [])
 
@@ -63,14 +81,19 @@ export const useNavStore = defineStore('nav', () => {
     packJob.value = null
     packMetadata.value = null
     packStartedAt.value = null
+    packImport.value = emptyPackImport()
+    installedPack.value = null
+    isTourMode.value = false
     itineraryApplySequence += 1
     console.log('[NavStore] Navigation state has been reset.')
   }
 
   const fetchSpots = async ({ force = false } = {}) => {
+    if (isTourMode.value) return spots.value
+    if (!api.bearerHeaders().Authorization) return spots.value
     if (spotsRequest && !force) return spotsRequest
 
-    spotsRequest = (async () => {
+    const request = (async () => {
       const response = await api.getSpots(force ? null : spotsEtag.value)
       if (response.status === 200) {
         spots.value = Array.isArray(response.spots) ? response.spots : []
@@ -83,12 +106,12 @@ export const useNavStore = defineStore('nav', () => {
       spotsEtag.value = response.etag
       return spots.value
     })()
+    spotsRequest = request
 
     try {
-      return await spotsRequest
-    } catch (fetchError) {
-      spotsRequest = null
-      throw fetchError
+      return await request
+    } finally {
+      if (spotsRequest === request) spotsRequest = null
     }
   }
 
@@ -123,6 +146,9 @@ export const useNavStore = defineStore('nav', () => {
       packJob.value = null
       packMetadata.value = null
       packStartedAt.value = null
+      packImport.value = emptyPackImport()
+      installedPack.value = null
+      isTourMode.value = false
       isNavigating.value = false
     }
     currentItinerary.value = state
@@ -216,7 +242,7 @@ export const useNavStore = defineStore('nav', () => {
   }
 
   const startGuidance = async () => {
-    if (!isRouteReady.value || isNavigating.value) return
+    if (isTourMode.value || !isRouteReady.value || isNavigating.value) return
 
     const itineraryVersion = Number(plan.value?.itinerary_version ?? currentItinerary.value?.version)
     if (!Number.isInteger(itineraryVersion) || itineraryVersion < 1) {
@@ -251,6 +277,7 @@ export const useNavStore = defineStore('nav', () => {
 
   const pollPackJob = async () => {
     stopPackPolling()
+    if (isTourMode.value) return
     const jobId = packJob.value?.job_id
     if (!jobId) return
     try {
@@ -278,14 +305,8 @@ export const useNavStore = defineStore('nav', () => {
     }
   }
 
-  const loadGeneratedPack = async (packId) => {
-    const metadata = await api.getPack(packId)
-    packMetadata.value = metadata
-    if (!metadata.manifest_url) return
-    const manifest = await api.fetchPackJson(metadata.manifest_url)
-    const manifestUrl = new URL(metadata.manifest_url, window.location.origin)
-    const routeUrl = new URL('route.geojson', manifestUrl)
-    const route = await api.fetchPackJson(routeUrl.toString())
+  const applyLoadedPack = ({ packId, metadata, manifest, manifestUrl, route }) => {
+    const normalizedManifestUrl = new URL(manifestUrl, window.location.origin).toString()
     const visitById = new Map((manifest.spots || []).map((spot) => [spot.spot_id, spot]))
     const itinerarySpotIds = [...new Set(
       (manifest.days || []).flatMap((day) => (day.items || []).map((item) => item.spot_id))
@@ -304,24 +325,160 @@ export const useNavStore = defineStore('nav', () => {
         spot_id: spot.spot_id,
         variant,
         situation: variant === 'base' ? null : variant,
-        audio_url: asset.file ? new URL(asset.file, manifestUrl).toString() : null,
+        audio_url: asset.file ? new URL(asset.file, normalizedManifestUrl).toString() : null,
         text: asset.text || null,
       }))
     )
     plan.value = {
       ...plan.value,
       pack_id: packId,
-      pack_state: metadata.state,
-      manifest_url: metadata.manifest_url,
+      pack_state: metadata?.state || manifest.state,
+      manifest_url: normalizedManifestUrl,
       manifest,
       playback_rules: manifest.playback_rules,
       route,
+      polyline: null,
       waypoints_info: visitSpots,
       along_pois: alongPois,
       assets,
-      missing: metadata.missing || manifest.missing || [],
+      missing: metadata?.missing || manifest.missing || [],
       createdAt: Date.now(),
+      cacheKey: `pack-${packId}-${manifest.pack_epoch}`,
     }
+  }
+
+  const installLoadedPack = async ({ manifest, manifestUrl, route }) => {
+    packImport.value = {
+      ...emptyPackImport(),
+      state: 'route',
+    }
+    try {
+      const result = await cacheOfflinePack({
+        manifest,
+        manifestUrl,
+        route,
+        onProgress(progress) {
+          packImport.value = {
+            ...packImport.value,
+            ...progress,
+            error: null,
+          }
+        },
+      })
+      installedPack.value = result.record
+      packImport.value = {
+        ...packImport.value,
+        state: result.record?.state || 'partial',
+        verification: result.verification,
+      }
+      return result
+    } catch (installError) {
+      packImport.value = {
+        ...packImport.value,
+        state: 'failed',
+        error: installError.message || '端末への取り込みに失敗しました',
+      }
+      error.value = packImport.value.error
+      return null
+    }
+  }
+
+  const restoreOfflinePack = async (packId = null) => {
+    try {
+      const stored = await loadStoredOfflinePack(packId)
+      if (!stored?.manifest || !stored.route) return false
+      installedPack.value = stored.record
+      const restoredState = stored.verification.routeCached
+        && stored.verification.missing.length === 0
+        && !(stored.record.tiles?.failed > 0)
+        ? 'ready'
+        : 'partial'
+      packImport.value = {
+        ...emptyPackImport(),
+        state: restoredState,
+        audio: stored.record.audio || {
+          done: stored.verification.cached,
+          total: stored.verification.expected,
+          failed: stored.verification.missing.length,
+        },
+        tiles: stored.record.tiles || emptyPackImport().tiles,
+        route: {
+          done: 1,
+          total: 1,
+          failed: stored.verification.routeCached ? 0 : 1,
+        },
+        verification: stored.verification,
+      }
+      packMetadata.value = {
+        state: stored.manifest.state,
+        manifest_url: stored.manifestUrl,
+        missing: stored.manifest.missing || [],
+      }
+      applyLoadedPack({
+        packId: stored.manifest.pack_id,
+        metadata: packMetadata.value,
+        manifest: stored.manifest,
+        manifestUrl: stored.manifestUrl,
+        route: stored.route,
+      })
+      if (packId) packJob.value = null
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  const loadGeneratedPack = async (packId) => {
+    if (await restoreOfflinePack(packId)) return
+    const metadata = await api.getPack(packId)
+    packMetadata.value = metadata
+    if (!metadata.manifest_url) return
+    const manifest = await api.fetchPackJson(metadata.manifest_url)
+    const manifestUrl = new URL(metadata.manifest_url, window.location.origin)
+    const routeUrl = new URL('route.geojson', manifestUrl)
+    const route = await api.fetchPackJson(routeUrl.toString())
+    applyLoadedPack({
+      packId,
+      metadata,
+      manifest,
+      manifestUrl: manifestUrl.toString(),
+      route,
+    })
+    await installLoadedPack({ manifest, manifestUrl: manifestUrl.toString(), route })
+  }
+
+  const verifyInstalledPack = async () => {
+    const manifest = plan.value?.manifest
+    const manifestUrl = plan.value?.manifest_url
+    if (!manifest || !manifestUrl) return null
+    const verification = await verifyOfflinePack(manifest, manifestUrl)
+    const verifiedState = verification.routeCached
+      && verification.missing.length === 0
+      && !(packImport.value.tiles?.failed > 0)
+      ? 'ready'
+      : 'partial'
+    packImport.value = {
+      ...packImport.value,
+      state: verifiedState,
+      verification,
+    }
+    return verification
+  }
+
+  const enterTourMode = async () => {
+    const verification = await verifyInstalledPack()
+    if (!installedPack.value || !verification?.routeCached) {
+      error.value = '先に案内パックを端末へ取り込んでください'
+      return false
+    }
+    stopPackPolling()
+    isTourMode.value = true
+    error.value = null
+    return true
+  }
+
+  const exitTourMode = () => {
+    isTourMode.value = false
   }
 
   function stopPackPolling() {
@@ -332,6 +489,7 @@ export const useNavStore = defineStore('nav', () => {
   }
 
   const resumePackPolling = () => {
+    if (isTourMode.value) return
     if (!['queued', 'running'].includes(packJob.value?.state)) return
     isNavigating.value = true
     if (!packStartedAt.value) packStartedAt.value = Date.now()
@@ -383,10 +541,14 @@ export const useNavStore = defineStore('nav', () => {
     packJob,
     packMetadata,
     packStartedAt,
+    packImport,
+    installedPack,
+    isTourMode,
     // Getters
     isRouteReady,
     isNavigationReady,
     isPackGenerating,
+    isPackImporting,
     waypoints,
     alongPois,
     // Actions
@@ -399,6 +561,10 @@ export const useNavStore = defineStore('nav', () => {
     fetchSpots,
     setCandidates,
     applyItineraryState,
+    restoreOfflinePack,
+    verifyInstalledPack,
+    enterTourMode,
+    exitTourMode,
   }
 }, {
   persist: true // LocalStorageに保存

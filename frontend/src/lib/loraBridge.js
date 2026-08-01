@@ -1,3 +1,5 @@
+import { decodeDownlinkHex } from './loraCodec'
+
 // ==========================================================
 // ★ 実行環境の自動判別 ★
 // ==========================================================
@@ -72,9 +74,9 @@ async function processLine(fullResponse) {
       const fport = parseInt(match[1], 10);
       const hexData = match[2];
       console.log(`[LoRa DATA] Port ${fport} で受信したペイロードHEX: ${hexData}`);
-      const decodedStr = hexToString(hexData);
-      console.log(`[LoRa DATA] デコードした文字列: ${decodedStr}`);
-      onDataReceived(JSON.parse(decodedStr));
+      const downlink = decodeDownlinkHex(hexData);
+      if (!downlink) return;
+      onDataReceived(downlink);
     } catch (e) { console.error('受信データのパースに失敗:', e); }
   }
 }
@@ -363,16 +365,4 @@ export async function send(data) {
 
   console.log(`データ送信: ${JSON.stringify(commandString)}`);
   await _write(commandString); // 送信ヘルパーを利用
-}
-
-
-// ==========================================================
-// ★ ユーティリティ関数 (hexToString) ★
-// ==========================================================
-function hexToString(hex) {
-  let str = '';
-  for (let i = 0; i < hex.length; i += 2) {
-    str += String.fromCharCode(parseInt(hex.substr(i, 2), 16));
-  }
-  return str;
 }

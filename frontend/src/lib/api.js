@@ -1,6 +1,6 @@
 // src/lib/api.js
 
-const configuredBase = import.meta.env.VITE_API_BASE ?? '/api/v1'
+const configuredBase = import.meta.env?.VITE_API_BASE ?? '/api/v1'
 export const API_BASE = String(configuredBase || '/api/v1').replace(/\/+$/, '')
 
 function storedToken() {

@@ -14,7 +14,7 @@ export const useUserStore = defineStore('user', () => {
 
   async function _loadSpots() {
     try {
-      await useNavStore().fetchSpots()
+      await useNavStore().fetchSpots({ force: true })
     } catch (error) {
       console.error('Failed to load spots:', error)
     }

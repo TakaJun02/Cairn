@@ -162,6 +162,14 @@
 
       <div class="top-left-ui-area">
         <div class="controls">
+          <div v-if="isTourMode" class="tour-mode-banner" role="status">
+            <div>
+              <strong>観光モード</strong>
+              <span>{{ realtimeStatusText }}</span>
+            </div>
+            <button type="button" @click="leaveTourMode">観光モードを終了</button>
+          </div>
+
           <div v-if="!isNavigationReady || packJob" class="start-nav-panel">
             <button
               v-if="!packJob || ['partial', 'failed'].includes(packJob.state)"
@@ -237,6 +245,45 @@
               エラー: {{ navError }}
             </div>
           </div>
+
+          <div v-if="isNavigationReady" class="offline-pack-panel" role="status" aria-live="polite">
+            <div class="offline-pack-panel__header">
+              <strong>オフライン資材</strong>
+              <span>{{ packImportStateLabel }}</span>
+            </div>
+            <div class="offline-pack-panel__progress">
+              <span>音声 {{ packImport.audio.done }} / {{ packImport.audio.total }}</span>
+              <span>タイル {{ packImport.tiles.done }} / {{ packImport.tiles.total }}</span>
+            </div>
+            <p v-if="packImport.verification">
+              自己検証: {{ packImport.verification.cached }} / {{ packImport.verification.expected }} 本
+              <strong v-if="packImport.verification.missing.length" class="offline-pack-panel__warning">
+                （{{ packImport.verification.missing.length }} 本足りません）
+              </strong>
+              <strong v-else>（完了）</strong>
+            </p>
+            <p v-if="packImport.tiles.quotaExceeded" class="offline-pack-panel__warning">
+              保存容量の上限に達したため、表示件数の地点でタイル取得を停止しました。
+            </p>
+            <p v-if="packImport.verification && !packImport.verification.routeCached" class="offline-pack-panel__warning">
+              経路データが足りません。観光モードは開始できません。
+            </p>
+            <p v-if="packImport.error" class="offline-pack-panel__warning">{{ packImport.error }}</p>
+            <div class="offline-pack-panel__actions">
+              <button type="button" :disabled="isPackImporting" @click="verifyOfflineAssets">
+                取り込みを再検証
+              </button>
+              <button
+                v-if="!isTourMode"
+                type="button"
+                class="offline-pack-panel__primary"
+                :disabled="!canEnterTourMode || isPackImporting"
+                @click="beginTourMode"
+              >
+                観光モードを開始
+              </button>
+            </div>
+          </div>
           
           <div v-if="isRouteReady" class="control-buttons">
             <button @click="togglePolling" class="control-btn data-sync-btn" :class="{'is-active': isPollingEnabled}" title="リアルタイム情報">
@@ -305,10 +352,6 @@
                         title="施設"
                         aria-label="施設"
                       >🏢</span>
-                      <span v-if="latestBySpot(poi.spot_id)?.u > 0" class="rt-badge upcoming" :title="upcomingTitle(latestBySpot(poi.spot_id))">
-                        {{ upcomingEmoji(latestBySpot(poi.spot_id)?.u) }}
-                        <small v-if="typeof latestBySpot(poi.spot_id)?.h === 'number'">{{ latestBySpot(poi.spot_id)?.h }}h</small>
-                      </span>
                       <span
                         class="rt-badge crowd"
                         :class="crowdBadge(latestBySpot(poi.spot_id)).className"
@@ -369,6 +412,7 @@ import {
 
 import { enqueueAudio, resetPlaybackState, useAudioPlaybackState, primeAudioPlayback } from '@/lib/audioManager.js'
 import * as geo from '@/lib/geoutils.js'
+import { advanceArrivalState, playbackVariants } from '@/lib/offlinePack'
 import { tilesForRoute } from '@/lib/tiles'
 import { sendSwMessage } from '@/lib/swClient'
 import { fetchPoiCatalog } from '@/lib/poi'
@@ -388,10 +432,16 @@ const {
   packJob,
   packMetadata,
   packStartedAt,
+  packImport,
+  installedPack,
+  isTourMode,
+  isPackImporting,
 } = storeToRefs(navStore)
 
 const navMap = ref(null)
-const playbackState = useAudioPlaybackState()
+const audioPlaybackState = useAudioPlaybackState()
+const textOnlyCaption = ref(null)
+const playbackState = computed(() => audioPlaybackState.value || textOnlyCaption.value)
 const isSpotListVisible = ref(true)
 const online = ref(navigator.onLine)
 const isLoraConnecting = ref(false)
@@ -416,6 +466,11 @@ const isDebug = computed(() => !!isMock)
 const isDebugPanelVisible = ref(false)
 const progressClock = ref(Date.now())
 let progressClockId = null
+let textCaptionTimer = null
+const pendingTextCaptions = []
+const arrivalArmed = new Map()
+const arrivalCycles = new Map()
+let nextPassByIndex = 0
 
 const packProgress = computed(() => packJob.value?.progress || { done: 0, total: 0, failed: 0 })
 const packFailures = computed(() => packMetadata.value?.missing || packJob.value?.failures || [])
@@ -435,6 +490,24 @@ const packElapsedText = computed(() => {
   if (!packStartedAt.value) return '0:00'
   const seconds = Math.max(0, Math.floor((progressClock.value - packStartedAt.value) / 1000))
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+})
+const packImportStateLabel = computed(() => ({
+  idle: '未取り込み',
+  route: '経路を保存中',
+  audio: '音声を保存中',
+  tiles: 'タイルを保存中',
+  verify: '自己検証中',
+  ready: '取り込み済み',
+  partial: '一部不足',
+  failed: '取り込み失敗',
+}[packImport.value.state] || packImport.value.state))
+const canEnterTourMode = computed(() => (
+  !!installedPack.value && !!packImport.value.verification?.routeCached
+))
+const realtimeStatusText = computed(() => {
+  if (rtStore.stale) return 'パックが古い（要再取得）'
+  if (!rtStore.lastReceivedAt) return 'リアルタイム情報なし'
+  return `${new Date(rtStore.lastReceivedAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })} 時点`
 })
 
 async function loadFacilityCatalog() {
@@ -483,6 +556,59 @@ const tileProfileIndex = ref(0)
 
 const primeOnFirstPointer = () => {
   primeAudioPlayback().catch(() => {})
+}
+
+function startTextCaptionTimer() {
+  if (textCaptionTimer != null || !textOnlyCaption.value || audioPlaybackState.value) return
+  textCaptionTimer = window.setTimeout(() => {
+    textCaptionTimer = null
+    textOnlyCaption.value = null
+    showNextTextCaption()
+  }, 8000)
+}
+
+function showNextTextCaption() {
+  if (audioPlaybackState.value || textOnlyCaption.value || pendingTextCaptions.length === 0) return
+  textOnlyCaption.value = pendingTextCaptions.shift()
+  startTextCaptionTimer()
+}
+
+function enqueueTextCaption(id, name, text) {
+  pendingTextCaptions.push({
+    id,
+    name,
+    text: text || 'この案内の音声・字幕はパックに含まれていません。',
+    isLoading: false,
+    error: null,
+  })
+  showNextTextCaption()
+}
+
+function clearTextCaptions() {
+  if (textCaptionTimer != null) {
+    clearTimeout(textCaptionTimer)
+    textCaptionTimer = null
+  }
+  pendingTextCaptions.length = 0
+  textOnlyCaption.value = null
+}
+
+watch(audioPlaybackState, (state) => {
+  if (state) {
+    if (textCaptionTimer != null) {
+      clearTimeout(textCaptionTimer)
+      textCaptionTimer = null
+    }
+    return
+  }
+  if (textOnlyCaption.value) startTextCaptionTimer()
+  else showNextTextCaption()
+})
+
+function resetArrivalTracking() {
+  arrivalArmed.clear()
+  arrivalCycles.clear()
+  nextPassByIndex = 0
 }
 
 const planAssetsList = computed(() => {
@@ -607,6 +733,7 @@ const startGuidance = async () => {
 // --- ★★★ ここまで ★★★ ---
 
 const handleSwMessage = (event) => {
+  if (isTourMode.value) return
   const data = event.data
   if (data?.type === 'PRECACHE_TILES_RESULT' && data.summary) {
     const { added, skipped, failed, quotaExceeded } = data.summary
@@ -672,15 +799,22 @@ watch(
 
 onMounted(async () => {
   progressClockId = window.setInterval(() => { progressClock.value = Date.now() }, 1000)
-  navStore.resumePackPolling()
   window.addEventListener('pointerdown', primeOnFirstPointer, { once: true })
 
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.addEventListener('message', handleSwMessage)
   }
 
-  // ★★★ isRouteReadyをチェックするように修正 ★★★
+  if (!isRouteReady.value || (isTourMode.value && !isNavigationReady.value)) {
+    await navStore.restoreOfflinePack()
+  }
+  if (isTourMode.value && !isNavigationReady.value) navStore.exitTourMode()
+  if (!isTourMode.value) {
+    navStore.resumePackPolling()
+  }
+
   if (!isRouteReady.value) {
+    if (isTourMode.value) navStore.exitTourMode()
     router.push('/plan')
     return
   }
@@ -697,6 +831,8 @@ onUnmounted(() => {
   rtStore.stopPolling()
   stopLoraPolling()
   resetPlaybackState()
+  clearTextCaptions()
+  resetArrivalTracking()
   resetAssetPrefetchState()
   if (isLoraConnected.value) {
     disconnectLoraDevice()
@@ -719,8 +855,13 @@ const clearTileCache = async () => {
 }
 
 watch(
-  () => plan.value?.cacheKey,
-  async (cacheKey, prevKey) => {
+  [() => plan.value?.cacheKey, isTourMode],
+  async ([cacheKey, tourMode], [prevKey] = []) => {
+    if (tourMode) return
+    if (plan.value?.manifest) {
+      cachedPlanKey.value = cacheKey
+      return
+    }
     if (!cacheKey || !plan.value?.polyline?.length) {
       if (prevKey) await clearTileCache()
       cachedPlanKey.value = null
@@ -750,12 +891,13 @@ watch(
 watch(
   () => isNavigating.value,
   async (navigating) => {
-    if (!navigating || !plan.value?.polyline?.length) return
+    if (isTourMode.value || !navigating || !plan.value?.polyline?.length) return
     await requestTilePrecache(plan.value.polyline, { force: true })
   }
 )
 
 async function requestTilePrecache(polyline, { force = false } = {}) {
+  if (isTourMode.value) return
   if (!('serviceWorker' in navigator)) return
   if (!force && didPrecacheTiles.value) return
   const profile = activeTileProfile()
@@ -810,7 +952,13 @@ watch(currentPos, (newPos) => {
 watch(
   [isNavigationReady, () => planAssetsList.value],
   ([ready, assets]) => {
-    if (!ready) return
+    if (
+      !ready
+      || isTourMode.value
+      || installedPack.value
+      || isPackImporting.value
+      || ['ready', 'partial'].includes(packJob.value?.state)
+    ) return
     queueAssetPrefetch(assets)
   },
   { immediate: true }
@@ -825,6 +973,18 @@ watch(
   },
   { immediate: true }
 )
+
+watch(
+  [() => plan.value?.pack_id ?? null, isTourMode],
+  () => {
+    resetArrivalTracking()
+    clearTextCaptions()
+  },
+)
+
+watch(isTourMode, (active) => {
+  if (active) rtStore.stopPolling()
+}, { immediate: true })
 
 watch(
   () => plan.value?.waypoints_info,
@@ -878,33 +1038,60 @@ function enqueueAssetAudio(id, displayName, asset, { fallbackText = null } = {})
   return true
 }
 
-// スポット接近時の通常案内をキューに追加するロジック
-watch(currentPos, (newPos) => {
-  // ★★★ isNavigationReadyをチェックする条件を追加 ★★★
-  if (!isNavigationReady.value || !plan.value || !newPos) return;
+function enqueueArrivalGuidance(spot, arrivalKey) {
+  const manifest = plan.value?.manifest
+  if (!manifest) return
+  const cycle = (arrivalCycles.get(arrivalKey) || 0) + 1
+  arrivalCycles.set(arrivalKey, cycle)
+  const spotName = spot.name_ja || spot.name || spot.spot_id
+  const variants = playbackVariants(manifest, rtStore.getLatest(spot.spot_id))
 
-  const allSpots = [
-    ...(plan.value?.waypoints_info || []),
-    ...(plan.value?.along_pois || [])
-  ];
-  if (allSpots.length === 0) return;
-
-  const assetsArray = planAssetsList.value
-  if (!assetsArray.length) return
-
-  allSpots.forEach((spot) => {
-    if (!spot.lat || !spot.lon) return;
-    const distance = geo.calculateDistance(newPos, { lat: spot.lat, lng: spot.lon });
-    const triggerRadiusM = Number(spot.trigger_radius_m)
-    if (!Number.isFinite(triggerRadiusM) || triggerRadiusM <= 0) return
-
-    if (distance <= triggerRadiusM) {
-      const asset = assetsArray.find((a) => a.spot_id === spot.spot_id && !a.situation);
-
-      enqueueAssetAudio(spot.spot_id, spot.name, asset);
+  for (const variant of variants) {
+    const asset = spot.assets?.[variant]
+    const label = variant === 'base'
+      ? spotName
+      : `${spotName} · ${variant}`
+    const id = `${arrivalKey}:${cycle}:${variant}`
+    if (asset?.file) {
+      enqueueAssetAudio(id, label, {
+        audio_url: new URL(asset.file, plan.value.manifest_url).toString(),
+        text: asset.text || null,
+      })
+    } else {
+      enqueueTextCaption(id, label, asset?.text || `${spotName}の${variant}案内音声がありません。`)
     }
-  });
-});
+  }
+}
+
+function checkArrival(spot, key, newPos) {
+  const lat = Number(spot?.lat)
+  const lon = Number(spot?.lon)
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false
+  const distance = geo.calculateDistance(newPos, { lat, lng: lon })
+  const currentArmed = arrivalArmed.has(key) ? arrivalArmed.get(key) : true
+  const next = advanceArrivalState(currentArmed, distance, spot.trigger_radius_m)
+  arrivalArmed.set(key, next.armed)
+  if (next.triggered) enqueueArrivalGuidance(spot, key)
+  return next.triggered
+}
+
+// 観光モードの到達判定。visit は全件、pass_by は route_position 順の次の 1 件だけを見る。
+watch(currentPos, (newPos) => {
+  if (!isTourMode.value || !isNavigationReady.value || !newPos) return
+  const manifest = plan.value?.manifest
+  if (!manifest) return
+
+  for (const spot of manifest.spots || []) {
+    checkArrival(spot, `visit:${spot.spot_id}`, newPos)
+  }
+
+  const passBy = [...(manifest.along || [])]
+    .sort((a, b) => Number(a.route_position) - Number(b.route_position))
+  const nextSpot = passBy[nextPassByIndex]
+  if (nextSpot && checkArrival(nextSpot, `pass_by:${nextPassByIndex}:${nextSpot.spot_id}`, newPos)) {
+    nextPassByIndex += 1
+  }
+})
 
 // LoRa受信データをトリガーに状況別案内をキューに追加するロジック
 watch(
@@ -920,7 +1107,7 @@ watch(
       event: lastEvent,
     })
 
-    if (newLength <= oldLength || !isNavigationReady.value || !plan.value) return;
+    if (isTourMode.value || newLength <= oldLength || !isNavigationReady.value || !plan.value) return;
 
     const event = rtStore.notifyLog[newLength - 1];
     const spotId = event.spot_id;
@@ -1047,7 +1234,7 @@ async function connectLoraDevice() {
   isLoraConnecting.value = true
   try {
     await connect(
-      (receivedData) => rtStore.processRtDoc(receivedData),
+      (receivedData) => rtStore.applyDownlink(receivedData, plan.value?.manifest),
       () => {
         pushToast('LoRa', 'Device disconnected.', 5000)
         disconnectLoraDevice()
@@ -1074,7 +1261,7 @@ async function disconnectLoraDevice() {
   stopLoraPolling()
   await disconnect()
   isLoraConnected.value = false
-  if (online.value && isPollingEnabled.value) {
+  if (!isTourMode.value && online.value && isPollingEnabled.value) {
     rtStore.startPolling(plan.value?.waypoints_info || [])
   } else {
     rtStore.stopPolling()
@@ -1086,6 +1273,10 @@ window.addEventListener('online', _updateOnline)
 window.addEventListener('offline', _updateOnline)
 
 watch(online, (isOnline) => {
+  if (isTourMode.value) {
+    rtStore.stopPolling()
+    return
+  }
   if (isOnline && isNavigationReady.value) {
     queueAssetPrefetch(planAssetsList.value)
   }
@@ -1102,6 +1293,13 @@ watch(online, (isOnline) => {
 
 function startRtPollingIfNeeded() {
   if (!isPollingEnabled.value) return;
+
+  if (isTourMode.value) {
+    rtStore.stopPolling()
+    if (isLoraConnected.value) startLoraPolling()
+    else stopLoraPolling()
+    return
+  }
 
   // ナビ開始前はHTTPポーリングのみ
   if (!isNavigationReady.value) {
@@ -1136,6 +1334,38 @@ function togglePolling() {
   else stopAllRtPolling()
 }
 
+async function verifyOfflineAssets() {
+  const verification = await navStore.verifyInstalledPack()
+  if (!verification) {
+    pushToast('オフライン資材', '取り込み済みのパックがありません。', 5000)
+    return
+  }
+  const body = verification.missing.length
+    ? `音声が ${verification.missing.length} 本足りません。利用できる案内はそのまま使えます。`
+    : '音声と経路の自己検証が完了しました。'
+  pushToast('オフライン資材', body, 5000)
+}
+
+async function beginTourMode() {
+  stopAllRtPolling()
+  const entered = await navStore.enterTourMode()
+  if (!entered) {
+    pushToast('観光モード', '先に案内パックを端末へ取り込んでください。', 5000)
+    startRtPollingIfNeeded()
+    return
+  }
+  resetArrivalTracking()
+  pushToast('観光モード', '通信を使わない観光モードを開始しました。', 5000)
+  if (isPollingEnabled.value && isLoraConnected.value) startLoraPolling()
+}
+
+function leaveTourMode() {
+  navStore.exitTourMode()
+  resetArrivalTracking()
+  if (isPollingEnabled.value) startRtPollingIfNeeded()
+  pushToast('観光モード', '計画モードへ戻りました。', 4000)
+}
+
 
 function toggleSpotList() { isSpotListVisible.value = !isSpotListVisible.value }
 function focusOnSpot(poi) {
@@ -1145,9 +1375,7 @@ function focusOnSpot(poi) {
   }
 }
 function weatherEmoji(w) { return { 0: '☀', 1: '☁', 2: '☂' }[w] || '▫' }
-function upcomingEmoji(u) { return { 1: '↗☁', 2: '↗☔', 3: '↗☀' }[u] || '' }
 function weatherTitle(doc) { if (!doc) return ''; const m = { 0: '晴れ', 1: '曇り', 2: '雨' }; return `現在: ${m[doc.w] ?? '-'}` }
-function upcomingTitle(doc) { if (!doc || !doc.u) return ''; const m = { 1: '曇り', 2: '雨', 3: '晴れ' }; const h = typeof doc.h === 'number' ? `${doc.h}時間後` : ''; return `${h}${m[doc.u] ?? ''}に変化` }
 
 const CROWD_STATES = [
   {
@@ -1172,6 +1400,12 @@ const CROWD_STATES = [
     className: 'is-high'
   }
 ]
+const UNKNOWN_CROWD_STATE = {
+  label: 'Unknown',
+  tooltip: '混雑情報なし',
+  toast: '混雑情報なし',
+  className: 'is-unknown',
+}
 
 const SITUATION_META = {
   weather_cloudy: {
@@ -1195,13 +1429,13 @@ const SITUATION_META = {
 function normalizeCrowd(docOrLevel) {
   const raw = (docOrLevel && typeof docOrLevel === 'object') ? docOrLevel.c : docOrLevel
   const value = Number(raw)
-  if (!Number.isFinite(value)) return 0
+  if (!Number.isFinite(value) || value === 0x0f) return null
   return Math.max(0, Math.min(2, value))
 }
 
 function crowdBadge(doc) {
   const level = normalizeCrowd(doc)
-  return CROWD_STATES[level]
+  return level == null ? UNKNOWN_CROWD_STATE : CROWD_STATES[level]
 }
 
 function queueSituationAnnouncement(spotId, situationType) {
@@ -1679,6 +1913,67 @@ function latestBySpot(spotId) { return rtStore.getLatest?.(spotId) ?? null }
   gap: 12px;
   align-items: flex-start;
 }
+.controls {
+  display: grid;
+  gap: 8px;
+  width: min(320px, calc(100vw - 32px));
+}
+.tour-mode-banner,
+.offline-pack-panel {
+  border-radius: 12px;
+  border: 1px solid rgba(45, 212, 191, 0.4);
+  background: rgba(15, 23, 42, 0.9);
+  color: #e2e8f0;
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.32);
+  backdrop-filter: blur(10px);
+}
+.tour-mode-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+}
+.tour-mode-banner div {
+  display: grid;
+  gap: 2px;
+}
+.tour-mode-banner strong { color: #5eead4; }
+.tour-mode-banner span { font-size: 0.72rem; color: #cbd5e1; }
+.tour-mode-banner button,
+.offline-pack-panel button {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.8);
+  color: #e2e8f0;
+  padding: 6px 9px;
+  cursor: pointer;
+}
+.offline-pack-panel {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  font-size: 0.76rem;
+}
+.offline-pack-panel p { margin: 0; }
+.offline-pack-panel__header,
+.offline-pack-panel__progress,
+.offline-pack-panel__actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.offline-pack-panel__warning { color: #fcd34d; }
+.offline-pack-panel .offline-pack-panel__primary {
+  border-color: rgba(45, 212, 191, 0.55);
+  background: rgba(13, 148, 136, 0.85);
+  color: white;
+}
+.offline-pack-panel button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
 
 /* 横並びコントロールバー */
 .controls .control-buttons {
@@ -1991,6 +2286,10 @@ function latestBySpot(spotId) { return rtStore.getLatest?.(spotId) ?? null }
   background: rgba(248, 113, 113, 0.2);
   color: #f87171;
   box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.32);
+}
+.rt-badge.crowd.is-unknown {
+  background: rgba(148, 163, 184, 0.2);
+  color: #cbd5e1;
 }
 .nearby-section {
   border-top: 1px solid rgba(148, 163, 184, 0.2);
