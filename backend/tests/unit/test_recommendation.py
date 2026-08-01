@@ -278,7 +278,28 @@ async def test_llm_rerank_uses_score_order_and_candidate_limited_guided_schema()
         value.spot.spot_id for value in scored
     ]
     assert schema["properties"]["spot_ids"]["minItems"] == 2
+    assert "uniqueItems" not in schema["properties"]["spot_ids"]
     assert client.kwargs["temperature"] == 0.0
+
+
+async def test_llm_duplicate_ids_are_deduplicated_and_filled_to_k() -> None:
+    repository = MemoryRecommendationRepository()
+    client = CaptureGenerationClient(
+        '{"spot_ids":["spot_006","spot_006","spot_006"]}'
+    )
+    service = RecommendationService(
+        repository,
+        settings=_settings(True),
+        reranker=LLMRecommendationReranker(client),  # type: ignore[arg-type]
+        today_provider=lambda: date(2026, 7, 1),
+    )
+
+    result = await service.recommend(RecommendRequest(k=3), context=_context())
+
+    assert result.rerank_used is True
+    assert len(result.spot_ids) == 3
+    assert len(set(result.spot_ids)) == 3
+    assert result.spot_ids[0] == "spot_006"
 
 
 async def test_rerank_off_is_deterministic_and_emits_provisional_then_final() -> None:

@@ -9,8 +9,8 @@ from typing import Protocol
 from app.core.llm import GenerationClient
 from app.domains.recommendation.scoring import ScoredSpot
 from app.domains.recommendation.types import (
-    RecommendRequest,
     RecommendationContext,
+    RecommendRequest,
 )
 
 
@@ -110,7 +110,6 @@ def _guided_schema(candidate_ids: list[str], k: int) -> dict[str, object]:
                 "items": {"type": "string", "enum": candidate_ids},
                 "minItems": k,
                 "maxItems": k,
-                "uniqueItems": True,
             }
         },
         "required": ["spot_ids"],

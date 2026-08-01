@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -82,7 +82,11 @@ class Settings(BaseSettings):
     embedding_dim: int = Field(default=4096, gt=0, alias="EMBEDDING_DIM")
     embedding_timeout_sec: float = Field(default=120, gt=0, alias="EMBEDDING_TIMEOUT_SEC")
 
-    tavily_api_key: str = Field(default="", alias="TAVILY_API_KEY")
+    # 実環境に旧名が残る移行期間は旧名を優先し、削除後は正規名を読む。
+    tavily_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("tavily_APIkey", "TAVILY_API_KEY"),
+    )
     packs_root: Path = Field(default=Path("/packs"), alias="PACKS_ROOT")
 
     rt_mqtt_broker: str = Field(default="au1.cloud.thethings.network", alias="RT_MQTT_BROKER")
