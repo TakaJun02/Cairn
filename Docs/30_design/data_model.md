@@ -745,6 +745,15 @@ CREATE TABLE app.lora_downlinks (
   last_sent timestamptz,
   PRIMARY KEY (device_id, sent_date)
 );
+
+-- ★ Phase 3（2026-08-02、実装中に追加）。シミュレータの進行状態を 1 行 JSONB で持つ
+--    realtime_lora.md §6 は「CLI と管理 API が同じ処理を呼ぶ」と決めたが、
+--    シナリオと進行位置をどこに置くかを書いていなかった。プロセス内に持つと
+--    再起動で消え、CLI と API で状態が割れるので DB に置く
+CREATE TABLE app.realtime_simulator_state (
+  id    smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),   -- 単一行
+  state jsonb NOT NULL DEFAULT '{}'   -- name / events / next_index / speed / running / virtual_time
+);
 ```
 
 - **`routes` は 1 レッグ = 1 行**([ADR-0013](../adr/0013-leg-route-door-to-door.md))。旧案の `legs` / `waypoints_info` 列は**廃止**した(レッグ単位に経由地の概念がない)。`params.osrm_build` を鍵に含めるので、**地図データを作り直すと経路キャッシュが自然に無効化される**

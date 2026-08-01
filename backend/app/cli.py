@@ -46,6 +46,12 @@ from app.domains.packs.storage import (
     PackStorage,
     garbage_collect_packs,
 )
+from app.domains.realtime.simulator import (
+    SimulatorError,
+    SimulatorService,
+    load_scenario_file,
+)
+from app.domains.realtime.store import RealtimeSpotNotFoundError, RealtimeStore
 from app.seeds import (
     SeedValidationError,
     load_seed_bundle,
@@ -320,6 +326,132 @@ def gc_packs_command(
 
     result = _run_async(_gc_packs(keep, dry_run))
     _emit({"command": "gc-packs", "status": "ok", **result})
+
+
+def _scenario_path(path: Path) -> Path:
+    """repo 起点の `backend/data/...` とコンテナ起点の `data/...` の両方を受ける。"""
+
+    if path.is_file():
+        return path
+    if path.parts and path.parts[0] == "backend":
+        candidate = Path(*path.parts[1:])
+        if candidate.is_file():
+            return candidate
+    return path
+
+
+async def _rt_load(path: Path) -> dict[str, Any]:
+    scenario = load_scenario_file(_scenario_path(path))
+    async with session_scope() as session:
+        state = await SimulatorService(session).load(scenario)
+    return state.model_dump(mode="json")
+
+
+@cli.command("rt-load")
+def rt_load_command(scenario_path: Path) -> None:
+    """JSON シナリオを検証し、進行状態とともに DB へ投入する。"""
+
+    try:
+        result = _run_async(_rt_load(scenario_path))
+    except (SimulatorError, ValueError) as exc:
+        typer.echo(f"rt-load failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    _emit({"command": "rt-load", "status": "ok", **result})
+
+
+async def _rt_start(speed: float) -> dict[str, Any]:
+    async with session_scope() as session:
+        state = await SimulatorService(session).start(speed=speed)
+    return state.model_dump(mode="json")
+
+
+@cli.command("rt-start")
+def rt_start_command(
+    speed: float = typer.Option(1.0, "--speed", min=0.000001, help="実時間倍率"),
+) -> None:
+    """投入済みシナリオの進行を開始する。"""
+
+    try:
+        result = _run_async(_rt_start(speed))
+    except (SimulatorError, ValueError) as exc:
+        typer.echo(f"rt-start failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    _emit({"command": "rt-start", "status": "ok", **result})
+
+
+async def _rt_stop() -> dict[str, Any]:
+    async with session_scope() as session:
+        state = await SimulatorService(session).stop()
+    return state.model_dump(mode="json")
+
+
+@cli.command("rt-stop")
+def rt_stop_command() -> None:
+    """シナリオの経過時刻を DB に確定して停止する。"""
+
+    try:
+        result = _run_async(_rt_stop())
+    except (SimulatorError, ValueError) as exc:
+        typer.echo(f"rt-stop failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    _emit({"command": "rt-stop", "status": "ok", **result})
+
+
+async def _rt_set(
+    spot_id: str,
+    weather: int | None,
+    congestion: int | None,
+) -> dict[str, object]:
+    async with session_scope() as session:
+        value = await RealtimeStore(session).set(
+            spot_id,
+            weather=weather,
+            congestion=congestion,
+            source="simulated",
+        )
+    return value.as_dict()
+
+
+@cli.command("rt-set")
+def rt_set_command(
+    spot_id: str,
+    weather: int | None = typer.Option(None, "--weather", min=0, max=2),
+    congestion: int | None = typer.Option(None, "--congestion", min=0, max=2),
+) -> None:
+    """1 スポットの現在値を設定する。省略した軸は unknown(NULL) にする。"""
+
+    try:
+        result = _run_async(_rt_set(spot_id, weather, congestion))
+    except (RealtimeSpotNotFoundError, ValueError) as exc:
+        typer.echo(f"rt-set failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    _emit({"command": "rt-set", "status": "ok", "spot": result})
+
+
+async def _rt_show() -> dict[str, object]:
+    async with session_scope() as session:
+        await SimulatorService(session).tick()
+        spots = await RealtimeStore(session).list_all()
+    values = [spot.as_dict() for spot in spots]
+    return {
+        "spots": values,
+        "known": sum(
+            value["weather"] is not None or value["congestion"] is not None
+            for value in values
+        ),
+        "unknown": sum(
+            value["weather"] is None and value["congestion"] is None
+            for value in values
+        ),
+    }
+
+
+@cli.command("rt-show")
+def rt_show_command() -> None:
+    """static.spots の全件を表示し、行が無い地点も NULL として区別する。"""
+
+    result = _run_async(_rt_show())
+    _emit({"command": "rt-show", "status": "ok", **result})
 
 
 @cli.command("export-openapi")

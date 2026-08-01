@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "鳥海山観光ガイダンスシステムのバックエンド"
 requires-python = ">=3.11"
 dependencies = [
+  "aiomqtt>=2.3,<3",
   "alembic>=1.13,<2",
   "asyncpg>=0.29,<1",
   "fastapi>=0.111,<1",

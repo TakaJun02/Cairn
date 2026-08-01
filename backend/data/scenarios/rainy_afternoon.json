@@ -1,0 +1,24 @@
+{
+  "name": "rainy_afternoon",
+  "base_time": "2026-08-10T09:00:00+09:00",
+  "events": [
+    {
+      "at_min": 0,
+      "spot_id": "spot_007",
+      "weather": 0,
+      "congestion": 1
+    },
+    {
+      "at_min": 180,
+      "spot_id": "spot_007",
+      "weather": 2,
+      "congestion": 2
+    },
+    {
+      "at_min": 180,
+      "spot_id": "spot_012",
+      "weather": 2,
+      "congestion": 0
+    }
+  ]
+}

@@ -13,6 +13,7 @@ from app.api.routers.chat import router as chat_router
 from app.api.routers.health import router as health_router
 from app.api.routers.itinerary import router as itinerary_router
 from app.api.routers.packs import router as packs_router
+from app.api.routers.realtime import router as realtime_router
 from app.api.routers.routes import router as routes_router
 from app.api.routers.spots import router as spots_router
 from app.api.routers.users import router as users_router
@@ -20,12 +21,14 @@ from app.core.config import get_settings
 from app.core.db import dispose_engine
 from app.core.logging import RequestIdMiddleware, configure_logging
 from app.domains.packs.storage import ImmutablePackStaticFiles
+from app.domains.realtime.mqtt import RealtimeMQTTService
+from app.domains.realtime.simulator import RealtimeSimulatorCoordinator
 from app.jobs.worker import PackJobWorker
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-    """プロセス内パックワーカーをアプリと同じ寿命で管理する。"""
+    """プロセス内 worker/MQTT/simulator をアプリと同じ寿命で管理する。"""
 
     settings = get_settings()
     configure_logging(settings.log_level)
@@ -33,9 +36,17 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     worker = PackJobWorker(settings)
     await worker.start()
     application.state.pack_job_worker = worker
+    simulator = RealtimeSimulatorCoordinator(settings)
+    await simulator.start()
+    application.state.realtime_simulator = simulator
+    mqtt = RealtimeMQTTService(settings)
+    await mqtt.start()
+    application.state.realtime_mqtt = mqtt
     try:
         yield
     finally:
+        await mqtt.stop()
+        await simulator.stop()
         await worker.stop()
         await dispose_engine()
         logging.getLogger("app.lifecycle").info("application_stopped")
@@ -64,6 +75,7 @@ def create_app() -> FastAPI:
     application.include_router(spots_router)
     application.include_router(routes_router)
     application.include_router(packs_router)
+    application.include_router(realtime_router)
     application.mount(
         "/packs",
         ImmutablePackStaticFiles(directory=settings.packs_root, check_dir=False),

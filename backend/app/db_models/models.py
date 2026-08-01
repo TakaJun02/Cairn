@@ -465,3 +465,45 @@ class LoraDownlink(Base):
     sent_date: Mapped[date] = mapped_column(Date, primary_key=True)
     count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     last_sent: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RealtimeSimulatorState(Base):
+    """CLI と app プロセスが共有するシミュレータの単一行状態。"""
+
+    __tablename__ = "realtime_simulator_state"
+    __table_args__ = (
+        CheckConstraint("singleton_id = 1"),
+        CheckConstraint("speed > 0"),
+        CheckConstraint("elapsed_min >= 0"),
+        CheckConstraint("next_event_index >= 0"),
+        {"schema": "app"},
+    )
+
+    singleton_id: Mapped[int] = mapped_column(
+        SmallInteger,
+        primary_key=True,
+        server_default=text("1"),
+    )
+    scenario: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    running: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+    )
+    speed: Mapped[float] = mapped_column(REAL, nullable=False, server_default=text("1"))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    elapsed_min: Mapped[float] = mapped_column(
+        REAL,
+        nullable=False,
+        server_default=text("0"),
+    )
+    next_event_index: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_NOW,
+    )

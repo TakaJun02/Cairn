@@ -94,6 +94,7 @@ class Settings(BaseSettings):
     )
     packs_root: Path = Field(default=Path("/packs"), alias="PACKS_ROOT")
 
+    rt_mqtt_enabled: bool = Field(default=False, alias="RT_MQTT_ENABLED")
     rt_mqtt_broker: str = Field(default="au1.cloud.thethings.network", alias="RT_MQTT_BROKER")
     rt_mqtt_port: int = Field(default=8883, ge=1, le=65535, alias="RT_MQTT_PORT")
     rt_mqtt_user: str = Field(default="", alias="RT_MQTT_USER")
@@ -159,6 +160,21 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allow_origins.split(",") if origin.strip()]
+
+    @property
+    def realtime_mqtt_configured(self) -> bool:
+        """接続に必要な値がすべて明示された場合だけ MQTT を有効にする。"""
+
+        return self.rt_mqtt_enabled and all(
+            value.strip()
+            for value in (
+                self.rt_mqtt_broker,
+                self.rt_mqtt_user,
+                self.rt_mqtt_pass,
+                self.ttn_app_id,
+                self.ttn_device_id,
+            )
+        )
 
 
 @lru_cache(maxsize=1)
