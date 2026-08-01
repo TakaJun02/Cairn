@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+import inspect
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import ValidationError
@@ -30,6 +31,7 @@ from app.domains.itinerary.solver import (
 )
 from app.domains.itinerary.types import (
     Constraint,
+    Diff,
     EditItineraryResult,
     Itinerary,
     Mode,
@@ -45,11 +47,23 @@ if TYPE_CHECKING:
 
 
 class SolutionSelector(Protocol):
-    def __call__(self, solutions: Sequence[Itinerary], free_text: str) -> Itinerary: ...
+    def __call__(
+        self,
+        solutions: Sequence[Itinerary],
+        free_text: str,
+    ) -> Itinerary | Awaitable[Itinerary]: ...
 
 
 class LegRouteProvider(Protocol):
     async def route_id_for_leg(self, source: str, target: str, mode: Mode) -> str: ...
+
+
+class ProvisionalItinerarySink(Protocol):
+    def __call__(
+        self,
+        itinerary: Itinerary,
+        diff: Diff,
+    ) -> None | Awaitable[None]: ...
 
 
 UtilityInput = Mapping[str, float] | Callable[[Any], float]
@@ -63,11 +77,13 @@ class ItineraryService:
         solver_config: SolverConfig | None = None,
         selector: SolutionSelector | None = None,
         route_provider: LegRouteProvider | None = None,
+        provisional_sink: ProvisionalItinerarySink | None = None,
     ) -> None:
         self.repository = repository
         self.solver_config = solver_config or SolverConfig()
         self.selector = selector
         self.route_provider = route_provider
+        self.provisional_sink = provisional_sink
 
     async def plan_itinerary(
         self,
@@ -126,7 +142,16 @@ class ItineraryService:
                 config=self.solver_config,
             )
             solved = solve_itinerary(solver_input)
-            selected, alternatives, selection_used = _select_solution_with_alternatives(
+            await _emit_provisional(
+                self.provisional_sink,
+                solved.solutions[0].model_copy(update={"version": 1}, deep=True),
+                Diff(),
+            )
+            (
+                selected,
+                alternatives,
+                selection_used,
+            ) = await _select_solution_with_alternatives(
                 solved.solutions,
                 selection_text,
                 selector=self.selector,
@@ -282,7 +307,20 @@ class ItineraryService:
             config=self.solver_config,
         )
         solved = solve_itinerary(solver_input)
-        selected, alternatives, selection_used = _select_solution_with_alternatives(
+        provisional = solved.solutions[0].model_copy(
+            update={"version": current.version + 1},
+            deep=True,
+        )
+        await _emit_provisional(
+            self.provisional_sink,
+            provisional,
+            calculate_diff(current.itinerary, provisional),
+        )
+        (
+            selected,
+            alternatives,
+            selection_used,
+        ) = await _select_solution_with_alternatives(
             solved.solutions,
             selection_text,
             selector=self.selector,
@@ -338,20 +376,69 @@ def select_solution(
         raise ValueError("選択できる旅程解がありません")
     if selector is None:
         return solutions[0].model_copy(deep=True)
+    if inspect.iscoroutinefunction(selector):
+        raise TypeError("async selector は select_solution_async で呼んでください")
     selected = selector(solutions, free_text)
+    if inspect.isawaitable(selected):
+        if inspect.iscoroutine(selected):
+            selected.close()
+        raise TypeError("async selector は select_solution_async で呼んでください")
+    return _validated_selection(solutions, selected)
+
+
+async def select_solution_async(
+    solutions: Sequence[Itinerary],
+    free_text: str,
+    *,
+    selector: SolutionSelector | None = None,
+) -> Itinerary:
+    """同期・非同期どちらの selector もイベントループを塞がず接続する。"""
+
+    if not solutions:
+        raise ValueError("選択できる旅程解がありません")
+    if selector is None:
+        return solutions[0].model_copy(deep=True)
+    selected = selector(solutions, free_text)
+    if inspect.isawaitable(selected):
+        selected = await selected
+    return _validated_selection(solutions, selected)
+
+
+def _validated_selection(
+    solutions: Sequence[Itinerary],
+    selected: Itinerary,
+) -> Itinerary:
     if selected not in solutions:
         raise ValueError("selector が候補外の旅程を返しました")
     return selected.model_copy(deep=True)
 
 
-def _select_solution_with_alternatives(
+async def _select_solution_with_alternatives(
     solutions: Sequence[Itinerary],
     free_text: str,
     *,
     selector: SolutionSelector | None,
 ) -> tuple[Itinerary, list[Itinerary], bool]:
-    selected = select_solution(solutions, free_text, selector=selector)
-    selected_index = next(index for index, solution in enumerate(solutions) if solution == selected)
+    selected = await select_solution_async(
+        solutions,
+        free_text,
+        selector=selector,
+    )
+
+
+async def _emit_provisional(
+    sink: ProvisionalItinerarySink | None,
+    itinerary: Itinerary,
+    diff: Diff,
+) -> None:
+    if sink is None:
+        return
+    result = sink(itinerary.model_copy(deep=True), diff.model_copy(deep=True))
+    if inspect.isawaitable(result):
+        await result
+    selected_index = next(
+        index for index, solution in enumerate(solutions) if solution == selected
+    )
     return (
         selected,
         [

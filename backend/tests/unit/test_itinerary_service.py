@@ -4,7 +4,11 @@ from dataclasses import replace
 from typing import Any
 
 from app.domains.itinerary.repo_types import ItineraryVersion, PlanningData
-from app.domains.itinerary.service import ItineraryService, select_solution
+from app.domains.itinerary.service import (
+    ItineraryService,
+    select_solution,
+    select_solution_async,
+)
 from app.domains.itinerary.solver import (
     PlanningSpot,
     SolverConfig,
@@ -219,3 +223,24 @@ def test_solution_selection_hook_defaults_to_a() -> None:
     solution_b = Itinerary(days=[], version=2)
 
     assert select_solution([solution_a, solution_b], "のんびり") == solution_a
+
+
+async def test_solution_selection_hook_accepts_async_selector() -> None:
+    solution_a = Itinerary(days=[], version=1)
+    solution_b = Itinerary(days=[], version=2)
+
+    async def choose_b(
+        solutions: list[Itinerary],
+        free_text: str,
+    ) -> Itinerary:
+        assert free_text == "温泉を優先"
+        return solutions[1]
+
+    selected = await select_solution_async(
+        [solution_a, solution_b],
+        "温泉を優先",
+        selector=choose_b,
+    )
+
+    assert selected == solution_b
+    assert selected is not solution_b

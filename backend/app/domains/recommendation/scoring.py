@@ -177,6 +177,7 @@ def _score_spot(
         weights.presented_penalty if spot.spot_id in context.presented_spot_ids else 0.0
     )
     pace = _pace_score(spot, context.profile.pace, weights)
+    turn_adjustment = context.score_adjustments.get(spot.spot_id, 0.0)
 
     components = {
         "preference": preference,
@@ -187,6 +188,7 @@ def _score_spot(
         "liked": liked,
         "rejected": rejected,
         "presented": presented,
+        "turn_adjustment": turn_adjustment,
     }
     total = sum(components.values())
     breakdown = {key: round(value, 6) for key, value in components.items()}

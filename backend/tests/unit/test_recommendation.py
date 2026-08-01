@@ -226,6 +226,23 @@ async def test_presented_penalty_moves_repeated_spot_from_first_place() -> None:
     assert repeated_materials.score_breakdown["presented"] == -8.0
 
 
+def test_turn_score_adjustment_is_bounded_and_changes_score_breakdown() -> None:
+    request = RecommendRequest(k=2, filter=RecommendFilter(tags=["滝"]))
+    context = _context(
+        travel_date=date(2026, 7, 1),
+        score_adjustments={"spot_006": 0.5},
+    )
+
+    scored = score_catalog(_data(), request, context, target_month=7)
+    by_id = {value.spot.spot_id: value for value in scored}
+
+    assert by_id["spot_006"].reason_materials.score_breakdown[
+        "turn_adjustment"
+    ] == 0.5
+    with pytest.raises(ValidationError):
+        _context(score_adjustments={"spot_006": 0.51})
+
+
 async def test_llm_failure_degrades_to_deterministic_score_order() -> None:
     repository = MemoryRecommendationRepository()
     reranker = StubReranker(error=RuntimeError("LLM down"))

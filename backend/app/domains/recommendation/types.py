@@ -133,6 +133,18 @@ class RecommendationContext(DomainModel):
     day_dates: dict[int, date] = Field(default_factory=dict)
     day_previous_spot_ids: dict[int, str] = Field(default_factory=dict)
     day_origin_spot_ids: dict[int, str] = Field(default_factory=dict)
+    # understand が抽出した、そのターンだけの地点別補正。永続化しない。
+    score_adjustments: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("score_adjustments")
+    @classmethod
+    def validate_score_adjustments(cls, values: dict[str, float]) -> dict[str, float]:
+        for spot_id, value in values.items():
+            if not spot_id or not math.isfinite(value) or not -0.5 <= value <= 0.5:
+                raise ValueError(
+                    "score_adjustments は spot_id ごとに -0.5〜0.5 で指定してください"
+                )
+        return values
 
     def origin_spot_id(self, day: int | None) -> str | None:
         """旅程の直前地点、拠点の順で travel_times の起点を決める。"""
