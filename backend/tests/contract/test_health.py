@@ -8,6 +8,8 @@ import respx
 
 from app.api.routers.health import HealthChecker, get_health_checker
 from app.core.config import Settings
+from app.domains.geo.osrm import read_osrm_build
+from app.domains.geo.repo import GeoDataCounts
 from app.main import create_app
 
 
@@ -35,7 +37,11 @@ async def test_healthz_returns_each_dependency_status() -> None:
         return_value=httpx.Response(200, json={"code": "Ok"})
     )
 
-    checker = HealthChecker(_settings(), database_probe=AsyncMock(return_value=None))
+    checker = HealthChecker(
+        _settings(),
+        database_probe=AsyncMock(return_value=None),
+        geo_data_probe=AsyncMock(return_value=GeoDataCounts(43, 1806, 46)),
+    )
 
     async def override_checker() -> HealthChecker:
         return checker
@@ -61,12 +67,19 @@ async def test_healthz_returns_each_dependency_status() -> None:
             "status": "ok",
             "latency_ms": pytest.approx(0, abs=50),
             "detail": None,
+            "build": read_osrm_build(),
         },
         "osrm_foot": {
             "status": "ok",
             "latency_ms": pytest.approx(0, abs=50),
             "detail": None,
+            "build": read_osrm_build(),
         },
+    }
+    assert response.json()["geo_data"] == {
+        "spot_approach": 43,
+        "travel_times_car": 1806,
+        "travel_times_foot": 46,
     }
 
 
@@ -84,7 +97,11 @@ async def test_healthz_stays_200_when_dependencies_are_down() -> None:
         return_value=httpx.Response(200, json={"code": "NoRoute"})
     )
 
-    checker = HealthChecker(_settings(), database_probe=unavailable_database)
+    checker = HealthChecker(
+        _settings(),
+        database_probe=unavailable_database,
+        geo_data_probe=AsyncMock(return_value=GeoDataCounts(43, 1806, 46)),
+    )
 
     async def override_checker() -> HealthChecker:
         return checker

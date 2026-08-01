@@ -13,13 +13,25 @@ class DependencyHealth(BaseModel):
     detail: str | None = None
 
 
+class OSRMDependencyHealth(DependencyHealth):
+    build: str | None
+
+
 class HealthDependencies(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     db: DependencyHealth
     vllm: DependencyHealth
-    osrm_car: DependencyHealth
-    osrm_foot: DependencyHealth
+    osrm_car: OSRMDependencyHealth
+    osrm_foot: OSRMDependencyHealth
+
+
+class GeoDataHealth(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    spot_approach: int
+    travel_times_car: int
+    travel_times_foot: int
 
 
 class HealthResponse(BaseModel):
@@ -27,3 +39,4 @@ class HealthResponse(BaseModel):
 
     status: Literal["ok", "degraded"]
     dependencies: HealthDependencies
+    geo_data: GeoDataHealth

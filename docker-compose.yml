@@ -26,19 +26,19 @@ services:
     build:
       context: .
       dockerfile: ./backend/Dockerfile.app
+    network_mode: host
     env_file:
       - .env
     environment:
-      POSTGRES_HOST: db
+      POSTGRES_HOST: 127.0.0.1
       POSTGRES_PORT: 5432
-      OSRM_CAR_URL: http://osrm-car:5000
-      OSRM_FOOT_URL: http://osrm-foot:5000
-      INFERENCE_SERVER: http://host.docker.internal:8000/v1
+      OSRM_CAR_URL: http://127.0.0.1:5001
+      OSRM_FOOT_URL: http://127.0.0.1:5002
+      INFERENCE_SERVER: http://127.0.0.1:8000/v1
       PACKS_ROOT: /packs
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - packs_data:/packs
+      - ./backend/data/map/BUILD:/app/backend/data/map/BUILD:ro
     depends_on:
       db:
         condition: service_healthy
@@ -52,12 +52,10 @@ services:
       - --host
       - 0.0.0.0
       - --port
-      - "8080"
+      - "8090"
       - --log-config
       - logging.json
       - --no-access-log
-    ports:
-      - "8080:8080"
     restart: unless-stopped
 
   # === Vector DB ===
@@ -235,6 +233,8 @@ services:
   frontend:
     image: node:20-alpine
     working_dir: /app/frontend
+    environment:
+      VITE_API_BASE: ${VITE_API_BASE:-}
     volumes:
       - ./frontend:/app/frontend
       - frontend_node_modules:/app/frontend/node_modules

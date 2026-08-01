@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -21,17 +21,55 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    postgres_host: str = Field(default="db", alias="POSTGRES_HOST")
+    postgres_host: str = Field(default="127.0.0.1", alias="POSTGRES_HOST")
     postgres_port: int = Field(default=5432, ge=1, le=65535, alias="POSTGRES_PORT")
     postgres_db: str = Field(default="guidance", min_length=1, alias="POSTGRES_DB")
     postgres_user: str = Field(default="guidance", min_length=1, alias="POSTGRES_USER")
     postgres_password: str = Field(default="", alias="POSTGRES_PASSWORD")
 
-    osrm_car_url: str = Field(default="http://osrm-car:5000", alias="OSRM_CAR_URL")
-    osrm_foot_url: str = Field(default="http://osrm-foot:5000", alias="OSRM_FOOT_URL")
+    osrm_car_url: str = Field(default="http://127.0.0.1:5001", alias="OSRM_CAR_URL")
+    osrm_foot_url: str = Field(default="http://127.0.0.1:5002", alias="OSRM_FOOT_URL")
+    osrm_concurrency: int = Field(default=8, ge=1, alias="OSRM_CONCURRENCY")
+    osrm_request_timeout_sec: float = Field(
+        default=5.0, gt=0, alias="OSRM_REQUEST_TIMEOUT_SEC"
+    )
+    osrm_request_retries: int = Field(default=2, ge=0, alias="OSRM_REQUEST_RETRIES")
+    osrm_retry_backoff_sec: float = Field(
+        default=0.5, ge=0, alias="OSRM_RETRY_BACKOFF_SEC"
+    )
+    osrm_leg_timeout_sec: float = Field(default=20.0, gt=0, alias="OSRM_LEG_TIMEOUT_SEC")
+    osrm_table_timeout_sec: float = Field(
+        default=60.0, gt=0, alias="OSRM_TABLE_TIMEOUT_SEC"
+    )
+    osrm_table_retries: int = Field(default=1, ge=0, alias="OSRM_TABLE_RETRIES")
+
+    geo_car_snap_tolerance_m: float = Field(
+        default=50.0, ge=0, alias="GEO_CAR_SNAP_TOLERANCE_M"
+    )
+    geo_access_candidate_count: int = Field(
+        default=5, ge=1, alias="GEO_ACCESS_CANDIDATE_COUNT"
+    )
+    geo_along_car_buffer_m: float = Field(
+        default=300.0, gt=0, alias="GEO_ALONG_CAR_BUFFER_M"
+    )
+    geo_along_foot_buffer_m: float = Field(
+        default=50.0, gt=0, alias="GEO_ALONG_FOOT_BUFFER_M"
+    )
+    geo_foot_max_duration_sec: int = Field(
+        default=1800, gt=0, alias="GEO_FOOT_MAX_DURATION_SEC"
+    )
+    geo_foot_max_distance_m: int = Field(
+        default=2500, gt=0, alias="GEO_FOOT_MAX_DISTANCE_M"
+    )
+    geo_coordinate_precision: int = Field(
+        default=6, ge=0, le=8, alias="GEO_COORDINATE_PRECISION"
+    )
+    geo_geojson_precision: int = Field(
+        default=6, ge=0, le=8, alias="GEO_GEOJSON_PRECISION"
+    )
 
     inference_server: str = Field(
-        default="http://host.docker.internal:8000/v1", alias="INFERENCE_SERVER"
+        default="http://127.0.0.1:8000/v1", alias="INFERENCE_SERVER"
     )
     inference_model: str = Field(default="", alias="INFERENCE_MODEL")
     inference_timeout_sec: float = Field(default=120, gt=0, alias="INFERENCE_TIMEOUT_SEC")
@@ -61,6 +99,24 @@ class Settings(BaseSettings):
         if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("LOG_LEVEL は標準ログレベルで指定してください")
         return level
+
+    @model_validator(mode="after")
+    def validate_geo_timeouts(self) -> "Settings":
+        """レッグ全体が OSRM 1 呼び出しの再試行を包めることを保証する。"""
+
+        request_outer = (
+            self.osrm_request_timeout_sec * (self.osrm_request_retries + 1)
+            + sum(
+                self.osrm_retry_backoff_sec * (2**attempt)
+                for attempt in range(self.osrm_request_retries)
+            )
+        )
+        if self.osrm_leg_timeout_sec < request_outer:
+            raise ValueError(
+                "OSRM_LEG_TIMEOUT_SEC は OSRM 1 呼び出しの"
+                "再試行全体以上にしてください"
+            )
+        return self
 
     @property
     def database_url(self) -> str:

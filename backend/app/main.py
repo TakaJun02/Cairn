@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
 from app.api.routers.health import router as health_router
+from app.api.routers.routes import router as routes_router
 from app.core.config import get_settings
 from app.core.db import dispose_engine
 from app.core.logging import RequestIdMiddleware, configure_logging
@@ -45,6 +46,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     application.include_router(health_router)
+    application.include_router(routes_router)
     return application
 
 

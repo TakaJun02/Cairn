@@ -22,6 +22,10 @@ from app.db_models import (
     Thread,
     User,
 )
+from app.domains.geo.approach import ApproachBuildError, build_spot_approaches
+from app.domains.geo.matrix import MatrixBuildError, build_travel_time_matrix
+from app.domains.geo.osrm import Coordinate, OSRMClient, OSRMError, read_osrm_build
+from app.domains.geo.repo import GeoRepository
 from app.seeds import (
     SeedValidationError,
     load_seed_bundle,
@@ -79,6 +83,111 @@ def validate_seeds_command() -> None:
         typer.echo(f"validate-seeds failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     _emit({"command": "validate-seeds", "status": "ok", "counts": counts.as_dict()})
+
+
+async def _check_osrm() -> dict[str, object]:
+    settings = get_settings()
+    coordinates = [
+        Coordinate(lon=140.0244, lat=39.1594),
+        Coordinate(lon=140.0354, lat=39.0342),
+    ]
+    async with OSRMClient(settings) as osrm:
+        car, foot = await asyncio.gather(
+            osrm.route("car", coordinates),
+            osrm.route("foot", coordinates),
+        )
+    return {
+        "build": read_osrm_build(),
+        "profiles": {
+            "car": {
+                "code": "Ok",
+                "distance_m": round(car.distance_m),
+                "duration_sec": round(car.duration_sec),
+            },
+            "foot": {
+                "code": "Ok",
+                "distance_m": round(foot.distance_m),
+                "duration_sec": round(foot.duration_sec),
+            },
+        },
+    }
+
+
+@cli.command("check-osrm")
+def check_osrm_command() -> None:
+    """car / foot の実経路と BUILD 識別子を確認する。"""
+
+    try:
+        result = _run_async(_check_osrm())
+    except OSRMError as exc:
+        typer.echo(f"check-osrm failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    _emit({"command": "check-osrm", "status": "ok", **result})
+
+
+async def _build_geo() -> dict[str, object]:
+    settings = get_settings()
+    async with session_scope(settings) as session:
+        async with OSRMClient(settings) as osrm:
+            summary = await build_spot_approaches(GeoRepository(session), osrm, settings)
+    return {
+        "total": summary.total,
+        "direct_by_car": summary.direct_by_car,
+        "via_access_point": summary.via_access_point,
+        "via_road_snap": summary.via_road_snap,
+        "median_walk_sec": summary.median_walk_sec,
+        "median_walk_min": round(summary.median_walk_sec / 60, 1),
+        "max_walk_sec": summary.max_walk_sec,
+        "max_walk_min": round(summary.max_walk_sec / 60, 1),
+        "walk_over_60_min_count": summary.walk_over_60_min_count,
+    }
+
+
+@cli.command("build-geo")
+def build_geo_command() -> None:
+    """全 spot の接近情報を OSRM から再構築する。"""
+
+    try:
+        counts = _run_async(_build_geo())
+    except (ApproachBuildError, OSRMError) as exc:
+        typer.echo(f"build-geo failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    _emit({"command": "build-geo", "status": "ok", "counts": counts})
+
+
+async def _build_travel_times(force: bool) -> dict[str, object]:
+    settings = get_settings()
+    async with session_scope(settings) as session:
+        async with OSRMClient(settings) as osrm:
+            result = await build_travel_time_matrix(
+                GeoRepository(session),
+                osrm,
+                settings,
+                force=force,
+            )
+    return {
+        "skipped": result.skipped,
+        "car": result.car_rows,
+        "foot": result.foot_rows,
+    }
+
+
+@cli.command("build-travel-times")
+def build_travel_times_command(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="既存行を検証済み行列で置き換える",
+    ),
+) -> None:
+    """door-to-door の car 行列と近距離 foot 行列を構築する。"""
+
+    try:
+        counts = _run_async(_build_travel_times(force))
+    except (MatrixBuildError, OSRMError) as exc:
+        typer.echo(f"build-travel-times failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    _emit({"command": "build-travel-times", "status": "ok", "counts": counts})
 
 
 async def _reset_user(user_name: str) -> int:

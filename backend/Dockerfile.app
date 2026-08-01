@@ -32,6 +32,6 @@ COPY backend/tests ./tests
 
 RUN mkdir -p /packs
 
-EXPOSE 8080
+EXPOSE 8090
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--log-config", "logging.json", "--no-access-log"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090", "--log-config", "logging.json", "--no-access-log"]
