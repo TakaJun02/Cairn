@@ -13,7 +13,7 @@ import OC_ChatInput from '@/components/OC_ChatInput.vue';
 
 const userStore = useUserStore()
 const chatStore = useChatStore()
-const { messages, isLoading, isSessionLoaded } = storeToRefs(chatStore)
+const { messages, isLoading, isSessionLoaded, isUndoing } = storeToRefs(chatStore)
 
 const messagesContainer = ref(null);
 
@@ -62,10 +62,18 @@ function applySuggestion(fullText) {
 }
 // -------------------------------------
 
-async function handleSendMessage() {
-  if (!chatInputText.value.trim()) return;
-  await chatStore.sendMessage(chatInputText.value);
+async function handleSendMessage(message = chatInputText.value) {
+  if (!message.trim()) return;
+  await chatStore.sendMessage(message);
   // The input will be cleared by the child component via v-model update
+}
+
+function handlePromptOption({ messageId, option }) {
+  void chatStore.selectPromptOption(messageId, option)
+}
+
+function handleUndo(messageId) {
+  void chatStore.undoItinerary(messageId)
 }
 
 // Function to scroll to the bottom of the messages container
@@ -79,6 +87,10 @@ const scrollToBottom = () => {
 
 // Watch for changes in the number of messages and scroll to bottom
 watch(() => messages.value.length, () => {
+  scrollToBottom();
+});
+
+watch(() => messages.value.at(-1)?.content, () => {
   scrollToBottom();
 });
 
@@ -123,7 +135,12 @@ onMounted(() => {
   <div class="tw-relative tw-w-full tw-h-full tw-flex tw-flex-col bg-noise">
     <!-- Message List Area -->
     <div class="tw-flex-1 tw-overflow-y-auto tw-pb-28 tw-overscroll-y-contain tw-touch-action-pan-y" ref="messagesContainer">
-      <OC_ChatMessages :messages="messages" />
+      <OC_ChatMessages
+        :messages="messages"
+        :is-undoing="isUndoing"
+        @select-option="handlePromptOption"
+        @undo="handleUndo"
+      />
     </div>
 
     <!-- Floating Suggestion Cards -->
@@ -148,6 +165,7 @@ onMounted(() => {
       <OC_ChatInput 
         v-model="chatInputText" 
         @sendMessage="handleSendMessage" 
+        @stop="chatStore.stopStreaming"
         :is-sending="isLoading" 
         :placeholder="placeholderText"
       />

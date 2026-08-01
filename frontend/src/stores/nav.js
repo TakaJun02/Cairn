@@ -1,6 +1,5 @@
 import { ref, computed } from 'vue'
 import { defineStore } from 'pinia'
-import { useRouter } from 'vue-router'
 import * as api from '@/lib/api'
 
 import { getDeviceUUID } from '@/lib/uuid'
@@ -19,17 +18,22 @@ const createRouteCacheKey = () => {
 }
 
 export const useNavStore = defineStore('nav', () => {
-  const router = useRouter()
-
   // --- State ---
   const lang = ref('ja')
   const origin = ref(null)
   const waypointsByIds = ref([])
   const plan = ref(null)
   const isRouteLoading = ref(false)
-  const isNavigating = ref(false) // This now represents the single, synchronous navigation plan generation step
+  const isNavigating = ref(false)
   const error = ref(null)
   const deviceId = ref(null)
+  const spots = ref([])
+  const spotsEtag = ref(null)
+  const candidates = ref(null)
+  const currentItinerary = ref(null)
+
+  let spotsRequest = null
+  let itineraryApplySequence = 0
 
   // --- Getters ---
   const isRouteReady = computed(() => !!plan.value?.route)
@@ -40,7 +44,7 @@ export const useNavStore = defineStore('nav', () => {
   // --- Actions ---
 
   const reset = () => {
-    console.log('[NavStore] Resetting navigation state...');
+    console.log('[NavStore] Resetting navigation state...')
     lang.value = 'ja'
     origin.value = null
     waypointsByIds.value = []
@@ -48,7 +52,105 @@ export const useNavStore = defineStore('nav', () => {
     isRouteLoading.value = false
     isNavigating.value = false
     error.value = null
-    console.log('[NavStore] Navigation state has been reset.');
+    candidates.value = null
+    currentItinerary.value = null
+    itineraryApplySequence += 1
+    console.log('[NavStore] Navigation state has been reset.')
+  }
+
+  const fetchSpots = async ({ force = false } = {}) => {
+    if (spotsRequest && !force) return spotsRequest
+
+    spotsRequest = (async () => {
+      const response = await api.getSpots(force ? null : spotsEtag.value)
+      if (response.status === 200) {
+        spots.value = Array.isArray(response.spots) ? response.spots : []
+      } else if (response.status === 304 && spots.value.length === 0) {
+        const uncached = await api.getSpots()
+        spots.value = Array.isArray(uncached.spots) ? uncached.spots : []
+        spotsEtag.value = uncached.etag
+        return spots.value
+      }
+      spotsEtag.value = response.etag
+      return spots.value
+    })()
+
+    try {
+      return await spotsRequest
+    } catch (fetchError) {
+      spotsRequest = null
+      throw fetchError
+    }
+  }
+
+  const spotInfo = (spotId) => {
+    const spot = spots.value.find((value) => value.spot_id === spotId)
+    if (!spot) return { spot_id: spotId, name: spotId }
+    const name = spot.name_ja || spot.name || spotId
+    return {
+      ...spot,
+      name,
+      names: spot.names || { ja: name },
+    }
+  }
+
+  const setCandidates = (state) => {
+    if (!state || state.kind !== 'candidates') return
+    candidates.value = state
+  }
+
+  const applyItineraryState = async (state) => {
+    if (!state || state.kind !== 'itinerary') return
+    if (
+      state.phase === 'provisional'
+      && currentItinerary.value?.phase === 'final'
+      && currentItinerary.value?.version === state.version
+    ) return
+
+    const applySequence = ++itineraryApplySequence
+    currentItinerary.value = state
+    const days = Array.isArray(state.itinerary?.days) ? state.itinerary.days : []
+    const items = days.flatMap((day) => Array.isArray(day.items) ? day.items : [])
+    const spotIds = items.map((item) => item.spot_id).filter(Boolean)
+    const routeIds = [...new Set(
+      items.map((item) => item.leg_from_prev?.route_id).filter(Boolean)
+    )]
+    const routeKey = routeIds.join(',')
+    const existingRoute = plan.value?.routeKey === routeKey ? plan.value?.route : null
+
+    waypointsByIds.value = spotIds
+    plan.value = {
+      ...(plan.value || {}),
+      itinerary_state: state,
+      itinerary_version: state.version,
+      waypoints_info: spotIds.map(spotInfo),
+      route_ids: routeIds,
+      routeKey,
+      route: existingRoute,
+      along_pois: [],
+      createdAt: Date.now(),
+      cacheKey: createRouteCacheKey(),
+    }
+
+    if (routeIds.length === 0 || existingRoute) return
+
+    try {
+      const routes = await Promise.all(routeIds.map((routeId) => api.getRoute(routeId)))
+      if (applySequence !== itineraryApplySequence) return
+      plan.value = {
+        ...plan.value,
+        route: {
+          type: 'FeatureCollection',
+          features: routes.flatMap((route) => route.geojson?.features || []),
+        },
+        segments: routes.flatMap((route) => route.segments || []),
+        legs: routes,
+      }
+    } catch (routeError) {
+      if (applySequence !== itineraryApplySequence) return
+      console.error('[NavStore] Failed to restore itinerary routes:', routeError)
+      error.value = routeError.message || '旅程の経路を読み込めませんでした'
+    }
   }
 
   const fetchRoute = async (planOptions, opts = {}) => {
@@ -59,7 +161,7 @@ export const useNavStore = defineStore('nav', () => {
 
     lang.value = planOptions.language
     origin.value = planOptions.origin
-    waypointsByIds.value = planOptions.waypoints?.map((w) => w.spot_id) ?? []
+    waypointsByIds.value = planOptions.waypoints?.map((value) => value.spot_id) ?? []
 
     try {
       const routeData = await api.createRoutePlan(planOptions)
@@ -67,10 +169,9 @@ export const useNavStore = defineStore('nav', () => {
       plan.value = {
         planOptions,
         route: routeData.feature_collection,
-        polyline: routeData.polyline,
         segments: routeData.segments,
         legs: routeData.legs,
-        waypoints_info: routeData.waypoints_info,
+        waypoints_info: waypointsByIds.value.map(spotInfo),
         pack_id: null,
         along_pois: [],
         assets: [],
@@ -80,11 +181,12 @@ export const useNavStore = defineStore('nav', () => {
       }
 
       if (navigate) {
-        router.push('/nav')
+        const { default: router } = await import('@/router')
+        await router.push('/nav')
       }
-    } catch (e) {
-      console.error('Failed to fetch route', e)
-      error.value = e.message || 'ルート計算に失敗しました'
+    } catch (routeError) {
+      console.error('Failed to fetch route', routeError)
+      error.value = routeError.message || 'ルート計算に失敗しました'
     } finally {
       isRouteLoading.value = false
     }
@@ -92,37 +194,22 @@ export const useNavStore = defineStore('nav', () => {
 
   const startGuidance = async () => {
     if (!isRouteReady.value || isNavigating.value) return
-    
+
     isNavigating.value = true
     error.value = null
     try {
-      const navRequestPayload = {
-        language: lang.value,
-        buffer: { car: 300, foot: 10 },
-        route: plan.value.route,
-        polyline: plan.value.polyline,
-        segments: plan.value.segments,
-        legs: plan.value.legs,
-        waypoints_info: plan.value.waypoints_info,
-      }
-
-      // Call the new synchronous API function
-      const navigationPlan = await api.createPlan(navRequestPayload)
-      console.log('Navigation plan received:', navigationPlan)
-
-      // Merge the navigation data into the existing plan
+      const navigationPlan = await api.createPlan()
       plan.value = {
         ...plan.value,
         pack_id: navigationPlan.pack_id,
         along_pois: navigationPlan.along_pois,
         assets: navigationPlan.assets,
         manifest_url: navigationPlan.manifest_url,
-        createdAt: Date.now(), // Update timestamp
+        createdAt: Date.now(),
       }
-
-    } catch (e) {
-      console.error('Failed to generate navigation plan', e)
-      error.value = e.message || 'ナビゲーションの生成に失敗しました'
+    } catch (navigationError) {
+      console.error('Failed to generate navigation plan', navigationError)
+      error.value = navigationError.message || 'ナビゲーションの生成に失敗しました'
     } finally {
       isNavigating.value = false
     }
@@ -139,20 +226,21 @@ export const useNavStore = defineStore('nav', () => {
   }
 
   const setItinerary = (itinerary) => {
-    console.log('[NavStore] Setting itinerary:', itinerary);
-    if (!Array.isArray(itinerary)) {
-      console.warn('[NavStore] setItinerary received non-array value:', itinerary);
-      return;
-    };
-    waypointsByIds.value = itinerary;
-    if (plan.value) {
-      // This is a simplified representation. The full waypoint_info would ideally be fetched or already present.
-      plan.value.waypoints_info = itinerary.map(spot_id => ({ spot_id, name: spot_id }));
-    } else {
-      // If there is no plan, create a minimal one
-      plan.value = { waypoints_info: itinerary.map(spot_id => ({ spot_id, name: spot_id })) };
+    if (itinerary?.kind === 'itinerary') {
+      void applyItineraryState(itinerary)
+      return
     }
-    console.log('[NavStore] Itinerary set. Waypoints by ID:', waypointsByIds.value);
+    if (!Array.isArray(itinerary)) {
+      console.warn('[NavStore] setItinerary received non-array value:', itinerary)
+      return
+    }
+    waypointsByIds.value = itinerary
+    const waypointInfo = itinerary.map(spotInfo)
+    if (plan.value) {
+      plan.value.waypoints_info = waypointInfo
+    } else {
+      plan.value = { waypoints_info: waypointInfo }
+    }
   }
 
   return {
@@ -165,6 +253,10 @@ export const useNavStore = defineStore('nav', () => {
     isNavigating,
     error,
     deviceId,
+    spots,
+    spotsEtag,
+    candidates,
+    currentItinerary,
     // Getters
     isRouteReady,
     isNavigationReady,
@@ -176,6 +268,9 @@ export const useNavStore = defineStore('nav', () => {
     reset,
     initializeDeviceId,
     setItinerary,
+    fetchSpots,
+    setCandidates,
+    applyItineraryState,
   }
 }, {
   persist: true // LocalStorageに保存

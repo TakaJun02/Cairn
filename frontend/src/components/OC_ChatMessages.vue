@@ -3,9 +3,21 @@
     <OC_ChatMessage
       v-for="message in messages"
       :key="message.id"
+      :message-id="message.id"
       :sender="message.sender"
-      :content="message.text || message.content" 
+      :content="message.text || message.content"
       :is-pending="message.isPending"
+      :status-text="message.statusText"
+      :candidates="message.candidates"
+      :itinerary="message.itinerary"
+      :prompt="message.prompt"
+      :profile="message.profile"
+      :notices="message.notices"
+      :error="message.error"
+      :undo-error="message.undoError"
+      :is-undoing="isUndoing"
+      @select-option="$emit('select-option', $event)"
+      @undo="$emit('undo', $event)"
     />
   </div>
 </template>
@@ -18,5 +30,11 @@ defineProps({
     type: Array,
     required: true,
   },
+  isUndoing: {
+    type: Boolean,
+    default: false,
+  },
 });
+
+defineEmits(['select-option', 'undo']);
 </script>

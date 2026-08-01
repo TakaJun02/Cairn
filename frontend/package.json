@@ -12,6 +12,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "dompurify": "^3.4.12",
     "idb": "^7.1.1",
     "leaflet": "^1.9.4",
     "marked": "^16.4.0",
