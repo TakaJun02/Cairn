@@ -18,7 +18,7 @@ FR-1.1 は「対話からプロファイルを獲得する」ことを求め、F
 ## 決定(何をすると決めたか)
 
 1. **初回の聞き取りは選択式**(クイックリプライのチップ)とする。party / mobility / interests を 2〜3 タップで埋める
-2. **追加質問は ReAct 型の `ask_user` ツール**として実装する。`act` が持つツール集合(`recommend` / `plan_itinerary` / `edit_itinerary` / `answer_qa` / `ask_user`)に並べ、`understand` が `next_action` として選ぶ
+2. **追加質問は ReAct 型の `ask_user` ツール**として実装する。`act` が持つツール集合(`recommend` / `plan_itinerary` / `edit_itinerary` / `search_knowledge` / `ask_user`。**2026-08-01: `answer_qa` を `search_knowledge` に置換**)に並べ、`understand` が `next_action` として選ぶ
 3. **初回聞き取りも `slot: "onboarding"` の `ask_user` 呼び出しとして表現し、専用パスを作らない**
 4. **質問の回数と条件はコードで強制する。**LLM の裁量に任せない:
 

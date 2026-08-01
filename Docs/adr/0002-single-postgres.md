@@ -1,7 +1,7 @@
 # ADR-0002: データストアをPostgreSQL 1台(PostGIS)に統合する
 
-- 状態: 提案(2026-07-30 改訂: 長期記憶のスコープ外化に伴い、pgvectorを必須構成から外した)
-- 日付: 2026-07-29 / 改訂 2026-07-30
+- 状態: **承認 (2026-07-31、ユーザー判断)**(2026-07-30 改訂: 長期記憶のスコープ外化に伴い、pgvectorを必須構成から外した)
+- 日付: 2026-07-29 / 改訂 2026-07-30 / 承認 2026-07-31
 
 ## 文脈(何が問題か)
 
@@ -25,5 +25,17 @@
 
 - Alembic導入。既存データ(users/conversations/spot_realtime)の移行スクリプトをPhase 3で書く
 - Chromaのベクトルデータは移行しない(必要になれば会話ログから再構築可能)
-- `.env` の `Embedding_server` と関連コード(`vector_store_client.py` ほか)は削除対象
+- ~~`.env` の `Embedding_server` と関連コード(`vector_store_client.py` ほか)は削除対象~~ → **2026-08-01 取り消し**(下記)
 - 長期記憶を再導入する場合は、本ADRを更新(または新ADR)した上で pgvector 拡張+背景埋め込みタスクを追加する
+
+## 2026-08-01 改訂 — pgvector を発動する([ADR-0012](0012-knowledge-retrieval-pgvector.md))
+
+**本 ADR が用意した「ベクトル検索が将来研究上必要になったら、同一 DB に pgvector 拡張を追加して再導入する」が発動した。**用途は**長期記憶ではなく知識検索**(`answer_qa` の後継)である。
+
+| | |
+| --- | --- |
+| **取り消す** | `.env` の `Embedding_server` の削除。**埋め込みサーバは使う**(`Qwen/Qwen3-Embedding-8B`、4096 次元、実測確認済み) |
+| **維持する** | **ChromaDB コンテナと `chromadb`/`faiss-cpu` 依存の削除。**ベクトルは同一 Postgres に持つので、**データストアは増えない**(本 ADR の中心的な主張はそのまま守られる) |
+| **追加する** | `postgis/postgis:16-3.4` に `postgresql-16-pgvector` を入れた派生イメージ。`static` スキーマに `knowledge_chunks(embedding vector(4096))` |
+
+**旧 `vector_store_client.py` は削除する**(Chroma 向けであり、埋め込み次元の不一致でサイレント停止する構造も含めて作り直す)。**長期記憶は引き続きスコープ外**である。
