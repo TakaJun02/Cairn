@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     )
     inference_model: str = Field(default="", alias="INFERENCE_MODEL")
     inference_timeout_sec: float = Field(default=120, gt=0, alias="INFERENCE_TIMEOUT_SEC")
+    recommendation_rerank_enabled: bool = Field(
+        default=True, alias="RECOMMENDATION_RERANK_ENABLED"
+    )
 
     embedding_server: str = Field(default="", alias="EMBEDDING_SERVER")
     embedding_model: str = Field(default="Qwen/Qwen3-Embedding-8B", alias="EMBEDDING_MODEL")
