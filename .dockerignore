@@ -3,10 +3,6 @@
 .venv
 **/__pycache__
 **/*.pyc
-backend/api
-backend/worker
-backend/logs
-backend/test
 backend/data/map
 frontend/node_modules
 frontend/dist
