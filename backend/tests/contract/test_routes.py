@@ -7,10 +7,12 @@ from uuid import UUID, uuid4
 import httpx
 import respx
 
+from app.api.auth import get_current_user
 from app.api.routers.routes import get_geo_repository
 from app.core.config import Settings, get_settings
 from app.domains.geo.osrm import Coordinate
 from app.domains.geo.repo import ApproachRecord, RouteRecord, SpotRecord
+from app.domains.users import UserData
 from app.main import create_app
 
 
@@ -99,6 +101,10 @@ async def test_post_routes_is_idempotent_and_get_returns_same_route() -> None:
     app = create_app()
     app.dependency_overrides[get_geo_repository] = lambda: repository
     app.dependency_overrides[get_settings] = lambda: settings
+    now = datetime.now(UTC)
+    app.dependency_overrides[get_current_user] = lambda: UserData(
+        1, "route-test", "token", None, now, now
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",

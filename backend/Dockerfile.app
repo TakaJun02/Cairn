@@ -27,6 +27,7 @@ COPY backend/pyproject.toml ./pyproject.toml
 COPY backend/alembic.ini ./alembic.ini
 COPY backend/alembic ./alembic
 COPY backend/data/seeds ./data/seeds
+COPY backend/data/knowledge ./data/knowledge
 COPY backend/logging.json ./logging.json
 COPY backend/tests ./tests
 

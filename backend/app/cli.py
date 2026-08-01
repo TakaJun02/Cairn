@@ -26,6 +26,11 @@ from app.domains.geo.approach import ApproachBuildError, build_spot_approaches
 from app.domains.geo.matrix import MatrixBuildError, build_travel_time_matrix
 from app.domains.geo.osrm import Coordinate, OSRMClient, OSRMError, read_osrm_build
 from app.domains.geo.repo import GeoRepository
+from app.domains.knowledge import (
+    KnowledgeIndexError,
+    index_knowledge,
+    validate_knowledge,
+)
 from app.seeds import (
     SeedValidationError,
     load_seed_bundle,
@@ -188,6 +193,30 @@ def build_travel_times_command(
         typer.echo(f"build-travel-times failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     _emit({"command": "build-travel-times", "status": "ok", "counts": counts})
+
+
+@cli.command("index-knowledge")
+def index_knowledge_command() -> None:
+    """日本語 Markdown をチャンク化し、差分だけ埋め込んで投入する。"""
+
+    try:
+        summary = _run_async(index_knowledge(get_settings()))
+    except (KnowledgeIndexError, OSError) as exc:
+        typer.echo(f"index-knowledge failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    _emit({"command": "index-knowledge", **summary.as_dict()})
+
+
+@cli.command("validate-knowledge")
+def validate_knowledge_command() -> None:
+    """索引件数と spot 参照を検査し、孤児は報告として出力する。"""
+
+    try:
+        summary = _run_async(validate_knowledge(get_settings()))
+    except (KnowledgeIndexError, OSError) as exc:
+        typer.echo(f"validate-knowledge failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    _emit({"command": "validate-knowledge", **summary.as_dict()})
 
 
 async def _reset_user(user_name: str) -> int:

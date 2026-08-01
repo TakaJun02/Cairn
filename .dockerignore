@@ -7,7 +7,6 @@ backend/api
 backend/worker
 backend/logs
 backend/test
-backend/data/knowledge
 backend/data/map
 frontend/node_modules
 frontend/dist

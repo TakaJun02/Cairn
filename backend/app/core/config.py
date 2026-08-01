@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     embedding_server: str = Field(default="", alias="EMBEDDING_SERVER")
     embedding_model: str = Field(default="Qwen/Qwen3-Embedding-8B", alias="EMBEDDING_MODEL")
     embedding_dim: int = Field(default=4096, gt=0, alias="EMBEDDING_DIM")
+    embedding_timeout_sec: float = Field(default=120, gt=0, alias="EMBEDDING_TIMEOUT_SEC")
 
     tavily_api_key: str = Field(default="", alias="TAVILY_API_KEY")
     packs_root: Path = Field(default=Path("/packs"), alias="PACKS_ROOT")
