@@ -1,7 +1,34 @@
 # 残タスク(次のセッションの起点)
 
-- 最終更新: **2026-08-01**
+- 最終更新: **2026-08-02**
 - 用途: **会話セッションをまたぐときの引き継ぎ。**新しいセッションはこの文書から読み始める
+
+> # ✅ 現在地(2026-08-02)— **Phase 1〜4 の実装が完了し、ブラウザから通しで動く**
+>
+> **§C-1 / §D-1 / §E-1 の全項目を実装し、`docker compose` を立ち上げ直してブラウザから通し確認した。**
+> ブランチ **`feat/rebuild-implementation`**(develop から分岐、16 コミット)。**まだ develop にマージしていない。**
+>
+> | Phase | 実装 | 検証 |
+> | --- | --- | --- |
+> | 1 | 骨格 / DB / 知識索引 / 認証 / ソルバー / 推薦 / 知識検索 / 対話 / SSE / フロント接続 | 実 LLM で推薦・旅程・編集・undo が動く |
+> | 2 | geo / voice / パック用原稿 / パック生成ジョブ / API / 進捗 UI | **41 アセットのパックが `ready`(failed 0)** |
+> | 3 | realtime(codec / スケジューラ / シミュレータ / MQTT) | codec 往復・フェアユース上限・値の NULL 保持 |
+> | 4 | 観光フェーズ / LoRa decode / 実害バグ / 旧構成の削除 | compose が **5 コンテナ**、約 31 GiB 解放 |
+>
+> **テスト: バックエンド 194 件 + フロント 10 件が通過。**
+>
+> **実装中に設計文書を改訂した箇所**(いずれも実データ・実測に基づく):
+> - **[geo.md §2.3.1](30_design/geo.md)** — 接近の候補に「車道スナップ点」を追加。`access_points` 33 件が 43 地点をカバーせず、**赤田の大仏の徒歩が 394 分**になっていた。`travel_times.car` の平均が **136.8 → 71.6 分**に是正
+> - **[geo.md §1.2](30_design/geo.md)** — 1 レッグのセグメントを 1〜2 → **1〜3**(`foot → car → foot` を認める)
+> - **[data_model.md §4.7](30_design/data_model.md)** — `app.realtime_simulator_state` を新設
+> - **[README.md](README.md)** — 文書中の `spot_id` の例が実データと一致しない旨を注記
+> - **[frontend_nav.md §3](30_design/frontend_nav.md)** — foot バッファの記述を 50 m に訂正
+>
+> **この環境固有の適合**(設計の変更ではない):
+> - **`app` と `frontend` を `network_mode: host` にした。**ホストの vLLM が `127.0.0.1:8000` にしか bind しておらず、docker bridge → ホストの通信もこのマシンでは落ちるため。**app のポートは 8080 が別プロセスに占有されているので 8090**
+> - **vLLM の xgrammar は JSON Schema の `uniqueItems` を実装していない**(400 になる)。guided decoding で使わないこと
+>
+> **残っている調整項目は §H。**
 
 > # 🚀 現在地(2026-08-01)— **設計は完了。実装に入れる**
 >
@@ -466,3 +493,27 @@
 **文書の承認状態**: `00_project` / `10_requirements` / `20_architecture` / ADR-0001〜0004 を 2026-07-31 に承認(ADR-0005〜0008 は 07-30〜07-31 に承認済み)。**未承認の文書はない。**
 
 `21_architecture_asis.md` / `22_current_issues.md` は凍結(更新しない)。
+
+---
+
+## H. 実装完了後に残っている調整項目(2026-08-02)
+
+**いずれも設計判断ではなく、動かしながら決める値・見せ方である。**機能は動いている。
+
+| # | 項目 | 詳細 |
+| --- | --- | --- |
+| 1 | **`understand` が時間指定を `unmodeled` に落とすことがある** | 「9時から17時で」が `days[].start/end` に正しく反映されているのに、`respond` が「一部システムで未処理」と述べる。**プロンプトの調整**([agent_planning_phase.md §3.1](30_design/agent_planning_phase.md) の `handling` 判定)。機能上の実害はないが、応答が分かりにくい |
+| 2 | **`ask_user` のチップのリロード復元** | `GET /thread` の `pending` は `clarify` 用の `pending_clarification` しか返さない。フロントは sessionStorage で補完している。**正しくは `messages.meta` に選択肢を載せて `pending` から返す** |
+| 3 | **`build-geo` の徒歩 0 分問題** | 車道スナップ点が選ばれた 4 地点(赤田の大仏 119 m / 遊佐町総合運動公園 55 m / 胴腹滝 96 m / 牛渡川 289 m)は foot グラフ上で同一ノードにスナップし `walk_sec = 0` になる。**誤差は 1 地点あたり最大 ±4 分**([geo.md §2.3.1](30_design/geo.md) に記録) |
+| 4 | **ILS の最適性ギャップが未実測** | 43 地点なら厳密解が計算できる([recommendation_planning.md §7](30_design/recommendation_planning.md))。**一度だけ測ってパラメータを確定する**(現在は反復 160 回・β 0.6) |
+| 5 | **推薦スコアの同点が多い** | 粗いタグ語彙のため上位が同点で並ぶ(例: 温泉選好で 5 件が 3.5 点)。**LLM リランクが差をつける前提**の設計([ADR-0006](adr/0006-recommendation-hybrid.md))だが、重みの調整余地がある |
+| 6 | **ヘッダの表示が "AI Agent by Qwen3"** | 実際のモデルは `gemma-4-31B`。表示だけの問題 |
+| 7 | **フロントの残骸** | `PlanView.vue` / `PlanForm.vue` / `stores/counter.js` / `components/icons/*`。`PlanView` は router から参照されているので、消すなら router も直す |
+| 8 | **実機が要る検証** | 機内モードでの観光フェーズ通し / LoRa 端末での decode / TTN のダウンリンク。**現在いずれも使えないため未検証**([offline_field_mode.md §9](30_design/offline_field_mode.md)) |
+
+## I. 次にやること
+
+1. **`feat/rebuild-implementation` を develop にマージするか判断する**(16 コミット)
+2. §H の 1〜2 を直す(応答の分かりにくさと復元の穴)
+3. §H の 4 を測って ILS のパラメータを確定する
+4. 実機が用意できたら §H の 8
