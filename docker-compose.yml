@@ -1,6 +1,68 @@
 services:
+  # === PostgreSQL 16 + PostGIS + pgvector（新構成） ===
+  db:
+    image: guidance-postgres:16-3.4-pgvector
+    build:
+      context: ./docker/postgres
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # === FastAPI モジュラモノリス（新構成） ===
+  app:
+    build:
+      context: .
+      dockerfile: ./backend/Dockerfile.app
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      OSRM_CAR_URL: http://osrm-car:5000
+      OSRM_FOOT_URL: http://osrm-foot:5000
+      INFERENCE_SERVER: http://host.docker.internal:8000/v1
+      PACKS_ROOT: /packs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - packs_data:/packs
+    depends_on:
+      db:
+        condition: service_healthy
+      osrm-car:
+        condition: service_healthy
+      osrm-foot:
+        condition: service_healthy
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --log-config
+      - logging.json
+      - --no-access-log
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
   # === Vector DB ===
   chromadb:
+    profiles: ["legacy"]
     image: chromadb/chroma:0.6.3   # バージョンを明示推奨
     ports:
       - "8001:8000"   # ホスト8000はvLLMが使用するため8001に公開
@@ -20,6 +82,7 @@ services:
 
   # === Static DB (POI / access_points) ===
   static-db:
+    profiles: ["legacy"]
     image: postgis/postgis:16-3.4
     env_file:
       - .env
@@ -36,6 +99,7 @@ services:
 
   # === App DB (users / conversations) ===
   app-db:
+    profiles: ["legacy"]
     image: postgres:16-alpine
     env_file:
       - .env
@@ -56,6 +120,7 @@ services:
 
   # 初期データ投入（POI / facilities / access_points）
   static-db-init:
+    profiles: ["legacy"]
     build:
       context: .
       dockerfile: ./backend/script/Dockerfile.init
@@ -78,6 +143,7 @@ services:
 
   # App DBのテーブル作成
   app-db-init:
+    profiles: ["legacy"]
     build:
       context: .
       dockerfile: ./backend/script/Dockerfile.init
@@ -111,7 +177,12 @@ services:
       - "5001:5000"
     healthcheck:
       # 静的な ok ではなく実際のルート照会で見る（22 §6-11）。あがりこ大王 → 鳥海高原家族旅行村
-      test: ["CMD-SHELL", "curl -sf 'http://localhost:5000/route/v1/car/140.0244,39.1594;140.0354,39.0342' | grep -q '\"code\":\"Ok\"'"]
+      test:
+        - CMD-SHELL
+        - >-
+          bash -ec 'exec 3<>/dev/tcp/127.0.0.1/5000;
+          printf "GET /route/v1/car/140.0244,39.1594;140.0354,39.0342?overview=false HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3;
+          grep -q "\"code\":\"Ok\"" <&3'
       interval: 30s
       timeout: 5s
       retries: 10
@@ -125,7 +196,12 @@ services:
     ports:
       - "5002:5000"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf 'http://localhost:5000/route/v1/foot/140.0244,39.1594;140.0354,39.0342' | grep -q '\"code\":\"Ok\"'"]
+      test:
+        - CMD-SHELL
+        - >-
+          bash -ec 'exec 3<>/dev/tcp/127.0.0.1/5000;
+          printf "GET /route/v1/foot/140.0244,39.1594;140.0354,39.0342?overview=false HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3;
+          grep -q "\"code\":\"Ok\"" <&3'
       interval: 30s
       timeout: 5s
       retries: 10
@@ -133,6 +209,7 @@ services:
   
   # === API Gateway (フロント直結) ===
   api:
+    profiles: ["legacy"]
     build:
       context: .
       dockerfile: ./backend/Dockerfile
@@ -165,10 +242,11 @@ services:
       - "5173:5173"
     command: sh -lc "npm install && npm run dev -- --host 0.0.0.0"
     depends_on:
-      - api
+      - app
 
   # === Worker側のマイクロサービス===
   svc-routing:
+    profiles: ["legacy"]
     build: { context: ., dockerfile: ./backend/Dockerfile }
     command: bash -lc "uvicorn backend.worker.app.services.routing.main:app --host 0.0.0.0 --port 9101"
     env_file:
@@ -179,6 +257,7 @@ services:
     ports: ["9101:9101"]
 
   svc-alongpoi:
+    profiles: ["legacy"]
     build: { context: ., dockerfile: ./backend/Dockerfile }
     command: bash -lc "uvicorn backend.worker.app.services.alongpoi.main:app --host 0.0.0.0 --port 9102"
     env_file:
@@ -189,6 +268,7 @@ services:
     ports: ["9102:9102"]
   
   svc-llm:
+    profiles: ["legacy"]
     build: { context: ., dockerfile: ./backend/Dockerfile }
     command: bash -lc "uvicorn backend.worker.app.services.llm.main:app --host 0.0.0.0 --port 9103"
     environment:
@@ -203,6 +283,7 @@ services:
     ports: ["9103:9103"]
 
   svc-voice:
+    profiles: ["legacy"]
     build:
       context: .
       dockerfile: ./backend/worker/app/services/voice/Dockerfile
@@ -211,7 +292,6 @@ services:
       set -euo pipefail;
       echo '--- voice bootstrap ---';
       ffmpeg -hide_banner -version || { echo 'ERROR: ffmpeg not found in PATH'; exit 1; };
-      mkdir -p /home/junta_takahashi/guidanceLLM2/packs;
       export OMP_NUM_THREADS=1;
       uvicorn backend.worker.app.services.voice.main:app --host 0.0.0.0 --port 9104
       "
@@ -219,22 +299,24 @@ services:
       - .env
     volumes:
       - ./backend:/app/backend
-      - /var/www/packs:/packs
+      - packs_data:/packs
     ports: ["9104:9104"]
 
   svc-nav:
+    profiles: ["legacy"]
     build: { context: ., dockerfile: ./backend/Dockerfile }
     command: bash -lc "uvicorn backend.worker.app.services.nav.main:app --host 0.0.0.0 --port 9100"
     env_file:
       - .env
     volumes:
       - ./backend:/app/backend
-      - /var/www/packs:/packs
+      - packs_data:/packs
     depends_on: [svc-routing, svc-alongpoi, svc-llm, svc-voice]
     ports: ["9100:9100"]
 
   # === AI Agent Service ===
   svc-agent:
+    profiles: ["legacy"]
     build: { context: ., dockerfile: ./backend/Dockerfile }
     command: bash -lc "uvicorn backend.worker.agent_app.api:app --host 0.0.0.0 --port 9200"
     env_file:
@@ -253,6 +335,8 @@ services:
     restart: unless-stopped
   
 volumes:
+  pgdata:
+  packs_data:
   pgdata_static:
   pgdata_app:
   chromadb_data:
