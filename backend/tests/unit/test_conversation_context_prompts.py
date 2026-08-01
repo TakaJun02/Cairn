@@ -168,12 +168,22 @@ def test_compressed_history_keeps_multiple_events_from_one_turn() -> None:
 
 def test_understand_and_respond_receive_the_same_history_and_utterance_is_last() -> None:
     state = _state("u: 前の発話\na: 前の応答")
+    # UTC では前日でも、基準日は JST の 2026-08-02 になる。
+    now = datetime(2026, 8, 1, 16, 0, tzinfo=UTC)
 
-    understand_messages = build_understand_messages(state)
-    respond_messages = build_respond_messages(state, mode=ResponseMode.EXPLANATION)
+    understand_messages = build_understand_messages(state, now=now)
+    respond_messages = build_respond_messages(
+        state,
+        mode=ResponseMode.EXPLANATION,
+        now=now,
+    )
 
     for messages in (understand_messages, respond_messages):
         dynamic = messages[1]["content"]
+        assert (
+            "今日は 2026-08-02(日)です。"
+            "『明日』は 2026-08-03 を指します。"
+        ) in dynamic
         assert "⑤ 会話履歴" in dynamic
         assert state.history in dynamic
         assert dynamic.endswith(state.utterance)
@@ -184,6 +194,13 @@ def test_understand_and_respond_receive_the_same_history_and_utterance_is_last()
             < dynamic.index("⑥ ")
         )
     assert understand_messages[0]["content"] == UNDERSTAND_SYSTEM_PROMPT
+    assert "今日は 2026-08-02" not in UNDERSTAND_SYSTEM_PROMPT
+
+
+def test_understand_prompt_documents_itinerary_endpoint_and_edit_target_shapes() -> None:
+    assert 'origin={"kind":"facility","id":"spot_011"}' in UNDERSTAND_SYSTEM_PROMPT
+    assert '{op:"remove", targets:[spot_id]}' in UNDERSTAND_SYSTEM_PROMPT
+    assert 'targets:[spot_id] または "$N.spot_ids"' in UNDERSTAND_SYSTEM_PROMPT
 
 
 def test_respond_context_keeps_degradation_and_removed_constraints() -> None:

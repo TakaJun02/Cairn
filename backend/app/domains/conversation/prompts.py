@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.domains.conversation.state import TurnState
 from app.domains.conversation.types import (
@@ -25,6 +27,8 @@ _INTERPRETATION_VALUES = [
     "current_itinerary",
     "last_candidates",
 ]
+_JAPAN_TZ = ZoneInfo("Asia/Tokyo")
+_WEEKDAYS_JA = ("月", "火", "水", "木", "金", "土", "日")
 
 
 UNDERSTAND_SYSTEM_PROMPT = f"""あなたは鳥海山観光ガイダンスの
@@ -66,8 +70,21 @@ selection_hints → unmodeled → action → intent → plan → clarify。
 
 Tool 引数の要点:
 recommend: {{filter: {{tags?, mobility?, weather_fit?, area?, day?}}, k: 1..8, exclude?}}
-plan_itinerary: {{days: [{{date,start,end,origin,destination?}}], must_visit?}}
-edit_itinerary: {{ops: [add/remove/move/replace/lock/set_stay/set_time/revert]}}
+plan_itinerary: {{days: [{{date:"YYYY-MM-DD", start:"HH:MM", end:"HH:MM",
+  origin:{{kind:"spot"|"facility"|"coord", id?:spot_id, lat?:数値, lon?:数値}},
+  destination?:{{kind, id?, lat?, lon?}}}}], must_visit?:[spot_id]}}
+  例: 起点が道の駅象潟なら
+  origin={{"kind":"facility","id":"spot_011"}}（文字列だけにしない）。
+edit_itinerary: {{ops:[
+  {{op:"add", targets:[spot_id] または "$N.spot_ids", day?, after?}},
+  {{op:"remove", targets:[spot_id]}},
+  {{op:"move", target:spot_id, day?, position?}},
+  {{op:"replace", target:spot_id, with:spot_id または "$N.spot_ids[:1]"}},
+  {{op:"lock", targets:[spot_id], locked:true|false}},
+  {{op:"set_stay", target:spot_id, min:整数}},
+  {{op:"set_time", target:spot_id, arrive?:"HH:MM", depart?:"HH:MM"}},
+  {{op:"revert", to_version?:整数}}
+]}}
 search_knowledge: {{request, spot_id?}}
 ask_user: {{slot, reason, options（2〜4件）}}
 
@@ -106,10 +123,18 @@ respond ノードです。
 """
 
 
-def build_understand_messages(state: TurnState) -> list[dict[str, str]]:
+def build_understand_messages(
+    state: TurnState,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, str]]:
     """固定 ①② と可変 ③④⑤⑥を、必ずこの順で連結する。"""
 
-    dynamic = _ordered_dynamic_context(state, include_turn_results=False)
+    dynamic = _ordered_dynamic_context(
+        state,
+        include_turn_results=False,
+        now=now,
+    )
     return [
         {"role": "system", "content": UNDERSTAND_SYSTEM_PROMPT},
         {"role": "user", "content": dynamic},
@@ -120,8 +145,14 @@ def build_respond_messages(
     state: TurnState,
     *,
     mode: ResponseMode,
+    now: datetime | None = None,
 ) -> list[dict[str, str]]:
-    dynamic = _ordered_dynamic_context(state, include_turn_results=True, mode=mode)
+    dynamic = _ordered_dynamic_context(
+        state,
+        include_turn_results=True,
+        mode=mode,
+        now=now,
+    )
     return [
         {"role": "system", "content": RESPOND_SYSTEM_PROMPT},
         {"role": "user", "content": dynamic},
@@ -387,6 +418,7 @@ def _ordered_dynamic_context(
     *,
     include_turn_results: bool,
     mode: ResponseMode | None = None,
+    now: datetime | None = None,
 ) -> str:
     active_constraints = (
         state.itinerary.constraints if state.itinerary is not None else state.pending_constraints
@@ -422,12 +454,29 @@ def _ordered_dynamic_context(
     # ⑥の発話より後ろには一切追加しない。
     return "\n".join(
         [
-            "③ プロファイル・現在の旅程・有効な制約:\n"
+            "③ 今日の日付（JST）・プロファイル・現在の旅程・有効な制約:\n"
+            + _date_context(now)
+            + "\n"
             + _compact_json(profile_and_trip),
             "④ 参照可能な spot_id 語彙:\n" + _compact_json(vocab),
             "⑤ 会話履歴（understand/respond 共通）:\n" + (state.history or "(なし)"),
             "⑥ ユーザーの発話:\n" + state.utterance,
         ]
+    )
+
+
+def _date_context(now: datetime | None) -> str:
+    current = now or datetime.now(_JAPAN_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=_JAPAN_TZ)
+    else:
+        current = current.astimezone(_JAPAN_TZ)
+    today = current.date()
+    tomorrow = today + timedelta(days=1)
+    weekday = _WEEKDAYS_JA[today.weekday()]
+    return (
+        f"今日は {today.isoformat()}({weekday})です。"
+        f"『明日』は {tomorrow.isoformat()} を指します。"
     )
 
 

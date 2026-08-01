@@ -70,17 +70,18 @@ async def validate_plan(
     # P3 — Tool ごとの引数 schema
     normalized: list[PlanStep] = []
     for step in working:
+        normalized_step = _normalize_llm_step(state, step)
         try:
-            parsed_args = _parse_args(step)
-            if _mixed_revert_ops(step):
+            parsed_args = _parse_args(normalized_step)
+            if _mixed_revert_ops(normalized_step):
                 _reject(
                     rejected,
-                    step,
+                    normalized_step,
                     "revert_exclusive",
                     "revert と混在した他の op を破棄しました",
                 )
             normalized.append(
-                step.model_copy(update={"args": parsed_args}, deep=True)
+                normalized_step.model_copy(update={"args": parsed_args}, deep=True)
             )
         except (ValidationError, ValueError, TypeError) as exc:
             _reject(rejected, step, "P3", f"引数 schema に適合しません: {exc}")
@@ -211,6 +212,41 @@ def _p2_known_tool(step: PlanStep) -> tuple[bool, str]:
     except ValueError:
         return False, f"未知の Tool です: {step.tool}"
     return True, ""
+
+
+def _normalize_llm_step(state: TurnState, step: PlanStep) -> PlanStep:
+    """LLM が省略しやすい Tool 引数の外形だけを P3 前に補正する。"""
+
+    args = deepcopy(step.args)
+    if step.tool == ToolName.PLAN_ITINERARY.value:
+        days = args.get("days")
+        if isinstance(days, list):
+            for day in days:
+                if not isinstance(day, dict):
+                    continue
+                for field in ("origin", "destination"):
+                    spot_id = day.get(field)
+                    if not isinstance(spot_id, str):
+                        continue
+                    spot = state.spot_catalog.get(spot_id)
+                    kind = (
+                        "facility"
+                        if spot is not None and spot.kind == "facility"
+                        else "spot"
+                    )
+                    day[field] = {"kind": kind, "id": spot_id}
+    elif step.tool == ToolName.EDIT_ITINERARY.value:
+        operations = args.get("ops")
+        if isinstance(operations, list):
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    continue
+                if operation.get("op") not in {"remove", "lock"}:
+                    continue
+                targets = operation.get("targets")
+                if isinstance(targets, str) and not targets.startswith("$"):
+                    operation["targets"] = [targets]
+    return step.model_copy(update={"args": args}, deep=True)
 
 
 def _parse_args(step: PlanStep) -> dict[str, Any]:

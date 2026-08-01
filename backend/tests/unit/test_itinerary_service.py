@@ -244,3 +244,49 @@ async def test_solution_selection_hook_accepts_async_selector() -> None:
 
     assert selected == solution_b
     assert selected is not solution_b
+
+
+async def test_plan_emits_solution_a_before_async_selection() -> None:
+    repository = MemoryItineraryRepository(_planning())
+    order: list[str] = []
+
+    async def provisional(itinerary: Itinerary, diff: Any) -> None:
+        assert itinerary.version == 1
+        assert diff.added == []
+        order.append("provisional")
+
+    async def choose_b(
+        solutions: list[Itinerary],
+        free_text: str,
+    ) -> Itinerary:
+        del free_text
+        order.append("selector")
+        return solutions[1]
+
+    service = ItineraryService(
+        repository,  # type: ignore[arg-type]
+        solver_config=SolverConfig(
+            iterations=20,
+            minimum_iterations=20,
+            time_limit_ms=2_000,
+        ),
+        selector=choose_b,
+        provisional_sink=provisional,
+    )
+
+    result = await service.plan_itinerary(
+        user_id=7,
+        days=[
+            {
+                "date": "2026-08-10",
+                "start": "09:00",
+                "end": "13:00",
+                "origin": {"kind": "spot", "id": "spot_origin"},
+            }
+        ],
+        selection_text="のんびり",
+    )
+
+    assert not isinstance(result, ToolError)
+    assert order == ["provisional", "selector"]
+    assert result.selection_used is True

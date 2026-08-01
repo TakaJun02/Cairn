@@ -44,8 +44,6 @@ from app.domains.itinerary.service import (
 )
 from app.domains.itinerary.types import (
     Diff as ItineraryDiff,
-)
-from app.domains.itinerary.types import (
     Itinerary,
     ToolError as ItineraryToolError,
 )

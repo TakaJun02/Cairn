@@ -441,3 +441,77 @@ async def test_plan_defaults_are_visible_and_add_confirmation_after_plan() -> No
     assert day["start"] == "09:00"
     assert day["end"] == "17:00"
     assert state.assumptions
+
+
+@pytest.mark.parametrize(
+    ("origin", "destination", "expected_origin", "expected_destination"),
+    [
+        (
+            {"kind": "facility", "id": "spot_001"},
+            {"kind": "spot", "id": "spot_002"},
+            {"kind": "facility", "id": "spot_001"},
+            {"kind": "spot", "id": "spot_002"},
+        ),
+        (
+            "spot_001",
+            "spot_002",
+            {"kind": "facility", "id": "spot_001"},
+            {"kind": "spot", "id": "spot_002"},
+        ),
+    ],
+)
+async def test_p3_accepts_or_normalizes_plan_endpoints(
+    origin: object,
+    destination: object,
+    expected_origin: dict[str, str],
+    expected_destination: dict[str, str],
+) -> None:
+    state = _state(
+        [
+            PlanStep(
+                id=1,
+                tool="plan_itinerary",
+                args={
+                    "days": [
+                        {
+                            "date": "2026-08-03",
+                            "start": "09:00",
+                            "end": "17:00",
+                            "origin": origin,
+                            "destination": destination,
+                        }
+                    ]
+                },
+            )
+        ],
+        intent=Intent.PLAN,
+    )
+
+    await validate_plan(state, now=datetime(2026, 8, 2, 9, 0))
+
+    assert state.rejected_steps == []
+    assert state.accepted_steps[0].args["days"][0]["origin"] == expected_origin
+    assert (
+        state.accepted_steps[0].args["days"][0]["destination"]
+        == expected_destination
+    )
+
+
+async def test_p3_normalizes_direct_remove_target_to_array() -> None:
+    state = _state(
+        [
+            PlanStep(
+                id=1,
+                tool="edit_itinerary",
+                args={"ops": [{"op": "remove", "targets": "spot_002"}]},
+            )
+        ],
+        itinerary_version=2,
+    )
+
+    await validate_plan(state)
+
+    assert state.rejected_steps == []
+    assert state.accepted_steps[0].args["ops"] == [
+        {"op": "remove", "targets": ["spot_002"]}
+    ]

@@ -424,18 +424,6 @@ async def _select_solution_with_alternatives(
         free_text,
         selector=selector,
     )
-
-
-async def _emit_provisional(
-    sink: ProvisionalItinerarySink | None,
-    itinerary: Itinerary,
-    diff: Diff,
-) -> None:
-    if sink is None:
-        return
-    result = sink(itinerary.model_copy(deep=True), diff.model_copy(deep=True))
-    if inspect.isawaitable(result):
-        await result
     selected_index = next(
         index for index, solution in enumerate(solutions) if solution == selected
     )
@@ -448,6 +436,18 @@ async def _emit_provisional(
         ],
         selector is not None,
     )
+
+
+async def _emit_provisional(
+    sink: ProvisionalItinerarySink | None,
+    itinerary: Itinerary,
+    diff: Diff,
+) -> None:
+    if sink is None:
+        return
+    result = sink(itinerary.model_copy(deep=True), diff.model_copy(deep=True))
+    if inspect.isawaitable(result):
+        await result
 
 
 async def plan_itinerary(
