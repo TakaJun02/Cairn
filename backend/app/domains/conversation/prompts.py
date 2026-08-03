@@ -16,17 +16,16 @@ from app.domains.conversation.types import (
     pred_values,
     preference_values,
 )
+from app.domains.recommendation.types import Mobility
 
 _PREFERENCE_VOCABULARY = " | ".join(preference_values())
+_MOBILITY_VOCABULARY = " | ".join(f'"{value.value}"' for value in Mobility)
+_SLOT_VOCABULARY = " | ".join(f'"{value.value}"' for value in Slot)
+_INTERPRETATION_VOCABULARY = (
+    "all_matches | single_match | current_itinerary | last_candidates"
+)
 _INTENT_VALUES = [value.value for value in Intent]
 _TOOL_VALUES = [value.value for value in ToolName]
-_SLOT_VALUES = [value.value for value in Slot]
-_INTERPRETATION_VALUES = [
-    "all_matches",
-    "single_match",
-    "current_itinerary",
-    "last_candidates",
-]
 _JAPAN_TZ = ZoneInfo("Asia/Tokyo")
 _WEEKDAYS_JA = ("月", "火", "水", "木", "金", "土", "日")
 
@@ -38,7 +37,7 @@ understand ノードです。
 
 出力フィールドは必ず次の思考順で埋めます。この順序を変えません。
 references → profile_delta → constraints → constraints_remove → score_adjustments →
-selection_hints → unmodeled → action → intent → plan → clarify。
+selection_hints → unmodeled → intent → plan。
 
 境界:
 - あなたは何も実行しません。Tool の列を plan に書くだけです。
@@ -48,16 +47,22 @@ selection_hints → unmodeled → action → intent → plan → clarify。
   どれか 1 経路へ写します。
 - constraints は plan.args に入れず、トップレベルへ置きます。
 - profile.interests のキーは次の 12 語だけです: {_PREFERENCE_VOCABULARY}
-- 生タグ（例: 滝、温泉）は recommend.filter.tags と constraint.args の
-  target にだけ使えます。
-- action は done または ask_user です。ask_user は意味の曖昧さが実行を妨げ、
-  具体的な選択肢が 2〜4 個ある場合だけです。その場合 plan=[]、
-  intent=unclear、clarify を埋めます。
+- 生タグは④の「生タグ語彙」にある語だけを recommend.filter.tags と
+  constraint.args.target に使えます。語彙に無い概念は tags に入れず、
+  その概念を tags ではスキップします。「山」は語彙に無いので、意図に合う
+  場合だけ「登山」か「鳥海山」を使い、合わなければ tags に入れません。
+- mobility は移動手段ではなく歩行耐性です。値は {_MOBILITY_VOCABULARY}
+  だけです。「車で行く」「車で回る」だけでは歩行耐性は不明なので、
+  recommend.filter.mobility と profile_delta.mobility のどちらにも写しません。
+- 意味の曖昧さが実行を妨げ、具体的な選択肢が 2〜4 個ある場合だけ、
+  plan=[ask_user] の 1 手を出します。kind=clarify、intent=unclear とし、
+  surface に曖昧だった表現を入れます。
 - 日付・時刻が無い旅程要求や、選好が薄い推薦要求では聞き返さず、
-  done で進めます。
-- 選好を聞く ask_user Tool と、意味を聞き返す action=ask_user を混同しません。
+  仮定して進めます。
+- ask_user は選好を聞く kind=preference と、意味を聞き返す kind=clarify の
+  1 つの Tool です。plan の末尾だけに置き、plan 全体で 1 手までです。
 - 広い初回要求で party/mobility/interests がすべて空なら、
-  plan の ask_user(onboarding) を使えます。
+  kind=preference、slot=onboarding の ask_user を使えます。
 - plan は最大 3 手。Tool は recommend / plan_itinerary / edit_itinerary /
   search_knowledge / ask_user のみです。
 - 後段は前段結果を $N.spot_ids、$N.spot_ids[:k]、$N.itinerary だけで
@@ -66,27 +71,42 @@ selection_hints → unmodeled → action → intent → plan → clarify。
 - edit_itinerary の自然言語 undo は ops=[{{"op":"revert"}}] です。
   他の op と混ぜません。
 - plan_itinerary/edit_itinerary の制約はトップレベル constraints に置きます。
-- clarify の resolves_to.kind は spot_id または interpretation です。
+- 前ターンの tool_results があれば、ask_user が何を聞き、ユーザーが
+  何と答えたかを元の要求と一緒に解釈して plan を組みます。
 
 Tool 引数の要点:
-recommend: {{filter: {{tags?, mobility?, weather_fit?, area?, day?}}, k: 1..8, exclude?}}
+recommend: {{filter: {{tags?:[④の生タグ],
+  mobility?:{_MOBILITY_VOCABULARY},
+  weather_fit?:true|false, area?:非空文字列, day?:1以上の整数}},
+  k:1..8, exclude?:[spot_id]}}
+  weather_fit は boolean です。雨天適性を考慮する要求なら true にします。
+  day は現在の旅程があるときだけ指定します。
 plan_itinerary: {{days: [{{date:"YYYY-MM-DD", start:"HH:MM", end:"HH:MM",
   origin:{{kind:"spot"|"facility"|"coord", id?:spot_id, lat?:数値, lon?:数値}},
   destination?:{{kind, id?, lat?, lon?}}}}], must_visit?:[spot_id]}}
   例: 起点が道の駅象潟なら
   origin={{"kind":"facility","id":"spot_011"}}（文字列だけにしない）。
 edit_itinerary: {{ops:[
-  {{op:"add", targets:[spot_id] または "$N.spot_ids", day?, after?}},
+  {{op:"add", targets:[spot_id] または "$N.spot_ids" または
+    "$N.spot_ids[:k]", day?:1以上整数, after?:spot_id}},
   {{op:"remove", targets:[spot_id]}},
-  {{op:"move", target:spot_id, day?, position?}},
+  {{op:"move", target:spot_id, day?:1以上整数, position?:1以上整数}},
   {{op:"replace", target:spot_id, with:spot_id または "$N.spot_ids[:1]"}},
   {{op:"lock", targets:[spot_id], locked:true|false}},
-  {{op:"set_stay", target:spot_id, min:整数}},
+  {{op:"set_stay", target:spot_id, min:1以上整数}},
   {{op:"set_time", target:spot_id, arrive?:"HH:MM", depart?:"HH:MM"}},
-  {{op:"revert", to_version?:整数}}
+  {{op:"revert", to_version?:1以上整数}}
 ]}}
-search_knowledge: {{request, spot_id?}}
-ask_user: {{slot, reason, options（2〜4件）}}
+  各 op では ? の無い引数が必須です。set_time は arrive/depart の少なくとも
+  一方が必須です。
+search_knowledge: {{request:非空文字列, spot_id?:spot_id}}
+ask_user: {{kind:"preference"|"clarify",
+  slot?:{_SLOT_VOCABULARY},
+  surface?:非空文字列, reason:非空文字列,
+  options:[{{label:非空文字列, value:非空文字列}}]（2〜4件）}}
+  kind=preference は slot が必須で surface は不可、kind=clarify は surface が
+  必須で slot は不可です。clarify の options.value は参照可能な spot_id または
+  {_INTERPRETATION_VOCABULARY} のどれかだけです。
 
 例:
 - 「明日は滝を2つ入れて、昼を取れるようにして」なら recommend の後に
@@ -102,7 +122,7 @@ RESPOND_SYSTEM_PROMPT = f"""あなたは鳥海山観光ガイダンスの
 respond ノードです。
 入力 JSON の mode に従い、自然で簡潔な日本語を
 1 回だけ生成してください。
-この 1 本のテンプレートを explanation / question / clarification / failure の
+この 1 本のテンプレートを explanation / question / failure の
 全モードで使います。
 
 必須規則:
@@ -113,8 +133,8 @@ respond ノードです。
 - 候補や旅程を組み替えません。確定済み結果を説明するだけです。
 - explanation では「今回考慮した条件」を列挙します。
 - unmodeled、破棄・スキップ・失敗、譲歩があれば必ず明示します。
-- question は質問 1 つと選択肢、clarification は曖昧だった点と
-  選択肢だけを書きます。
+- question は質問 1 つと選択肢だけを書きます。ask_user.kind=preference なら
+  聞きたいことを、kind=clarify なら何が曖昧だったかを述べます。
 - failure は分からなかったことと、ユーザーが次にできることを
   短く伝えます。
 - 検索結果の coverage=none なら推測で補いません。
@@ -133,6 +153,7 @@ def build_understand_messages(
     dynamic = _ordered_dynamic_context(
         state,
         include_turn_results=False,
+        include_tag_vocabulary=True,
         now=now,
     )
     return [
@@ -150,6 +171,7 @@ def build_respond_messages(
     dynamic = _ordered_dynamic_context(
         state,
         include_turn_results=True,
+        include_tag_vocabulary=False,
         mode=mode,
         now=now,
     )
@@ -162,8 +184,6 @@ def build_respond_messages(
 def understand_guided_schema(
     spot_ids: list[str],
     constraint_ids: list[str] | None = None,
-    *,
-    allow_clarification: bool = True,
 ) -> dict[str, Any]:
     """xgrammar 互換の schema。`uniqueItems` は意図的に一切使わない。"""
 
@@ -173,11 +193,6 @@ def understand_guided_schema(
     else:
         # 空 enum や pattern を grammar compiler へ渡さず、親配列を空に縛る。
         spot_value_schema = {"type": "string"}
-    interpretation_or_spot_values = [*spot_ids, *_INTERPRETATION_VALUES]
-    resolution_value_schema: dict[str, Any] = {
-        "type": "string",
-        "enum": list(dict.fromkeys(interpretation_or_spot_values)),
-    }
     normalized_constraint_ids = list(dict.fromkeys(constraint_ids or []))
     constraint_id_schema: dict[str, Any]
     if normalized_constraint_ids:
@@ -190,6 +205,63 @@ def understand_guided_schema(
     profile_properties = {
         key: {"type": "number", "minimum": -1.0, "maximum": 1.0}
         for key in preference_values()
+    }
+    regular_plan_step_schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer", "minimum": 1},
+            "tool": {
+                "type": "string",
+                "enum": [
+                    value
+                    for value in _TOOL_VALUES
+                    if value != ToolName.ASK_USER.value
+                ],
+            },
+            "args": {"type": "object", "additionalProperties": True},
+        },
+        "required": ["id", "tool", "args"],
+        "additionalProperties": False,
+    }
+    ask_user_plan_step_schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer", "minimum": 1},
+            "tool": {"type": "string", "enum": [ToolName.ASK_USER.value]},
+            "args": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["preference", "clarify"],
+                    },
+                    "slot": {
+                        "type": "string",
+                        "enum": [value.value for value in Slot],
+                    },
+                    "surface": {"type": "string", "minLength": 1},
+                    "reason": {"type": "string", "minLength": 1},
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "minLength": 1},
+                                "value": {"type": "string", "minLength": 1},
+                            },
+                            "required": ["label", "value"],
+                            "additionalProperties": False,
+                        },
+                        "minItems": 2,
+                        "maxItems": 4,
+                    },
+                },
+                "required": ["kind", "reason", "options"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["id", "tool", "args"],
+        "additionalProperties": False,
     }
     return {
         "type": "object",
@@ -333,67 +405,16 @@ def understand_guided_schema(
                 },
                 "maxItems": 8,
             },
-            "action": {
-                "type": "string",
-                "enum": (
-                    ["done", "ask_user"]
-                    if allow_clarification
-                    else ["done"]
-                ),
-            },
             "intent": {"type": "string", "enum": _INTENT_VALUES},
             "plan": {
                 "type": "array",
                 "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "integer", "minimum": 1},
-                        "tool": {"type": "string", "enum": _TOOL_VALUES},
-                        "args": {"type": "object", "additionalProperties": True},
-                    },
-                    "required": ["id", "tool", "args"],
-                    "additionalProperties": False,
+                    "anyOf": [
+                        regular_plan_step_schema,
+                        ask_user_plan_step_schema,
+                    ]
                 },
                 "maxItems": 3,
-            },
-            "clarify": {
-                "anyOf": [
-                    {"type": "null"},
-                    {
-                        "type": "object",
-                        "properties": {
-                            "surface": {"type": "string", "minLength": 1},
-                            "why": {"type": "string", "minLength": 1},
-                            "options": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "label": {"type": "string", "minLength": 1},
-                                        "resolves_to": {
-                                            "type": "object",
-                                            "properties": {
-                                                "kind": {
-                                                    "type": "string",
-                                                    "enum": ["spot_id", "interpretation"],
-                                                },
-                                                "value": resolution_value_schema,
-                                            },
-                                            "required": ["kind", "value"],
-                                            "additionalProperties": False,
-                                        },
-                                    },
-                                    "required": ["label", "resolves_to"],
-                                    "additionalProperties": False,
-                                },
-                                "minItems": 2,
-                                "maxItems": 4,
-                            },
-                        },
-                        "required": ["surface", "why", "options"],
-                        "additionalProperties": False,
-                    },
-                ]
             },
         },
         "required": [
@@ -404,10 +425,8 @@ def understand_guided_schema(
             "score_adjustments",
             "selection_hints",
             "unmodeled",
-            "action",
             "intent",
             "plan",
-            "clarify",
         ],
         "additionalProperties": False,
     }
@@ -417,6 +436,7 @@ def _ordered_dynamic_context(
     state: TurnState,
     *,
     include_turn_results: bool,
+    include_tag_vocabulary: bool,
     mode: ResponseMode | None = None,
     now: datetime | None = None,
 ) -> str:
@@ -430,16 +450,10 @@ def _ordered_dynamic_context(
         "last_candidates": [
             value.model_dump(mode="json") for value in state.last_candidates
         ],
-        "pending_clarification": state.pending_clarification,
         "resolved_ambiguities": state.resolved_ambiguities,
-        "clarify_streak": state.clarify_streak,
         "asked_slots": state.asked_slots,
         "ask_streak": state.ask_streak,
-        "explicit_resolution": (
-            state.explicit_resolution.model_dump(mode="json")
-            if state.explicit_resolution is not None
-            else None
-        ),
+        "tool_results": state.tool_results,
         "realtime": {
             spot_id: state.realtime.get(spot_id, {}) for spot_id in state.spot_id_vocab
         },
@@ -451,6 +465,9 @@ def _ordered_dynamic_context(
         {"spot_id": spot_id, "name_ja": state.spot_names.get(spot_id, spot_id)}
         for spot_id in state.spot_id_vocab
     ]
+    vocabulary_context = "④ 参照可能な spot_id 語彙:\n" + _compact_json(vocab)
+    if include_tag_vocabulary:
+        vocabulary_context += "\n" + _tag_vocabulary_context(state.tag_vocabulary)
     # ⑥の発話より後ろには一切追加しない。
     return "\n".join(
         [
@@ -458,7 +475,7 @@ def _ordered_dynamic_context(
             + _date_context(now)
             + "\n"
             + _compact_json(profile_and_trip),
-            "④ 参照可能な spot_id 語彙:\n" + _compact_json(vocab),
+            vocabulary_context,
             "⑤ 会話履歴（understand/respond 共通）:\n" + (state.history or "(なし)"),
             "⑥ ユーザーの発話:\n" + state.utterance,
         ]
@@ -521,13 +538,8 @@ def _turn_result(state: TurnState) -> dict[str, Any]:
         "aborted_at": state.aborted_at,
         "degraded": [value.model_dump(mode="json") for value in state.degraded],
         "assumptions": state.assumptions,
-        "clarification": (
-            state.clarification.model_dump(mode="json")
-            if state.clarification is not None
-            else None
-        ),
-        "ask_user": state.ask_user_payload,
-        "tool_results": {
+        "ask_user": state.pending_ask,
+        "step_results": {
             str(step_id): result.model_dump(mode="json")
             for step_id, result in state.step_results.items()
         },
@@ -560,3 +572,12 @@ def _allowed_response_spot_ids(state: TurnState) -> list[str]:
 
 def _compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _tag_vocabulary_context(values: list[str]) -> str:
+    vocabulary = list(dict.fromkeys(value for value in values if value))
+    rendered = " | ".join(vocabulary) if vocabulary else "(なし)"
+    return (
+        f"生タグ語彙（{len(vocabulary)}語・ここにある語だけ使用可）:\n"
+        f"{rendered}"
+    )

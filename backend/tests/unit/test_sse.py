@@ -14,7 +14,9 @@ from app.api.sse import (
     frame_sse,
     iter_sse_frames,
 )
-from app.domains.conversation.events import ConversationEvent
+from app.domains.conversation.events import ConversationEvent, MemoryEventSink
+from app.domains.conversation.tool_adapters import ToolAdapters
+from app.domains.conversation.types import AskUserArgs
 
 
 def test_candidate_internal_names_are_mapped_to_public_contract() -> None:
@@ -54,6 +56,62 @@ def test_candidate_internal_names_are_mapped_to_public_contract() -> None:
     assert "stage" not in payload
     assert "spot_ids" not in payload
     assert "candidates" not in payload
+
+
+async def test_ask_user_and_clarify_sse_include_reason_without_changing_options() -> None:
+    sink = MemoryEventSink()
+    adapter = object.__new__(ToolAdapters)
+    adapter.event_sink = sink
+
+    await adapter.ask_user(
+        step_id=1,
+        args=AskUserArgs.model_validate(
+            {
+                "kind": "preference",
+                "slot": "origin",
+                "reason": "仮定した旅程条件の確認",
+                "options": [
+                    {"label": "この条件で進める", "value": "accept_assumptions"},
+                    {"label": "条件を変更する", "value": "change_conditions"},
+                ],
+            }
+        ),
+    )
+    await adapter.ask_user(
+        step_id=2,
+        args=AskUserArgs.model_validate(
+            {
+                "kind": "clarify",
+                "surface": "2番目",
+                "reason": "候補が複数あります",
+                "options": [
+                    {"label": "鶴間池", "value": "spot_001"},
+                    {"label": "元滝伏流水", "value": "spot_002"},
+                ],
+            }
+        ),
+    )
+
+    preference, clarify = [
+        adapt_conversation_event(event).root.data.model_dump(mode="json")
+        for event in sink.events
+    ]
+
+    assert preference == {
+        "kind": "ask_user",
+        "slot": "origin",
+        "reason": "仮定した旅程条件の確認",
+        "options": ["この条件で進める", "条件を変更する"],
+    }
+    assert clarify == {
+        "kind": "clarify",
+        "surface": "2番目",
+        "reason": "候補が複数あります",
+        "options": [
+            {"label": "鶴間池", "value": "spot_001"},
+            {"label": "元滝伏流水", "value": "spot_002"},
+        ],
+    }
 
 
 def test_sse_frame_has_event_data_and_terminal_blank_line() -> None:

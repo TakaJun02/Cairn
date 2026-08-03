@@ -1,7 +1,7 @@
 # データモデル設計
 
-- 状態: **決定稿 (2026-08-01)** / **改訂 2026-08-01(Phase 2 設計を反映)**
-- 前提: [ADR-0002](../adr/0002-single-postgres.md)(PostgreSQL 1 台に統合)/ [20_architecture.md §9](../20_architecture.md) / [agent_planning_phase.md §4](agent_planning_phase.md)(状態の設計)/ [recommendation_planning.md §3.1・§4.0](recommendation_planning.md)
+- 状態: **決定稿 (2026-08-01)** / 改訂 2026-08-01(Phase 2 設計を反映)/ **改訂 2026-08-04([ADR-0019](../adr/0019-react-main-agent-subagents.md) ReAct 構成を反映: `threads` に `history_summary`・`summarized_until_message_id` を追加、`pending_ask` を「表示中の質問(HITL)」の復元用に再定義、§6 の履歴構築を LLM 要約方式に変更 = migration 0004)**
+- 前提: [ADR-0002](../adr/0002-single-postgres.md)(PostgreSQL 1 台に統合)/ [20_architecture.md §9](../20_architecture.md) / [agent_react_architecture.md §12](agent_react_architecture.md)(状態の設計)/ [recommendation_planning.md §3.1・§4.0](recommendation_planning.md)
 - 決定事項の議論経緯: [90_backlog.md §A0-3・§A0-4](../90_backlog.md)
 - **改訂の内容(Phase 2)**: `static.access_points` / `static.spot_approach` を新設(§2.6)、`travel_times` を door-to-door と定義(§3)、`app.routes` をレッグ単位に変更・`pack_jobs` / `pack_assets` に列を追加(§4.7)、`weather_fit` / `visit_difficulty` の CHECK を実データに合わせて拡張(§1.4.1)。根拠は [ADR-0013](../adr/0013-leg-route-door-to-door.md) / [ADR-0015](../adr/0015-pack-asset-composition.md)
 - **改訂の内容(Phase 3)**: `app.lora_downlinks` を新設、`users.lora_device_id` と `pack_jobs.epoch` を追加(§4.7)。根拠は [ADR-0016](../adr/0016-lora-terminal-driven-batch.md)、設計は [realtime_lora.md](realtime_lora.md)
@@ -45,7 +45,7 @@ erDiagram
         bigint id PK
         bigint user_id UK "1ユーザー1スレッド"
         jsonb last_candidates
-        jsonb pending_clarification
+        jsonb pending_ask
     }
     messages {
         bigint id PK
@@ -97,7 +97,7 @@ erDiagram
 
 統合で得られるもの:
 
-- **`understand` が出す `spot_id` の照合先が 1 つになる**(§3.3 のクローズドワールド設計が単純になる)
+- **LLM が出す `spot_id`・スポット名の照合先が 1 つになる**(クローズドワールド設計が単純になる)
 - **ソルバーの候補集合と起点の集合が同じテーブルから引ける。**宿は起点にも訪問先にもなりうる(温泉宿に立ち寄る)ので、**テーブルで分けると表現できない**
 - `search_knowledge` の参照先、`travel_times` の外部キー、パック生成の対象がすべて同じ集合になる
 
@@ -431,15 +431,18 @@ CREATE TABLE app.threads (
   id         bigserial PRIMARY KEY,
   user_id    bigint NOT NULL UNIQUE REFERENCES app.users(id) ON DELETE CASCADE,
 
-  -- ── 会話状態（agent_planning_phase.md §4.1）────────────────────
+  -- ── 会話状態（agent_react_architecture.md §12）─────────────────
   presented_spot_ids    text[] NOT NULL DEFAULT '{}',   -- 反復推薦の防止（ADR-0006）
-  last_candidates       jsonb  NOT NULL DEFAULT '[]',   -- 照応解決の検証語彙（§4.3）
-  asked_slots           text[] NOT NULL DEFAULT '{}',   -- ガードレール G2
-  ask_streak            smallint NOT NULL DEFAULT 0,    -- ガードレール G3
-  pending_clarification jsonb,                          -- 1 ターン限り（ADR-0010）
-  resolved_ambiguities  jsonb  NOT NULL DEFAULT '[]',   -- ガードレール G7
-  clarify_streak        smallint NOT NULL DEFAULT 0,    -- ガードレール G8
+  last_candidates       jsonb  NOT NULL DEFAULT '[]',   -- 名寄せ・照応の検証語彙（§4.3）
+  asked_slots           text[] NOT NULL DEFAULT '{}',   -- ガードレール A1（同じスロットを 2 回聞かない）
+  ask_streak            smallint NOT NULL DEFAULT 0,    -- ガードレール A2（連続 ask_user は 2 ターンまで）
+  pending_ask           jsonb,                          -- 表示中の質問（HITL の回答待ち。リロード復元用 = ADR-0019）
+  resolved_ambiguities  jsonb  NOT NULL DEFAULT '[]',   -- ガードレール A5（同じ曖昧さを 2 回聞かない）
   pending_constraints   jsonb  NOT NULL DEFAULT '[]',   -- 旅程がない間の一時制約（§4.5.4）
+
+  -- ── 会話履歴の要約（agent_react_architecture.md §8。2026-08-04 追加）──
+  history_summary       text   NOT NULL DEFAULT '',     -- 直近 2 ターンより古い部分の LLM 要約
+  summarized_until_message_id bigint,                   -- 要約に畳み込み済みの最終 message id
 
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -448,10 +451,10 @@ CREATE TABLE app.threads (
 
 **なぜ 1 本にするのか。**旅程とプロファイルは user 単位、会話履歴と `presented_spot_ids` は thread 単位である。複数スレッドを許すと**スコープがねじれ、新しいスレッドを開いた瞬間に同じ POI が再推薦される**(ADR-0006 の反復推薦防止が効かない)。1 本にすれば profile / 旅程 / 履歴 / 提示済みがすべて同じ寿命になる。FR-5.1(スレッドの復元)も FR-2.3(続きから再開)も 1 本で満たせる。
 
-**なぜ 8 個の状態を列に分けるのか**(JSONB 1 本にしない)。
+**なぜ状態を列に分けるのか**(JSONB 1 本にしない)。
 
-- **旧実装の失敗は「何が状態なのかコードを読まないと分からない」ことだった。**8 個ならスキーマに書ける
-- これらは**すべてコードが強制するガードレール(G2/G3/G7/G8)の入力**である。スキーマに現れるべきものであり、隠すと「どこかで更新し忘れる」型のバグを検出できない
+- **旧実装の失敗は「何が状態なのかコードを読まないと分からない」ことだった。**列ならスキーマに書ける
+- これらは**すべてコードが強制するガードレール(A1/A2/A5)や復帰処理の入力**である。スキーマに現れるべきものであり、隠すと「どこかで更新し忘れる」型のバグを検出できない
 - 各列の**中身**は配列や構造なので JSONB / 配列型を使う。**列に分けることと、値が構造を持つことは別の話**である
 
 ### 4.3 各状態の中身
@@ -461,19 +464,22 @@ CREATE TABLE app.threads (
 [ {"rank": 1, "spot_id": "spot_012", "name_ja": "鶴間池"},
   {"rank": 2, "spot_id": "spot_007", "name_ja": "元滝伏流水"} ]
 
-// pending_clarification — 聞き返しの答えを元の要求に結びつける（ADR-0010）
-{ "surface": "2番目のやつ",
-  "why": "候補が鶴間池と元滝の 2 つある",
-  "options": [ {"label": "鶴間池",     "resolves_to": {"kind": "spot_id", "value": "spot_012"}},
-               {"label": "元滝伏流水", "resolves_to": {"kind": "spot_id", "value": "spot_007"}} ],
-  "original_utterance": "2番目のやつを外して",
-  "asked_at_message_id": 87 }
+// pending_ask — 表示中の質問（HITL・ADR-0019）
+// ターンの処理は回答をプロセス内で待っている。この行は「リロードしてもフォームが復元できる」ためだけにある
+// 回答受領・タイムアウト・ターン終了で必ず NULL。ターンが死んでいたら GET /thread が掃除して null を返す
+{ "kind": "clarify",                      // "preference" | "clarify"
+  "surface": "2番目のやつ",                // kind = "clarify" のとき
+  "slot": null,                           // kind = "preference" のときは Slot が入る
+  "reason": "候補が鶴間池と元滝の 2 つある",
+  "options": [ {"label": "鶴間池",     "value": "spot_012"},
+               {"label": "元滝伏流水", "value": "spot_007"} ],
+  "asked_at": "2026-08-04T10:12:00+09:00" }   // タイムアウト（10 分）の起点
 
 // resolved_ambiguities — 同じ曖昧さを 2 回聞かない（G7）
 [ {"surface": "2番目のやつ", "resolved_to": "spot_012"} ]
 ```
 
-**`last_candidates` は会話履歴とは別物である。**[agent_planning_phase.md §7.2](agent_planning_phase.md) のとおり、役割が違うので両方持つ。
+**`last_candidates` は会話履歴とは別物である。**[agent_react_architecture.md §12](agent_react_architecture.md) のとおり、役割が違うので両方持つ。
 
 | | 誰が読むか | 何のためか |
 | --- | --- | --- |
@@ -482,7 +488,7 @@ CREATE TABLE app.threads (
 
 LLM が `spot_099` と書いたときに弾くのは履歴の仕事ではない。**片方を消すともう片方の役割が穴になる。**
 
-**`pending_clarification` は次のターンで必ず NULL に戻す**(ユーザーが別の話を始めた場合も含む)。永続化しないのは、状態を毎ターン DB から再構築する原則([ADR-0004](../adr/0004-conversation-pipeline.md))を崩さないためである。
+**`pending_ask` はターンをまたがない。**回答待ちの実体はターンの処理(プロセス内)であり、この行は表示の復元用でしかない([agent_react_architecture.md §7](agent_react_architecture.md))。回答受領・タイムアウト・ターン終了で必ず NULL に戻し、プロセス再起動でターンが死んでいたら `GET /thread` が掃除する。エージェントの軌跡やサブエージェントの内部状態は**一切保存しない**(すべてターン内のメモリで完結する)。
 
 ### 4.4 `messages` — 本文と、履歴構築の材料
 
@@ -505,7 +511,7 @@ CREATE INDEX ON app.messages (thread_id, seq DESC);
 
 **`seq` を持つ理由**: 1 ターンのユーザー発話とアシスタント発話は**同一トランザクションで書かれ、`created_at` が同値になりうる**。時刻で並べると順序が不定になる。履歴の並び順は会話の意味そのものなので、明示的な連番で決める。
 
-**`status` を持つ理由**: `respond` が途中で落ちてもアシスタント行は作る([agent_planning_phase.md §16.6](agent_planning_phase.md))。**「ユーザーが見たものは保存されている」を不変条件にする**ため、ストリーム済みの断片を `partial` として残す。
+**`status` を持つ理由**: `respond` が途中で落ちてもアシスタント行は作る([agent_react_architecture.md §13](agent_react_architecture.md))。**「ユーザーが見たものは保存されている」を不変条件にする**ため、ストリーム済みの断片を `partial` として残す。
 
 #### `meta` の中身(assistant)
 
@@ -523,6 +529,8 @@ CREATE INDEX ON app.messages (thread_id, seq DESC);
 ```
 
 **これは計測ログではない。**§6 の会話履歴の圧縮層を組み立てる材料であり、画面を再読み込みしたときにカードと地図を復元するためにも要る。NFR-7 の削除では消えない。
+
+**user 行の `meta` は通常 `{}` だが、`ask_user` への回答行だけは質問とのペアを持つ**(2026-08-04、[ADR-0019](../adr/0019-react-main-agent-subagents.md) HITL): `{"answer_to": {"kind": "clarify", "reason": "...", "surface"|"slot": "..."}, "answered_by": "chip"|"free_text"}`。履歴(§6)の生層で「何を聞かれて何と答えたか」が読めるのはこのためである。
 
 ### 4.5 `itineraries` — 版と undo と制約
 
@@ -575,7 +583,7 @@ CREATE UNIQUE INDEX itineraries_one_current
       "note": null
     }]
   }],
-  "concessions": [                        // 守れなかった制約。型は agent_planning_phase.md §18.2 の Concession
+  "concessions": [                        // 守れなかった制約。型は agent_react_architecture.md §14 の Concession
     {"constraint_id": "c_014", "pred": "lunch_break", "args": {"from": 720, "to": 780, "min": 60},
      "violation": 45,                     // ペナルティレジストリが返した違反量
      "message_ja": "昼休憩を12時台に置けませんでした（移動が入るため13時台になっています）"}
@@ -593,7 +601,7 @@ CREATE UNIQUE INDEX itineraries_one_current
 
 #### 4.5.3 `constraints` — 版ごとにコピーし、id を維持する
 
-[agent_planning_phase.md §4.4](agent_planning_phase.md) の決定を受ける。
+[agent_react_architecture.md §5](agent_react_architecture.md) の決定(制約は旅程 version ごとにコピー・undo で一緒に戻る)を受ける。
 
 ```jsonc
 [{
@@ -607,21 +615,21 @@ CREATE UNIQUE INDEX itineraries_one_current
 }]
 ```
 
-**id を版コピー時に維持することが不可欠である。**維持しないと `understand` が出す `constraints_remove: ["c_014"]` が指す先を失い、**ユーザーが自分で制約を外せなくなる**。制約は永続化する以上、溜まって互いに矛盾するので、取り消せることが設計の一部になっている。
+**id を版コピー時に維持することが不可欠である。**維持しないとメインエージェントが出す制約の取り消し(`edit_itinerary.constraints` の remove 操作が `"c_014"` を指す)が指す先を失い、**ユーザーが自分で制約を外せなくなる**。制約は永続化する以上、溜まって互いに矛盾するので、取り消せることが設計の一部になっている。
 
 これが成り立つには 3 つが揃っている必要がある(どれか 1 つ欠けると、外せない制約が旅程に張り付く):
 
-1. `understand` のプロンプトに**現在有効な制約を id つきで載せる**
-2. `understand` が `constraints_remove: [id]` で取り消しを表現できる
+1. メインエージェントのコンテキストに**現在有効な制約を id つきで載せる**([agent_react_architecture.md §5](agent_react_architecture.md))
+2. メインエージェントが `edit_itinerary.constraints` の remove 操作で取り消しを表現できる
 3. `respond` が毎ターン「今回考慮した条件」を列挙する
 
 **`source_text` を持つのは 3 のためである。**「神社が続かないように」という条件を日本語で列挙できないと、ユーザーは何が効いているのか分からない。
 
-**保存しないもの**: `score_adjustments` と `selection_hints` は**そのターン限り**で、どこにも書かない。「静かな所がいい」はその場の注文であり、恒久的な選好なら `profile.interests` 側に写るべきである。両方に永続化すると二重に効く。
+**保存しないもの**: `score_adjustments`(と Tool 呼び出しの `notes` に載る選択ヒント)は**そのターン限り**で、どこにも書かない。「静かな所がいい」はその場の注文であり、恒久的な選好なら `profile.interests` 側に写るべきである。両方に永続化すると二重に効く。
 
 #### 4.5.4 旅程がまだ無い間の制約
 
-推薦は旅程を必要としない([agent_planning_phase.md §4.3](agent_planning_phase.md))ので、**旅程が生成される前に制約が出てくる**ことがある。
+推薦は旅程を必要としない(レコメンド SA に旅程の事前条件はない。[agent_react_architecture.md §4](agent_react_architecture.md))ので、**旅程が生成される前に制約が出てくる**ことがある。
 
 - `threads.pending_constraints` に同じ形で溜める
 - **`plan_itinerary` が初めて呼ばれたとき**、v1 の `constraints` に移し、`pending_constraints` を空にする
@@ -652,12 +660,12 @@ v1 ─ v2 ─ v3                    is_current = v3
 - **redo は副産物として得られる。**FR に redo はないが、この構造では `is_current` を進めるだけなので実質タダである
 - **保持上限は設けない**(全保持)。1 版が数 KB、1 ユーザーが数十版の規模でしかない
 
-**undo の入口は 2 つ**([agent_planning_phase.md §4.2](agent_planning_phase.md))。どちらも同じ「`is_current` を移す」処理に落ちる。
+**undo の入口は 2 つ**([agent_react_architecture.md §5](agent_react_architecture.md))。どちらも同じ「`is_current` を移す」処理に落ちる。
 
 | 入口 | 経路 | LLM |
 | --- | --- | --- |
 | 差分カードの [元に戻す] ボタン | 専用 REST(`40_api/chat_sse.md`) | **通さない** |
-| 自然言語「さっきのに戻して」 | `understand` → `edit_itinerary` の `revert` op | `understand` のみ |
+| 自然言語「さっきのに戻して」 | メインエージェント → `edit_itinerary` の `revert` op | メインの周回のみ |
 
 `revert` op が作る行は無い(`is_current` を移すだけ)。`origin='revert'` を使うのは、**`revert` の結果としてさらに編集が入った版**を後から見分けるためである。
 
@@ -680,7 +688,7 @@ CREATE TABLE app.profiles (
 
 **当初案(1 行 JSONB)から変更した。**固定スロット(`party` / `mobility` / `pace`)は**列にして CHECK を張る。**理由は §4.2 で会話状態を列に分けたのと同じで、**enum で強制している値を JSONB に隠すと、guided decoding の enum と DB の許容値がずれても気づけない**からである。動的なキーを持つ `interests` と `rejected_spots` だけ JSONB に残す。
 
-- **`NULL` は「まだ聞いていない」を意味する**(「該当なし」ではない)。ガードレール G4 の「主要スロットが全部空の初回だけ質問だけで返してよい」がこの NULL を見る
+- **`NULL` は「まだ聞いていない」を意味する**(「該当なし」ではない)。ガードレール A7(推薦要求に質問だけを返さない。[agent_react_architecture.md §10](agent_react_architecture.md))の判定がこの NULL を見る
 - **`profile_events`(履歴テーブル)は作らない。**NFR-7 の削除で「いつ何が入ったか」を残す理由がなくなった
 
 ### 4.7 その他のテーブル(**routes / pack_\* は 2026-08-01、Phase 2 で確定**)
@@ -767,7 +775,7 @@ CREATE TABLE app.realtime_simulator_state (
 
 ## 5. 1 ターンで何が書かれるか
 
-[agent_planning_phase.md §16.6](agent_planning_phase.md) の「persist は必ず走る」をデータ側から見た図。**1 ターン = 1 トランザクション**([22 §4-2](../22_current_issues.md) の解消)。
+[agent_react_architecture.md §13](agent_react_architecture.md) の「persist は必ず走る」をデータ側から見た図。**1 ターン = 1 トランザクション**([22 §4-2](../22_current_issues.md) の解消)。
 
 ```mermaid
 flowchart TB
@@ -776,16 +784,17 @@ flowchart TB
   T --> M2["messages<br/>assistant 発話（seq = n+1、status つき）"]
   T --> P["profiles<br/>profile_delta をマージ"]
   T --> I["itineraries<br/>版を追記 or is_current を移す"]
-  T --> TH["threads<br/>会話状態 8 個を更新"]
+  T --> TH["threads<br/>会話状態を更新"]
   L["構造化ログ（stdout）<br/>トランザクションの外"]
 ```
 
 | 状況 | 書かれるもの |
 | --- | --- |
 | 通常 | 上記すべて |
-| `understand` が致命失敗 | **user 発話のみ**(Tool が動いていない) |
-| Tool が途中で失敗 | **成功した手の結果は書く**(§1.4 の「そこまでの結果は捨てない」をデータ側でも守る) |
+| `update_profile` / メインの周回が致命失敗 | **user 発話 + そこまでに成功した手の結果**(Tool が動いていなければ user 発話のみ) |
+| Tool が途中で失敗 | **成功した手の結果は書く**(「そこまでの結果は捨てない」をデータ側でも守る) |
 | `respond` がタイムアウト | assistant 行を `status='partial'` または `'failed'` で書く。**旅程は保存されている** |
+| ターン内に `ask_user` があった | 上記すべて + **回答の user 行**(質問とペアであることを `meta` に記す。[ADR-0019](../adr/0019-react-main-agent-subagents.md) HITL) |
 
 **不変条件: ユーザーが `state` イベントで見たものは、必ず DB に保存されている。**
 
@@ -793,24 +802,20 @@ flowchart TB
 
 ## 6. 会話履歴をどう組み立てるか
 
-[agent_planning_phase.md §7.2](agent_planning_phase.md) の 3 層構成を、このスキーマの上でどう作るかを示す。**要約 LLM は呼ばない。**
+[agent_react_architecture.md §8](agent_react_architecture.md) の「**LLM 要約 + 直近 2 ターン生**」をこのスキーマの上でどう作るかを示す(**2026-08-04 改訂**。旧「3 層・要約 LLM なし」を置き換えた)。
 
 ```
-SELECT role, content, meta, seq FROM app.messages
- WHERE thread_id = :tid ORDER BY seq DESC LIMIT 40;
+会話履歴 =
+  ① threads.history_summary                       … summarized_until_message_id までの LLM 要約
+  ② 機械要約の列（あれば）                          … ①より後〜直近 2 ターンより前の未畳み込みターン
+  ③ 候補提示リストの機械要約（直近 3 リストまで）    … 序数照応の担保（下記）
+  ④ 直近 2 ターンの生テキスト                      … user も assistant も content そのまま
 ```
 
-を取ってきて、**新しい順に**次の規則で組み立てる。
-
-| 層 | 対象 | 出力 |
-| --- | --- | --- |
-| **生** | 直近 3 ターン | `content` をそのまま(user も assistant も) |
-| **圧縮** | それ以前の assistant | **`meta` から 1 行を組み立てる**(下記) |
-| **圧縮** | それ以前の user | `content` をそのまま |
-| 破棄 | 予算 4,000 トークン超過分 | 古い方から落とす |
+**要約の更新**は `persist` 内・`done` 送出後に行う: 生層(④)から押し出されたターンを既存要約に畳み込む LLM 1 回 + `history_summary` / `summarized_until_message_id` の小さな UPDATE(**本体トランザクションとは別**。失敗しても対話は止めない = NFR-5)。失敗すると `summarized_until_message_id` が進まないだけで、そのターンは②の機械要約として履歴に残り続ける。
 
 ```python
-# 圧縮層の assistant 行を meta から組み立てる（LLM を使わない）
+# 機械要約（②③・要約失敗時のフォールバック）を meta から組み立てる（LLM を使わない）
 def summarize(meta):
     if meta["mode"] == "recommend":
         names = " / ".join(p["name_ja"] for p in meta["presented"])
@@ -822,9 +827,11 @@ def summarize(meta):
     ...
 ```
 
-**`meta.presented` が順序つきである理由がここに出る。**`[推薦3件: 鶴間池 / 元滝伏流水 / 奈曽の白滝]` が履歴に残るので、**3 ターン前のリストを指す「あのとき 2 番目に出てたやつ」も解ける**。`last_candidates` は直近 1 回分しか持たないので、この遡りは履歴側の仕事である。
+**③を LLM 要約と別に残す理由 — 序数照応。**`[推薦3件: 鶴間池 / 元滝伏流水 / 奈曽の白滝]` の**順序つきリスト**は、LLM 要約に畳み込むと順序や取りこぼしのドリフトが静かに起きる。「あのとき 2 番目に出てたやつ」を解くための行なので、`meta.presented` から**機械的に**組み立てた行を要約とは独立に履歴へ挟む(`last_candidates` は直近 1 回分しか持たないため、過去への遡りは履歴側の仕事である)。
 
-**予算を超えて古いユーザー発話を落として安全なのは、その内容がすでに `profiles` と `itineraries.constraints` に書き出されているからである。**裏返すと、**`understand` の抽出が漏れていると、履歴を落とした瞬間に情報が消える。**
+予算は履歴全体で約 1,700 トークン([agent_react_architecture.md §3.1](agent_react_architecture.md))。超えたら②③の古い方から落とす(①は上限 ~600 で生成、④は削らない)。
+
+**古いターンを要約に畳んで安全なのは、確定した内容がすでに `profiles` と `itineraries.constraints` に書き出されているからである。**裏返すと、要約が「決まった事実」を落とすと情報が消える — だから要約への指示は**決まった事実(選んだ POI・確定した日程・約束・有効な条件)を落とさないことを最優先**にする([agent_react_architecture.md §8](agent_react_architecture.md))。
 
 ---
 
@@ -837,7 +844,7 @@ def summarize(meta):
 | 場所 | 守り方 |
 | --- | --- |
 | `travel_times` / `pack_assets` / `spot_realtime` | **外部キー**(列なので張れる) |
-| `itineraries.body` / `threads.*` / `messages.meta` / `profiles.liked_spots` | **書き込み時にコードが `spots` と照合する。**これが [agent_planning_phase.md §3.3](agent_planning_phase.md) のクローズドワールド設計そのもの |
+| `itineraries.body` / `threads.*` / `messages.meta` / `profiles.liked_spots` | **書き込み時にコードが `spots` と照合する。**これが [agent_react_architecture.md §10 C1](agent_react_architecture.md) のクローズドワールド設計そのもの |
 | シードデータ | `python -m app.cli validate-seeds` が全参照を検査 |
 
 **「外部キーが張れないから緩くする」ではなく、「張れないと分かっているから明示的に照合する」**という立場を取る。LLM が `spot_id` を生成する以上、どのみち照合は必要である。
@@ -893,7 +900,7 @@ python -m app.cli delete-user <user_name>    # users 行ごと消す（CASCADE �
 
 | 廃止 | 代わりに |
 | --- | --- |
-| `turn_metrics` テーブル | **構造化ログ(JSON, stdout)にターン 1 行**([agent_planning_phase.md §10](agent_planning_phase.md)) |
+| `turn_metrics` テーブル | **構造化ログ(JSON, stdout)にターン 1 行**([20_architecture.md §12](../20_architecture.md)) |
 | `unmodeled_log` テーブル | `unmodeled` はそのターンの `respond` が言及するだけ。保存しない |
 | `profile_events` テーブル | 作らない |
 | `export-metrics` CLI | 作らない |

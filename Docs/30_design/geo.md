@@ -87,7 +87,7 @@ flowchart LR
 
 | 出てくる場所 | 意味 |
 | --- | --- |
-| `ItineraryItem.leg_from_prev.mode`([§18.2](agent_planning_phase.md)) | **移動時間行列のどちらの行を使ったか**(`car` / `foot`) |
+| `ItineraryItem.leg_from_prev.mode`([agent_react_architecture.md §14](agent_react_architecture.md)) | **移動時間行列のどちらの行を使ったか**(`car` / `foot`) |
 | `routes.mode_summary`(§3.2) | **経路に実際に含まれるセグメントの構成**(`car` / `foot` / `car+foot`) |
 
 上の例は `leg_from_prev.mode = "car"` かつ `mode_summary = "car+foot"` である。**両者は別物**で、一致させようとしてはいけない。表示は後者を使う(「車で 28 分(駐車場から徒歩 10 分)」)。

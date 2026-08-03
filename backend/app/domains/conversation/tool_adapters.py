@@ -323,15 +323,30 @@ class ToolAdapters:
         step_id: int,
         args: AskUserArgs,
     ) -> ToolResult | ToolError:
-        payload = {
-            "slot": args.slot.value,
-            "reason": args.reason,
-            "options": args.options,
-        }
-        await emit(
-            self.event_sink,
-            state_event("ask_user", slot=args.slot.value, options=args.options),
-        )
+        payload = args.model_dump(mode="json", exclude_none=True)
+        if args.kind == "preference":
+            await emit(
+                self.event_sink,
+                state_event(
+                    "ask_user",
+                    slot=args.slot.value if args.slot is not None else None,
+                    reason=args.reason,
+                    options=[option.label for option in args.options],
+                ),
+            )
+        else:
+            await emit(
+                self.event_sink,
+                state_event(
+                    "clarify",
+                    surface=args.surface,
+                    reason=args.reason,
+                    options=[
+                        {"label": option.label, "value": option.value}
+                        for option in args.options
+                    ],
+                ),
+            )
         return ToolResult(
             step_id=step_id,
             tool=ToolName.ASK_USER,

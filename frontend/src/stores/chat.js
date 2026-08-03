@@ -40,6 +40,7 @@ function normalizePending(pending) {
     return {
       ...pending,
       kind,
+      reason: pending.reason,
       options: (pending.options || []).map((option) => ({
         label: option?.label || option?.value || String(option),
         value: option?.value || option?.resolves_to?.value || option?.label || String(option),
@@ -49,7 +50,12 @@ function normalizePending(pending) {
   return {
     ...pending,
     kind: 'ask_user',
-    options: (pending.options || []).map((option) => String(option)),
+    reason: pending.reason,
+    options: (pending.options || []).map((option) => (
+      typeof option === 'string'
+        ? option
+        : option?.label || option?.value || String(option)
+    )),
   }
 }
 
@@ -81,53 +87,12 @@ export const useChatStore = defineStore('chat', () => {
 
   let activeController = null
 
-  const promptStorageKey = () => `chat-prompt:${userStore.userName || 'anonymous'}`
-
-  const rememberPrompt = (prompt) => {
-    if (typeof sessionStorage === 'undefined') return
-    if (prompt) {
-      sessionStorage.setItem(promptStorageKey(), JSON.stringify(prompt))
-    } else {
-      sessionStorage.removeItem(promptStorageKey())
-    }
-  }
-
-  const storedPrompt = (restoredMessages) => {
-    if (typeof sessionStorage === 'undefined') return null
-    try {
-      const prompt = normalizePending(JSON.parse(sessionStorage.getItem(promptStorageKey()) || 'null'))
-      const lastAssistant = [...restoredMessages].reverse().find((message) => message.sender === 'ai')
-      if (
-        prompt?.kind === 'ask_user'
-        && lastAssistant?.meta?.ask_slot === prompt.slot
-      ) return prompt
-      if (
-        prompt?.kind === 'clarify'
-        && lastAssistant?.meta?.clarify_surface === prompt.surface
-      ) return prompt
-    } catch {
-      // 壊れた一時データは無視し、GET /thread の内容を優先する。
-    }
-    return null
-  }
-
   const clearPrompt = () => {
-    if (currentPrompt.value) {
-      const message = messages.value.find((value) => value.id === currentPrompt.value.messageId)
-      if (message) message.prompt = null
-    }
     currentPrompt.value = null
-    rememberPrompt(null)
   }
 
-  const setPrompt = (message, prompt) => {
-    clearPrompt()
-    const normalized = normalizePending(prompt)
-    message.prompt = normalized
-    currentPrompt.value = normalized
-      ? { messageId: message.id, prompt: normalized }
-      : null
-    rememberPrompt(normalized)
+  const setPrompt = (prompt) => {
+    currentPrompt.value = normalizePending(prompt)
   }
 
   const applyState = (state, message) => {
@@ -158,7 +123,7 @@ export const useChatStore = defineStore('chat', () => {
       }
       case 'ask_user':
       case 'clarify':
-        setPrompt(message, state)
+        setPrompt(state)
         break
       case 'profile':
         profile.value = state.profile
@@ -199,7 +164,7 @@ export const useChatStore = defineStore('chat', () => {
     const content = String(userInput || '').trim()
     if (!content || isLoading.value) return false
 
-    clearPrompt()
+    const promptAtSend = currentPrompt.value
     isLoading.value = true
     messages.value.push({
       id: clientId(),
@@ -219,7 +184,6 @@ export const useChatStore = defineStore('chat', () => {
       error: '',
       candidates: null,
       itinerary: null,
-      prompt: null,
       profile: null,
     }
     messages.value.push(aiMessageSeed)
@@ -279,6 +243,7 @@ export const useChatStore = defineStore('chat', () => {
       if (!receivedDone && !controller.signal.aborted) {
         throw new Error('応答ストリームが完了前に切断されました。')
       }
+      if (currentPrompt.value === promptAtSend) clearPrompt()
       return true
     } catch (error) {
       if (error?.name === 'AbortError') {
@@ -307,14 +272,11 @@ export const useChatStore = defineStore('chat', () => {
     activeController?.abort()
   }
 
-  async function selectPromptOption(messageId, option) {
+  async function selectPromptOption(option) {
     if (isLoading.value) return false
-    const message = messages.value.find((value) => value.id === messageId)
-    const prompt = message?.prompt
+    const prompt = currentPrompt.value
     if (!prompt) return false
 
-    message.prompt = null
-    currentPrompt.value = null
     const label = typeof option === 'string' ? option : option?.label
     if (!label) return false
     const resolves = prompt.kind === 'clarify'
@@ -378,7 +340,6 @@ export const useChatStore = defineStore('chat', () => {
         error: '',
         candidates: message.role === 'assistant' ? restoredCandidates(message.meta) : null,
         itinerary: null,
-        prompt: null,
         profile: null,
         meta: message.meta || {},
       }))
@@ -401,7 +362,6 @@ export const useChatStore = defineStore('chat', () => {
           notices: [],
           error: '',
           candidates: null,
-          prompt: null,
           profile: null,
         }
         if (!target) restored.push(itineraryMessage)
@@ -409,32 +369,13 @@ export const useChatStore = defineStore('chat', () => {
         await navStore.applyItineraryState(itinerary)
       }
 
-      const pending = normalizePending(session?.pending) || storedPrompt(restored)
-      if (pending) {
-        let target = [...restored].reverse().find((message) => message.sender === 'ai')
-        if (!target) {
-          target = {
-            id: clientId(),
-            content: '',
-            sender: 'ai',
-            timestamp: new Date(),
-            isPending: false,
-            statusText: '',
-            notices: [],
-            error: '',
-            candidates: null,
-            itinerary: null,
-            profile: null,
-          }
-          restored.push(target)
-        }
-        setPrompt(target, pending)
-      }
+      currentPrompt.value = normalizePending(session?.pending)
 
       messages.value = restored
     } catch (error) {
       console.error('[ChatStore] Failed to rehydrate session:', error)
       messages.value = []
+      currentPrompt.value = null
     } finally {
       isLoading.value = false
       isSessionLoaded.value = true

@@ -1,44 +1,75 @@
+# =============================================================================
+#  guidanceLLM2 — 統合開発環境
+# =============================================================================
+#  設定の置き場所（Docs/20_architecture.md §11）
+#    .env                     秘密・環境固有値のみ（API キー / パスワード / IP を含む URL）
+#    このファイル             接続先のトポロジ（どのコンテナがどこに居るか）
+#    app/core/config.py       それ以外の既定値。変えたい人だけ .env で上書きする
+#
+#  コードはイメージに焼かずマウントする。イメージが持つのは依存関係だけなので、
+#  backend / frontend のコードを直しても再ビルドは要らない（app は --reload で拾う）。
+#  再ビルドが要るのは pyproject.toml の依存を変えたときだけ。
+# =============================================================================
+
 services:
-  # === PostgreSQL 16 + PostGIS + pgvector（新構成） ===
+  # === PostgreSQL 16 + PostGIS + pgvector ===
+  #  Docs/50_operations/database.md。秘密は POSTGRES_PASSWORD だけなので
+  #  env_file は渡さない（Tavily キーなどを DB コンテナに持ち込まない）
   db:
     image: guidance-postgres:16-3.4-pgvector
     build:
       context: ./docker/postgres
-    env_file:
-      - .env
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      #  DB 名・ユーザー名はプロジェクトの定数として固定する。秘密でも環境依存でもなく、
+      #  pgdata の初期化時に焼き付くので後から変えても壊れるだけだから（.env で扱わない）
+      POSTGRES_DB: guidance
+      POSTGRES_USER: guidance
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD を .env に設定してください（.env.example 参照）}
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test:
+        - CMD-SHELL
+        - pg_isready -U guidance -d guidance
       interval: 5s
       timeout: 5s
       retries: 20
     restart: unless-stopped
 
-  # === FastAPI モジュラモノリス（新構成） ===
+  # === FastAPI モジュラモノリス ===
+  #  イメージは Python 依存のためだけにある。コードは ./backend のマウントが
+  #  イメージ内の同じパスを覆い、ホスト側の編集がそのまま動く
   app:
     build:
       context: .
       dockerfile: ./backend/Dockerfile.app
+    #  ホストの vLLM（127.0.0.1:8000）と、ホストへ公開した db / OSRM に届かせるため
     network_mode: host
     env_file:
       - .env
     environment:
+      # --- トポロジ: compose が決める値。.env には置かない ---
       POSTGRES_HOST: 127.0.0.1
       POSTGRES_PORT: 5432
+      #  db サービスと同じ固定値。古い .env が残っていてもここが必ず勝つ
+      POSTGRES_DB: guidance
+      POSTGRES_USER: guidance
       OSRM_CAR_URL: http://127.0.0.1:5001
       OSRM_FOOT_URL: http://127.0.0.1:5002
-      INFERENCE_SERVER: http://127.0.0.1:8000/v1
       PACKS_ROOT: /packs
+      # マウントしたコードを site-packages の同名パッケージより優先させる
+      PYTHONPATH: /app/backend
+      # --- 開発環境としての既定。必要な人だけ .env で上書きする ---
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:5173}
     volumes:
+      #  コード・マイグレーション・シード・知識データをまとめてマウントする
+      #  （backend/data/map も含むので BUILD を個別にマウントする必要はない）
+      - ./backend:/app/backend
       - packs_data:/packs
-      - ./backend/data/map/BUILD:/app/backend/data/map/BUILD:ro
     depends_on:
       db:
         condition: service_healthy
@@ -46,6 +77,7 @@ services:
         condition: service_healthy
       osrm-foot:
         condition: service_healthy
+    working_dir: /app/backend
     command:
       - uvicorn
       - app.main:app
@@ -56,6 +88,9 @@ services:
       - --log-config
       - logging.json
       - --no-access-log
+      - --reload
+      - --reload-dir
+      - /app/backend/app
     restart: unless-stopped
 
   # === OSRM (car / foot) ===
@@ -98,13 +133,15 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
-  
+
   # === Frontend (Vite dev server) ===
+  #  イメージは素の node。依存は named volume の node_modules に入れる
   frontend:
     image: node:20-alpine
     network_mode: host
     working_dir: /app/frontend
     environment:
+      #  未設定なら Vite の proxy 経由（/api/v1 → localhost:8090）になる
       VITE_API_BASE: ${VITE_API_BASE:-}
     volumes:
       - ./frontend:/app/frontend

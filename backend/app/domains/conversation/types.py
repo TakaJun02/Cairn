@@ -41,15 +41,9 @@ class Intent(StrEnum):
     UNCLEAR = "unclear"
 
 
-class UnderstandAction(StrEnum):
-    DONE = "done"
-    ASK_USER = "ask_user"
-
-
 class ResponseMode(StrEnum):
     EXPLANATION = "explanation"
     QUESTION = "question"
-    CLARIFICATION = "clarification"
     FAILURE = "failure"
 
 
@@ -170,22 +164,6 @@ class PlanStep(ConversationModel):
     args: dict[str, Any] = Field(default_factory=dict)
 
 
-class ClarificationResolution(ConversationModel):
-    kind: Literal["spot_id", "interpretation"]
-    value: str = Field(min_length=1)
-
-
-class ClarificationOption(ConversationModel):
-    label: str = Field(min_length=1)
-    resolves_to: ClarificationResolution
-
-
-class Clarification(ConversationModel):
-    surface: str = Field(min_length=1)
-    why: str = Field(min_length=1)
-    options: list[ClarificationOption] = Field(default_factory=list)
-
-
 class UnderstandOutput(ConversationModel):
     """N2 の guided JSON。宣言順は生成時の推論順そのものである。"""
 
@@ -196,21 +174,8 @@ class UnderstandOutput(ConversationModel):
     score_adjustments: list[ScoreAdjustment] = Field(default_factory=list)
     selection_hints: list[SelectionHint] = Field(default_factory=list)
     unmodeled: list[UnmodeledItem] = Field(default_factory=list)
-    action: UnderstandAction
     intent: Intent
     plan: list[PlanStep] = Field(default_factory=list)
-    clarify: Clarification | None = None
-
-    @model_validator(mode="after")
-    def validate_action_shape(self) -> UnderstandOutput:
-        if self.action is UnderstandAction.ASK_USER:
-            if self.plan:
-                raise ValueError("action=ask_user のとき plan は空にしてください")
-            if self.clarify is None:
-                raise ValueError("action=ask_user のとき clarify が必要です")
-        elif self.clarify is not None:
-            raise ValueError("action=done のとき clarify は null にしてください")
-        return self
 
 
 class RecommendArgs(ConversationModel):
@@ -235,11 +200,39 @@ class SearchKnowledgeArgs(ConversationModel):
     spot_id: str | None = None
 
 
+class AskUserOption(ConversationModel):
+    label: str = Field(min_length=1)
+    value: str = Field(min_length=1)
+
+
 class AskUserArgs(ConversationModel):
-    slot: Slot
-    reason: str = ""
+    kind: Literal["preference", "clarify"]
+    slot: Slot | None = None
+    surface: str | None = None
+    reason: str = Field(min_length=1)
     # 2〜4 件かどうかは Pydantic ではなく G5 として理由つきで判定する。
-    options: list[str] = Field(default_factory=list)
+    options: list[AskUserOption] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_kind_shape(self) -> AskUserArgs:
+        if self.kind == "preference":
+            if self.slot is None:
+                raise ValueError("kind=preference のとき slot が必要です")
+            if self.surface is not None:
+                raise ValueError("kind=preference のとき surface は指定できません")
+        else:
+            if self.surface is None or not self.surface.strip():
+                raise ValueError("kind=clarify のとき surface が必要です")
+            if self.slot is not None:
+                raise ValueError("kind=clarify のとき slot は指定できません")
+        return self
+
+
+class AskUserResult(ConversationModel):
+    answer: str = Field(min_length=1)
+    answered_by: Literal["chip", "free_text"]
+    slot: Slot | None = None
+    surface: str | None = None
 
 
 class ToolError(ConversationModel):

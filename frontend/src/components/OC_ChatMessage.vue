@@ -28,7 +28,7 @@
         <p class="tw-text-sm tw-text-gray-300">{{ statusText || pendingText }}</p>
       </div>
 
-      <div v-if="content || candidates || itinerary || prompt || profile">
+      <div v-if="content || candidates || itinerary || profile">
         <div class="tw-w-8 tw-h-8 tw-flex tw-items-center tw-justify-start tw-shrink-0">
           <img src="/app-icon.png" alt="App Icon" class="tw-w-6 tw-h-6 tw-rounded-full">
         </div>
@@ -113,20 +113,6 @@
           希望条件を更新しました<span v-if="profileSummary">: {{ profileSummary }}</span>
         </div>
 
-        <div v-if="prompt" class="tw-mt-4 tw-space-y-2">
-          <p class="tw-text-sm tw-text-slate-300">選択するか、下の入力欄から自由に回答できます。</p>
-          <div class="tw-flex tw-flex-wrap tw-gap-2">
-            <button
-              v-for="(option, index) in prompt.options || []"
-              :key="`${optionValue(option)}-${index}`"
-              type="button"
-              class="tw-rounded-full tw-border tw-border-blue-400/70 tw-bg-blue-500/10 tw-px-3 tw-py-1.5 tw-text-sm tw-text-blue-100 tw-transition-colors hover:tw-bg-blue-500/25 focus:tw-outline-none focus:tw-ring-2 focus:tw-ring-blue-400"
-              @click="emit('select-option', { messageId, option })"
-            >
-              {{ optionLabel(option) }}
-            </button>
-          </div>
-        </div>
       </div>
 
       <div v-if="notices?.length" class="tw-space-y-1">
@@ -159,7 +145,6 @@ const props = defineProps({
   statusText: { type: String, default: '' },
   candidates: { type: Object, default: null },
   itinerary: { type: Object, default: null },
-  prompt: { type: Object, default: null },
   profile: { type: Object, default: null },
   notices: { type: Array, default: () => [] },
   error: { type: String, default: '' },
@@ -167,7 +152,7 @@ const props = defineProps({
   isUndoing: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['select-option', 'undo'])
+const emit = defineEmits(['undo'])
 const userStore = useUserStore()
 const navStore = useNavStore()
 const gradientId = `spinner-gradient-${Math.random().toString(36).substring(2, 9)}`
@@ -219,9 +204,6 @@ const profileSummary = computed(() => {
   const values = [props.profile?.party, props.profile?.mobility, props.profile?.pace].filter(Boolean)
   return values.join(' / ')
 })
-
-const optionLabel = (option) => typeof option === 'string' ? option : option?.label
-const optionValue = (option) => typeof option === 'string' ? option : option?.value || option?.label
 
 const pendingText = computed(() => {
   const lang = userStore.user?.language || 'ja'

@@ -46,19 +46,47 @@ Frontend (Vue/Vite) ──> app (FastAPI :8090)
 
 ---
 
-## Local Development
+## Setup
 
-### Frontend
 ```bash
-cd frontend
-npm install
-npm run dev
+cp .env.example .env     # 秘密と環境固有値だけを埋める
+docker compose up -d
 ```
 
-### Backend (local run)
+DB の初期化（マイグレーション・シード・ジオ派生データ）は [`Docs/50_operations/database.md`](Docs/50_operations/database.md) §3 を参照してください。
+
+### 設定の置き場所
+
+設定は役割で 3 層に分かれています（[`Docs/20_architecture.md`](Docs/20_architecture.md) §11）。**`.env` に全部を並べません。**
+
+| 置き場所 | 何を書くか |
+| --- | --- |
+| `.env`（Git 追跡外） | **秘密**と**人によって値が変わるもの**だけ — パスワード、API キー、IP を含む URL、モデル名 |
+| `docker-compose.yml` の `environment:` | 接続先のトポロジ（`POSTGRES_HOST` / `OSRM_*_URL` / `PACKS_ROOT` など）とプロジェクトの定数（`POSTGRES_DB` / `POSTGRES_USER` = `guidance`）。compose の構成が決めるので人によらない |
+| `backend/app/core/config.py` の `Settings` | チューニング値の既定（`OSRM_*` / `GEO_*` / タイムアウト / 各種フラグ）。変えたい人だけ `.env` で上書きする |
+
+最低限必要なのは `POSTGRES_PASSWORD` と、vLLM を既定（`http://127.0.0.1:8000/v1`）以外で動かしている場合の `INFERENCE_SERVER` / `INFERENCE_MODEL` です。埋め込み・Web 検索・LoRaWAN は未設定でも起動し、その機能だけが縮退します。
+
+---
+
+## Local Development
+
+**コードはコンテナにマウントされます。** イメージが持つのは依存関係だけなので、`backend/` や `frontend/` を編集しても再ビルドは不要です（`app` は uvicorn の `--reload`、`frontend` は Vite の HMR が拾います）。
+
 ```bash
-cd backend
-uvicorn app.main:app --host 0.0.0.0 --port 8090
+docker compose up -d          # 編集はそのまま反映される
+docker compose build app      # 再ビルドが要るのは pyproject.toml を変えたときだけ
+docker compose logs -f app
+```
+
+コンテナを使わずに動かす場合:
+
+```bash
+# Frontend
+cd frontend && npm install && npm run dev
+
+# Backend
+cd backend && uvicorn app.main:app --host 0.0.0.0 --port 8090
 ```
 
 ---

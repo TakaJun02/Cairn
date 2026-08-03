@@ -13,15 +13,17 @@ from app.domains.conversation.events import EventSinkLike, emit, state_event
 from app.domains.conversation.guards import (
     normalize_revert_ops,
     parse_step_reference,
-    validate_preference_question,
+    validate_ask_user,
 )
 from app.domains.conversation.state import RejectedStep, TurnState
 from app.domains.conversation.types import (
     AskUserArgs,
     EditItineraryArgs,
+    Intent,
     PlanItineraryArgs,
     PlanStep,
     RecommendArgs,
+    ReferenceResolution,
     SearchKnowledgeArgs,
     ToolName,
 )
@@ -93,13 +95,21 @@ async def validate_plan(
     # §20.2 の事前条件（P5 より前）
     working = _apply_preconditions(state, working, rejected, now=now)
 
-    # P5 — ask_user は生き残った plan の末尾のみ
+    # P5 — ask_user は生き残った plan の末尾のみ・plan 全体で 1 手まで
     p5_working: list[PlanStep] = []
+    ask_seen = False
     for index, step in enumerate(working):
-        if step.tool == ToolName.ASK_USER.value and index != len(working) - 1:
-            _reject(rejected, step, "P5", "ask_user は plan の末尾にしか置けません")
-        else:
+        if step.tool != ToolName.ASK_USER.value:
             p5_working.append(step)
+            continue
+        if ask_seen:
+            _reject(rejected, step, "P5", "ask_user は plan 全体で 1 手までです")
+            continue
+        ask_seen = True
+        if index != len(working) - 1:
+            _reject(rejected, step, "P5", "ask_user は plan の末尾にしか置けません")
+            continue
+        p5_working.append(step)
     working = p5_working
 
     # P6 — 旅程書換えは 1 手
@@ -277,10 +287,20 @@ def _parse_args(step: PlanStep) -> dict[str, Any]:
         )
     if tool is ToolName.ASK_USER:
         parsed = AskUserArgs.model_validate(step.args)
+        options: list[dict[str, str]] = []
+        seen_values: set[str] = set()
+        for option in parsed.options:
+            value = option.value.strip()
+            if value in seen_values:
+                continue
+            seen_values.add(value)
+            options.append({"label": option.label.strip(), "value": value})
         return {
-            "slot": parsed.slot.value,
+            "kind": parsed.kind,
+            "slot": parsed.slot.value if parsed.slot is not None else None,
+            "surface": parsed.surface.strip() if parsed.surface is not None else None,
             "reason": parsed.reason.strip(),
-            "options": list(dict.fromkeys(value.strip() for value in parsed.options)),
+            "options": options,
         }
     raise ValueError(f"未対応の Tool です: {tool}")  # pragma: no cover
 
@@ -382,8 +402,8 @@ def _apply_preconditions(
     now: datetime | None,
 ) -> list[PlanStep]:
     result: list[PlanStep] = []
-    ask_count = sum(step.tool == ToolName.ASK_USER.value for step in steps)
     has_non_question = any(step.tool != ToolName.ASK_USER.value for step in steps)
+    ask_count = 0
     needs_confirmation: str | None = None
     for step in steps:
         tool = ToolName(step.tool)
@@ -441,8 +461,9 @@ def _apply_preconditions(
             state.assumptions.extend(assumptions)
             needs_confirmation = confirmation_slot or needs_confirmation
         if tool is ToolName.ASK_USER:
+            ask_count += 1
             question = AskUserArgs.model_validate(step.args)
-            decision = validate_preference_question(
+            decision = validate_ask_user(
                 question,
                 asked_slots=state.asked_slots,
                 ask_streak=state.ask_streak,
@@ -450,6 +471,10 @@ def _apply_preconditions(
                 profile=state.profile,
                 has_non_question_step=has_non_question,
                 question_count=ask_count,
+                allowed_spot_ids=set(state.spot_id_vocab),
+                existing_spot_ids=set(state.spot_catalog),
+                resolved_ambiguities=state.resolved_ambiguities,
+                has_viable_plan=_has_viable_plan(state, steps, question),
             )
             if not decision.accepted:
                 if decision.rule == "G4":
@@ -470,6 +495,8 @@ def _apply_preconditions(
                         decision.rule or "precondition",
                         decision.reason or "ask_user の事前条件を満たしません",
                     )
+                    if decision.rule == "G3":
+                        _record_first_option_assumption(state, question)
                     continue
         result.append(step)
 
@@ -480,18 +507,25 @@ def _apply_preconditions(
             id=_next_step_id([*steps, *result]),
             tool=ToolName.ASK_USER.value,
             args={
+                "kind": "preference",
                 "slot": needs_confirmation,
                 "reason": "仮定した旅程条件の確認",
-                "options": ["この条件で進める", "条件を変更する"],
+                "options": [
+                    {"label": "この条件で進める", "value": "accept_assumptions"},
+                    {"label": "条件を変更する", "value": "change_conditions"},
+                ],
             },
         )
-        decision = validate_preference_question(
+        decision = validate_ask_user(
             AskUserArgs.model_validate(confirmation.args),
             asked_slots=state.asked_slots,
             ask_streak=state.ask_streak,
             intent=state.intent,
             profile=state.profile,
             has_non_question_step=True,
+            allowed_spot_ids=set(state.spot_id_vocab),
+            existing_spot_ids=set(state.spot_catalog),
+            resolved_ambiguities=state.resolved_ambiguities,
         )
         if decision.accepted:
             result.append(confirmation)
@@ -503,6 +537,42 @@ def _apply_preconditions(
                 decision.reason or "確認質問を追加できませんでした",
             )
     return result
+
+
+def _has_viable_plan(
+    state: TurnState,
+    steps: list[PlanStep],
+    question: AskUserArgs,
+) -> bool:
+    non_questions = [step for step in steps if step.tool != ToolName.ASK_USER.value]
+    if question.kind == "clarify":
+        return bool(non_questions) or state.intent not in {None, Intent.UNCLEAR}
+    return bool(non_questions) and state.intent in {
+        Intent.QA,
+        Intent.PROFILE_ONLY,
+        Intent.CHITCHAT,
+    }
+
+
+def _record_first_option_assumption(
+    state: TurnState,
+    question: AskUserArgs,
+) -> None:
+    if not question.options:
+        return
+    first = question.options[0]
+    subject = question.surface if question.kind == "clarify" else question.slot
+    subject_text = subject.value if hasattr(subject, "value") else str(subject or "質問")
+    state.assumptions.append(f"「{subject_text}」は {first.label} と仮定しました")
+    if (
+        question.kind == "clarify"
+        and question.surface is not None
+        and first.value in state.spot_catalog
+        and first.value in state.spot_id_vocab
+    ):
+        state.references.append(
+            ReferenceResolution(surface=question.surface, spot_id=first.value)
+        )
 
 
 def _fill_plan_defaults(

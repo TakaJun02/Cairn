@@ -8,7 +8,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.domains.conversation.types import (
-    Clarification,
     ConstraintDraft,
     Intent,
     PlanStep,
@@ -17,7 +16,6 @@ from app.domains.conversation.types import (
     ScoreAdjustment,
     SelectionHint,
     ToolResult,
-    UnderstandAction,
     UnmodeledItem,
 )
 from app.domains.itinerary.types import Itinerary
@@ -93,11 +91,6 @@ class DegradedState(StateModel):
     message: str
 
 
-class ExplicitResolution(StateModel):
-    surface: str
-    value: str
-
-
 class ContextSnapshot(StateModel):
     thread_id: int
     profile: ProfileState
@@ -107,12 +100,12 @@ class ContextSnapshot(StateModel):
     presented_spot_ids: list[str]
     asked_slots: list[str]
     ask_streak: int
-    pending_clarification: dict[str, Any] | None
+    pending_ask: dict[str, Any] | None
     resolved_ambiguities: list[Any]
-    clarify_streak: int
     pending_constraints: list[dict[str, Any]]
     realtime: dict[str, dict[str, int | None]]
     spots: dict[str, SpotFact]
+    tag_vocabulary: list[str] = Field(default_factory=list)
 
 
 class TurnState(StateModel):
@@ -131,19 +124,17 @@ class TurnState(StateModel):
     presented_spot_ids: list[str] = Field(default_factory=list)
     asked_slots: list[str] = Field(default_factory=list)
     ask_streak: int = 0
-    pending_clarification: dict[str, Any] | None = None
     resolved_ambiguities: list[Any] = Field(default_factory=list)
-    clarify_streak: int = 0
     pending_constraints: list[dict[str, Any]] = Field(default_factory=list)
     realtime: dict[str, dict[str, int | None]] = Field(default_factory=dict)
     spot_id_vocab: list[str] = Field(default_factory=list)
     spot_names: dict[str, str] = Field(default_factory=dict)
     spot_catalog: dict[str, SpotFact] = Field(default_factory=dict)
+    tag_vocabulary: list[str] = Field(default_factory=list)
     default_origin_spot_id: str | None = None
-    explicit_resolution: ExplicitResolution | None = None
+    tool_results: list[dict[str, Any]] = Field(default_factory=list)
 
     # N2 understand
-    understand_action: UnderstandAction | None = None
     intent: Intent | None = None
     plan: list[PlanStep] = Field(default_factory=list)
     profile_delta: ProfileDelta | None = None
@@ -153,7 +144,6 @@ class TurnState(StateModel):
     selection_hints: list[SelectionHint] = Field(default_factory=list)
     unmodeled: list[UnmodeledItem] = Field(default_factory=list)
     references: list[ReferenceResolution] = Field(default_factory=list)
-    clarification: Clarification | None = None
     understand_attempts: int = 0
     understand_failed: bool = False
     understand_failures: list[str] = Field(default_factory=list)
@@ -169,7 +159,7 @@ class TurnState(StateModel):
     skipped_steps: list[SkippedStep] = Field(default_factory=list)
     aborted_at: int | None = None
     should_end_turn: bool = False
-    ask_user_payload: dict[str, Any] | None = None
+    pending_ask: dict[str, Any] | None = None
     degraded: list[DegradedState] = Field(default_factory=list)
 
     # N5 respond

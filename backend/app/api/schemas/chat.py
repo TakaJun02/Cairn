@@ -88,6 +88,7 @@ class AskUserState(ApiModel):
         "dates",
         "origin",
     ]
+    reason: str = Field(min_length=1)
     options: list[str] = Field(min_length=2, max_length=4)
 
 
@@ -99,6 +100,7 @@ class ClarificationOption(ApiModel):
 class ClarifyState(ApiModel):
     kind: Literal["clarify"]
     surface: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
     options: list[ClarificationOption] = Field(min_length=1)
 
 

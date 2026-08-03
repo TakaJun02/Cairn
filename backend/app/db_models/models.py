@@ -246,12 +246,9 @@ class Thread(Base):
         ARRAY(Text), nullable=False, server_default=_EMPTY_TEXT_ARRAY
     )
     ask_streak: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("0"))
-    pending_clarification: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    pending_ask: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     resolved_ambiguities: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=_EMPTY_LIST
-    )
-    clarify_streak: Mapped[int] = mapped_column(
-        SmallInteger, nullable=False, server_default=text("0")
     )
     pending_constraints: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=_EMPTY_LIST

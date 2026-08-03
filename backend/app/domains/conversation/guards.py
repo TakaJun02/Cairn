@@ -10,7 +10,6 @@ from typing import Any
 from app.domains.conversation.state import ProfileState, SpotFact
 from app.domains.conversation.types import (
     AskUserArgs,
-    Clarification,
     ConstraintDraft,
     Intent,
     ReferenceResolution,
@@ -139,7 +138,7 @@ def validate_reference_closed_world(
     return GuardResult(True)
 
 
-def validate_preference_question(
+def validate_ask_user(
     question: AskUserArgs,
     *,
     asked_slots: Sequence[str],
@@ -148,22 +147,36 @@ def validate_preference_question(
     profile: ProfileState,
     has_non_question_step: bool,
     question_count: int = 1,
+    allowed_spot_ids: set[str] | None = None,
+    existing_spot_ids: set[str] | None = None,
+    resolved_ambiguities: Sequence[Any] = (),
+    has_viable_plan: bool = False,
 ) -> GuardResult:
-    """ADR-0007 G1〜G5 を順に適用する。"""
+    """ADR-0018 の統合済み G1〜G7・G9 を順に適用する。"""
 
     if question_count > 1:
-        return GuardResult(False, "G1", "1 ターンに聞ける選好質問は 1 問です")
-    if question.slot.value in asked_slots:
-        return GuardResult(False, "G2", f"slot={question.slot.value} は質問済みです")
+        return GuardResult(False, "G1", "1 ターンに聞ける質問は 1 問です")
+    if (
+        question.kind == "preference"
+        and question.slot is not None
+        and question.slot.value in asked_slots
+    ):
+        return GuardResult(
+            False,
+            "G2",
+            f"slot={question.slot.value} は質問済みです",
+        )
     if ask_streak >= 2:
-        return GuardResult(False, "G3", "選好質問が 2 ターン連続しています")
+        return GuardResult(False, "G3", "ask_user が 2 ターン連続しています")
     major_slots_empty = (
         profile.party is None
         and profile.mobility is None
         and not profile.interests
     )
     if (
-        intent is Intent.RECOMMEND
+        question.kind == "preference"
+        and question.slot is not None
+        and intent is Intent.RECOMMEND
         and not has_non_question_step
         and not (major_slots_empty and question.slot.value == "onboarding")
     ):
@@ -174,53 +187,32 @@ def validate_preference_question(
         )
     if not 2 <= len(question.options) <= 4:
         return GuardResult(False, "G5", "選択肢は 2〜4 個にしてください")
-    if any(not value.strip() for value in question.options):
+    if any(
+        not option.label.strip() or not option.value.strip()
+        for option in question.options
+    ):
         return GuardResult(False, "G5", "空の選択肢は使えません")
-    return GuardResult(True)
-
-
-def validate_clarification(
-    clarification: Clarification,
-    *,
-    allowed_spot_ids: set[str],
-    existing_spot_ids: set[str],
-    resolved_ambiguities: Sequence[Any],
-    clarify_streak: int,
-    has_viable_plan: bool,
-) -> GuardResult:
-    """ADR-0010 G6〜G9。G1〜G5 は意図的に適用しない。"""
-
-    if not 2 <= len(clarification.options) <= 4:
-        return GuardResult(False, "G6", "具体的な選択肢が 2〜4 個ありません")
-    for option in clarification.options:
-        resolution = option.resolves_to
-        if resolution.kind == "spot_id":
-            if (
-                resolution.value not in existing_spot_ids
-                or resolution.value not in allowed_spot_ids
-            ):
+    if question.kind == "clarify":
+        allowed = allowed_spot_ids or set()
+        existing = existing_spot_ids or set()
+        for option in question.options:
+            if option.value in _ALLOWED_INTERPRETATIONS:
+                continue
+            if option.value not in existing or option.value not in allowed:
                 return GuardResult(
                     False,
                     "G6",
                     (
-                        "選択肢が参照可能な spot_id に解決しません: "
-                        f"{resolution.value}"
+                        "選択肢が参照可能な spot_id または既定の解釈に"
+                        f"解決しません: {option.value}"
                     ),
                 )
-        elif resolution.value not in _ALLOWED_INTERPRETATIONS:
-            return GuardResult(
-                False,
-                "G6",
-                f"未定義の解釈です: {resolution.value}",
-            )
-    normalized_surface = _normalize_surface(clarification.surface)
-    if normalized_surface in {
-        _normalize_surface(surface)
-        for surface in _resolved_surfaces(resolved_ambiguities)
-    }:
-        return GuardResult(False, "G7", "同じ曖昧さは既に聞き返しています")
-    if clarify_streak >= 1:
-        return GuardResult(False, "G8", "聞き返しは 1 ターンまでです")
+        normalized_surface = _normalize_surface(question.surface or "")
+        if normalized_surface in {
+            _normalize_surface(surface)
+            for surface in _resolved_surfaces(resolved_ambiguities)
+        }:
+            return GuardResult(False, "G7", "同じ曖昧さは既に聞き返しています")
     if has_viable_plan:
         return GuardResult(False, "G9", "妥当な plan を出せるため聞き返しません")
     return GuardResult(True)

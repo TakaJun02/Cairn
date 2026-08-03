@@ -29,5 +29,8 @@ plugins/lorart/dist/
 .vscode/
 *.iml
 
+# ブラウザ操作ツール（Playwright MCP）が吐くログ・スナップショット
+.playwright-mcp/
+
 OC_guidanceLLM/
 .codex

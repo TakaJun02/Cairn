@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ from app.domains.conversation.executor import act
 from app.domains.conversation.pipeline import ConversationPipeline
 from app.domains.conversation.respond import response_mode
 from app.domains.conversation.state import (
+    CandidateReference,
     ContextSnapshot,
     ProfileState,
     SkippedStep,
@@ -40,10 +42,8 @@ def _understand_output(plan: list[dict[str, Any]]) -> str:
             "score_adjustments": [],
             "selection_hints": [],
             "unmodeled": [],
-            "action": "done",
             "intent": "recommend",
             "plan": plan,
-            "clarify": None,
         },
         ensure_ascii=False,
     )
@@ -94,9 +94,8 @@ class MemoryConversationRepository:
             presented_spot_ids=[],
             asked_slots=[],
             ask_streak=0,
-            pending_clarification=None,
+            pending_ask=None,
             resolved_ambiguities=[],
-            clarify_streak=0,
             pending_constraints=[],
             realtime={},
             spots={spot.spot_id: spot},
@@ -109,6 +108,10 @@ class MemoryConversationRepository:
 
     async def persist_turn(self, state: TurnState) -> int:
         self.persisted.append(state.model_copy(deep=True))
+        self.snapshot.pending_ask = deepcopy(state.pending_ask)
+        self.snapshot.ask_streak = (
+            state.ask_streak + 1 if state.pending_ask is not None else 0
+        )
         return 88
 
 
@@ -186,9 +189,38 @@ class FakeTools:
         )
 
     async def ask_user(self, *, step_id: int, **kwargs: Any):
-        del kwargs
         self.called.append(step_id)
-        return self.scripted[step_id]
+        if step_id in self.scripted:
+            return self.scripted[step_id]
+        args = kwargs["args"]
+        payload = args.model_dump(mode="json", exclude_none=True)
+        if self.sink is not None:
+            if args.kind == "preference":
+                await emit(
+                    self.sink,
+                    state_event(
+                        "ask_user",
+                        slot=args.slot.value,
+                        options=[option.label for option in args.options],
+                    ),
+                )
+            else:
+                await emit(
+                    self.sink,
+                    state_event(
+                        "clarify",
+                        surface=args.surface,
+                        options=[
+                            {"label": option.label, "value": option.value}
+                            for option in args.options
+                        ],
+                    ),
+                )
+        return ToolResult(
+            step_id=step_id,
+            tool=ToolName.ASK_USER,
+            data=payload,
+        )
 
 
 def _state(steps: list[PlanStep]) -> TurnState:
@@ -332,6 +364,84 @@ async def test_pipeline_event_order_and_persist() -> None:
     ]
     assert sink.events[3].data["kind"] == "profile"
     assert sink.events[-1].data["message_id"] == 88
+
+
+async def test_ask_user_suspends_resumes_and_pending_expires_after_one_turn() -> None:
+    sink = MemoryEventSink()
+    repository = MemoryConversationRepository()
+    repository.snapshot.last_candidates = [
+        CandidateReference(spot_id="spot_001", name_ja="鶴間池", rank=1)
+    ]
+    ask_output = json.loads(
+        _understand_output(
+            [
+                {
+                    "id": 1,
+                    "tool": "ask_user",
+                    "args": {
+                        "kind": "clarify",
+                        "surface": "2番目",
+                        "reason": "候補が複数あります",
+                        "options": [
+                            {"label": "鶴間池", "value": "spot_001"},
+                            {
+                                "label": "直近候補全体",
+                                "value": "last_candidates",
+                            },
+                        ],
+                    },
+                }
+            ]
+        )
+    )
+    ask_output["intent"] = "unclear"
+
+    first = await ConversationPipeline(
+        repository,
+        event_sink=sink,
+        llm_client=TurnClient(
+            [json.dumps(ask_output, ensure_ascii=False)],
+            response_chunks=["「2番目」はどちらでしょうか。"],
+        ),
+        tools=FakeTools(sink=sink),
+    ).run(user_id=1, utterance="2番目を外して")
+
+    assert first.should_end_turn is True
+    assert first.pending_ask == {
+        "kind": "clarify",
+        "surface": "2番目",
+        "reason": "候補が複数あります",
+        "options": [
+            {"label": "鶴間池", "value": "spot_001"},
+            {"label": "直近候補全体", "value": "last_candidates"},
+        ],
+    }
+    assert repository.snapshot.pending_ask == first.pending_ask
+    assert [event.data.get("kind") for event in sink.events if event.event == "state"] == [
+        "plan",
+        "clarify",
+    ]
+
+    second = await ConversationPipeline(
+        repository,
+        llm_client=TurnClient(
+            [_understand_output([])],
+            response_chunks=["鶴間池として承りました。"],
+        ),
+        tools=FakeTools(),
+    ).run(
+        user_id=1,
+        utterance="鶴間池",
+        resolves={"surface": "2番目", "value": "spot_001"},
+    )
+
+    assert second.tool_results[0]["output"] == {
+        "answer": "spot_001",
+        "answered_by": "chip",
+        "surface": "2番目",
+    }
+    assert second.log_fields["resumed_from_ask"] is True
+    assert repository.snapshot.pending_ask is None
 
 
 async def test_respond_failure_still_persists_failed_assistant_and_done() -> None:

@@ -9,7 +9,15 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db_models import Itinerary as ItineraryRow
-from app.db_models import Message, Profile, Spot, SpotRealtime, Thread, User
+from app.db_models import (
+    Message,
+    Profile,
+    Spot,
+    SpotRealtime,
+    TagVocabulary,
+    Thread,
+    User,
+)
 from app.domains.conversation.state import (
     CandidateReference,
     ContextSnapshot,
@@ -61,6 +69,13 @@ class ConversationRepository:
                 .order_by(Spot.spot_id)
             )
         ).all()
+        tag_vocabulary = list(
+            (
+                await self.session.scalars(
+                    select(TagVocabulary.tag).order_by(TagVocabulary.tag)
+                )
+            ).all()
+        )
         spots = {
             spot.spot_id: SpotFact(
                 spot_id=spot.spot_id,
@@ -89,13 +104,12 @@ class ConversationRepository:
             presented_spot_ids=list(thread.presented_spot_ids),
             asked_slots=list(thread.asked_slots),
             ask_streak=int(thread.ask_streak),
-            pending_clarification=(
-                deepcopy(dict(thread.pending_clarification))
-                if thread.pending_clarification
+            pending_ask=(
+                deepcopy(dict(thread.pending_ask))
+                if thread.pending_ask
                 else None
             ),
             resolved_ambiguities=deepcopy(list(thread.resolved_ambiguities)),
-            clarify_streak=int(thread.clarify_streak),
             pending_constraints=deepcopy(list(thread.pending_constraints)),
             realtime={
                 spot.spot_id: {
@@ -105,6 +119,7 @@ class ConversationRepository:
                 for spot, value in spot_rows
             },
             spots=spots,
+            tag_vocabulary=tag_vocabulary,
         )
 
     async def persist_turn(self, state: TurnState) -> int | None:
@@ -154,7 +169,7 @@ class ConversationRepository:
                 self.session.add(assistant_message)
                 await self.session.flush()
 
-            self._persist_thread(thread, state)
+            self._persist_thread(thread, state, asked_at_message_id=user_message.id)
             _persist_profile(profile, state.profile)
             # 旅程 Tool は同じ session に新しい版を flush 済み。
             # 発話 ID をここで結ぶ。
@@ -176,42 +191,38 @@ class ConversationRepository:
             await self.session.rollback()
             raise
 
-    def _persist_thread(self, thread: Thread, state: TurnState) -> None:
+    def _persist_thread(
+        self,
+        thread: Thread,
+        state: TurnState,
+        *,
+        asked_at_message_id: int | None = None,
+    ) -> None:
         thread.presented_spot_ids = list(dict.fromkeys(state.presented_spot_ids))
         thread.last_candidates = [
             value.model_dump(mode="json") for value in state.last_candidates
         ]
-        if state.should_end_turn and state.ask_user_payload is not None:
-            slot = str(state.ask_user_payload["slot"])
-            thread.asked_slots = list(dict.fromkeys([*state.asked_slots, slot]))
+        if state.should_end_turn and state.pending_ask is not None:
+            slot = state.pending_ask.get("slot")
+            if state.pending_ask.get("kind") == "preference" and isinstance(slot, str):
+                thread.asked_slots = list(dict.fromkeys([*state.asked_slots, slot]))
+            else:
+                thread.asked_slots = list(state.asked_slots)
             thread.ask_streak = state.ask_streak + 1
         else:
             thread.asked_slots = list(state.asked_slots)
             thread.ask_streak = 0
 
-        previous_pending = state.pending_clarification
-        if state.clarification is not None:
-            thread.pending_clarification = {
-                "surface": state.clarification.surface,
-                "why": state.clarification.why,
-                "options": [
-                    option.model_dump(mode="json")
-                    for option in state.clarification.options
-                ],
-                "utterance": state.utterance,
+        if state.pending_ask is not None:
+            thread.pending_ask = {
+                **deepcopy(state.pending_ask),
+                "original_utterance": state.utterance,
+                "asked_at_message_id": asked_at_message_id,
             }
-            thread.clarify_streak = state.clarify_streak + 1
         else:
             # 前ターンの pending は、別の話題が来た場合もここで必ず消す。
-            thread.pending_clarification = None
-            thread.clarify_streak = 0
-            if previous_pending and _pending_was_resolved(state, previous_pending):
-                surface = previous_pending.get("surface")
-                if isinstance(surface, str) and surface:
-                    thread.resolved_ambiguities = [
-                        *list(thread.resolved_ambiguities),
-                        {"surface": surface},
-                    ]
+            thread.pending_ask = None
+        _record_resolved_asks(thread, state)
 
         initial_version = state.log_fields.get("initial_itinerary_version", 0)
         successful_plan = any(
@@ -305,10 +316,16 @@ def _assistant_meta(state: TurnState) -> dict[str, Any]:
         "qa_spot_id": qa_spot_id,
         "qa_spot_name": state.spot_names.get(qa_spot_id or "") if qa_spot_id else None,
         "ask_slot": (
-            state.ask_user_payload.get("slot") if state.ask_user_payload else None
+            state.pending_ask.get("slot")
+            if state.pending_ask is not None
+            and state.pending_ask.get("kind") == "preference"
+            else None
         ),
         "clarify_surface": (
-            state.clarification.surface if state.clarification is not None else None
+            state.pending_ask.get("surface")
+            if state.pending_ask is not None
+            and state.pending_ask.get("kind") == "clarify"
+            else None
         ),
     }
 
@@ -334,13 +351,31 @@ def _qa_spot_id(state: TurnState) -> str | None:
     return None
 
 
-def _pending_was_resolved(state: TurnState, pending: dict[str, Any]) -> bool:
-    surface = pending.get("surface")
-    if not isinstance(surface, str):
-        return False
-    if state.explicit_resolution is not None:
-        return state.explicit_resolution.surface == surface
-    return any(reference.surface == surface for reference in state.references)
+def _record_resolved_asks(thread: Thread, state: TurnState) -> None:
+    existing = deepcopy(list(thread.resolved_ambiguities))
+    known_surfaces = {
+        str(value.get("surface"))
+        for value in existing
+        if isinstance(value, dict) and isinstance(value.get("surface"), str)
+    }
+    for result in state.tool_results:
+        tool_input = result.get("input")
+        output = result.get("output")
+        if not isinstance(tool_input, dict) or not isinstance(output, dict):
+            continue
+        surface = tool_input.get("surface")
+        answer = output.get("answer")
+        if (
+            tool_input.get("kind") != "clarify"
+            or not isinstance(surface, str)
+            or not surface
+            or not isinstance(answer, str)
+            or surface in known_surfaces
+        ):
+            continue
+        existing.append({"surface": surface, "resolved_to": answer})
+        known_surfaces.add(surface)
+    thread.resolved_ambiguities = existing
 
 
 def _deduplicate_constraints(values: list[dict[str, Any]]) -> list[dict[str, Any]]:

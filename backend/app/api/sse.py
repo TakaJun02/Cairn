@@ -100,6 +100,7 @@ class ChatEventBuffer:
             "candidates",
             "itinerary",
             "ask_user",
+            "clarify",
             "searching",
         }:
             self.tool_phase_started.set()

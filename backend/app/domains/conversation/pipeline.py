@@ -24,7 +24,6 @@ from app.domains.conversation.planner import validate_plan
 from app.domains.conversation.respond import RespondGenerationError, respond
 from app.domains.conversation.state import TurnState
 from app.domains.conversation.tool_ports import ConversationToolPort
-from app.domains.conversation.types import UnderstandAction
 from app.domains.conversation.understand import (
     GenerationPort,
     UnderstandFatalError,
@@ -94,13 +93,6 @@ class ConversationPipeline:
                 ),
             )
             await self._persist_or_finish(state)
-            self._log_turn(state)
-            return state
-
-        if state.understand_action is UnderstandAction.ASK_USER:
-            # E6: validate_plan / act を飛ばす。
-            await apply_profile_update(state, event_sink=self.event_sink)
-            await self._respond_then_persist(state)
             self._log_turn(state)
             return state
 
@@ -204,11 +196,8 @@ class ConversationPipeline:
                 **state.log_fields,
                 "turn_id": state.turn_id,
                 "intent": state.intent.value if state.intent is not None else None,
-                "understand_action": (
-                    state.understand_action.value
-                    if state.understand_action is not None
-                    else None
-                ),
+                "asked": state.log_fields.get("asked"),
+                "resumed_from_ask": state.log_fields.get("resumed_from_ask", False),
                 "executed_tools": [
                     value.tool.value for value in state.step_results.values()
                 ],

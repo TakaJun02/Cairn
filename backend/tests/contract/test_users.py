@@ -8,6 +8,7 @@ from app.api.auth import get_user_repository
 from app.api.routers.spots import get_catalog_repository
 from app.domains.catalog import SpotsSnapshot
 from app.domains.users import MessageData, ProfileData, ThreadData, UserData
+from app.domains.users.repo import _public_pending
 from app.main import create_app
 
 
@@ -100,6 +101,83 @@ class CommitGatedMemoryUserRepository(MemoryUserRepository):
 class EmptyCatalogRepository:
     async def list_spots(self) -> SpotsSnapshot:
         return SpotsSnapshot(spots=[], latest_updated_at=None)
+
+
+def test_pending_ask_is_restored_with_reason_and_unchanged_public_shapes() -> None:
+    preference = _public_pending(
+        {
+            "kind": "preference",
+            "slot": "origin",
+            "reason": "仮定した旅程条件の確認",
+            "options": [
+                {"label": "この条件で進める", "value": "accept_assumptions"},
+                {"label": "条件を変更する", "value": "change_conditions"},
+            ],
+        }
+    )
+    clarify = _public_pending(
+        {
+            "kind": "clarify",
+            "surface": "2番目",
+            "reason": "候補が複数あります",
+            "options": [
+                {"label": "鶴間池", "value": "spot_001"},
+                {"label": "元滝伏流水", "value": "spot_002"},
+            ],
+        }
+    )
+
+    assert preference == {
+        "kind": "ask_user",
+        "slot": "origin",
+        "reason": "仮定した旅程条件の確認",
+        "options": ["この条件で進める", "条件を変更する"],
+    }
+    assert clarify == {
+        "kind": "clarify",
+        "surface": "2番目",
+        "reason": "候補が複数あります",
+        "options": [
+            {"label": "鶴間池", "value": "spot_001"},
+            {"label": "元滝伏流水", "value": "spot_002"},
+        ],
+    }
+
+
+async def test_thread_response_includes_pending_reason() -> None:
+    repository = MemoryUserRepository()
+    app = create_app()
+    app.dependency_overrides[get_user_repository] = lambda: repository
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        login = await client.post("/api/v1/login", json={"user_name": "pending-user"})
+        identity = login.json()
+        profile = repository.profiles[identity["user_id"]]
+        repository.threads[identity["user_id"]] = ThreadData(
+            messages=[],
+            itinerary=None,
+            profile=profile,
+            pending={
+                "kind": "ask_user",
+                "slot": "origin",
+                "reason": "仮定した旅程条件の確認",
+                "options": ["この条件で進める", "条件を変更する"],
+            },
+        )
+        thread = await client.get(
+            "/api/v1/thread",
+            headers={"Authorization": f"Bearer {identity['token']}"},
+        )
+
+    assert thread.status_code == 200
+    assert thread.json()["pending"] == {
+        "kind": "ask_user",
+        "slot": "origin",
+        "reason": "仮定した旅程条件の確認",
+        "options": ["この条件で進める", "条件を変更する"],
+    }
 
 
 async def test_login_commits_token_before_immediate_authenticated_request() -> None:

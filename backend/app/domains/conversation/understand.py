@@ -12,10 +12,9 @@ from typing import Any, Protocol
 from pydantic import ValidationError
 
 from app.core.llm import GenerationClient, GenerationError
-from app.domains.conversation.events import EventSinkLike, emit, state_event
+from app.domains.conversation.events import EventSinkLike
 from app.domains.conversation.guards import (
     validate_and_normalize_constraints,
-    validate_clarification,
     validate_classification_completeness,
     validate_reference_closed_world,
 )
@@ -25,9 +24,7 @@ from app.domains.conversation.prompts import (
 )
 from app.domains.conversation.state import DegradedState, RejectedStep, TurnState
 from app.domains.conversation.types import (
-    Intent,
     ReferenceResolution,
-    UnderstandAction,
     UnderstandOutput,
     UnmodeledItem,
 )
@@ -77,13 +74,7 @@ async def understand(
         for value in active_constraints
         if isinstance(value.get("id"), str) and value["id"]
     ]
-    schema = understand_guided_schema(
-        state.spot_id_vocab,
-        constraint_ids,
-        # G8 は生成後に plan を復元できないため、連続時は
-        # guided decoding の時点で done に絞り、同じ 1 回で plan を出させる。
-        allow_clarification=state.clarify_streak < 1,
-    )
+    schema = understand_guided_schema(state.spot_id_vocab, constraint_ids)
     messages = build_understand_messages(state)
     failures: list[str] = []
     output: UnderstandOutput | None = None
@@ -128,7 +119,7 @@ async def understand(
     state.understand_failures = failures
     if output is None:
         state.understand_failed = True
-        state.log_fields["understand_action"] = None
+        state.log_fields["asked"] = None
         raise UnderstandFatalError("understand の guided JSON を確定できませんでした")
     if state.understand_attempts > 1:
         state.degraded.append(
@@ -142,9 +133,15 @@ async def understand(
     normalized_output = _deduplicate_output(output)
     _copy_output(state, normalized_output)
     _postvalidate_extractions(state)
-    await _apply_clarification_guard(state, event_sink)
-    state.log_fields["understand_action"] = (
-        state.understand_action.value if state.understand_action is not None else None
+    del event_sink
+    state.log_fields["asked"] = next(
+        (
+            step.args.get("kind")
+            for step in state.plan
+            if step.tool == "ask_user"
+            and step.args.get("kind") in {"preference", "clarify"}
+        ),
+        None,
     )
     state.log_fields["intent"] = state.intent.value if state.intent is not None else None
     return state
@@ -180,14 +177,13 @@ def _retry_messages(
     result = [dict(value) for value in messages]
     result[0]["content"] += (
         "\n再試行です。前回は契約違反でした。全必須フィールドと "
-        "action/plan/clarify の"
+        "plan/Tool 引数の"
         f"整合を確認してください。原因: {failure[:240]}"
     )
     return result
 
 
 def _copy_output(state: TurnState, output: UnderstandOutput) -> None:
-    state.understand_action = output.action
     state.intent = output.intent
     state.plan = output.plan
     state.profile_delta = output.profile_delta
@@ -197,7 +193,6 @@ def _copy_output(state: TurnState, output: UnderstandOutput) -> None:
     state.selection_hints = output.selection_hints
     state.unmodeled = output.unmodeled
     state.references = output.references
-    state.clarification = output.clarify
 
 
 def _deduplicate_output(output: UnderstandOutput) -> UnderstandOutput:
@@ -222,20 +217,6 @@ def _deduplicate_output(output: UnderstandOutput) -> UnderstandOutput:
     )
     selection_hints = _unique_by(output.selection_hints, lambda value: value.text)
     unmodeled = _unique_by(output.unmodeled, lambda value: value.text)
-    clarification = output.clarify
-    if clarification is not None:
-        clarification = clarification.model_copy(
-            update={
-                "options": _unique_by(
-                    clarification.options,
-                    lambda value: (
-                        value.resolves_to.kind,
-                        value.resolves_to.value,
-                    ),
-                )
-            },
-            deep=True,
-        )
     return output.model_copy(
         update={
             "references": references,
@@ -244,7 +225,6 @@ def _deduplicate_output(output: UnderstandOutput) -> UnderstandOutput:
             "score_adjustments": score_adjustments,
             "selection_hints": selection_hints,
             "unmodeled": unmodeled,
-            "clarify": clarification,
         },
         deep=True,
     )
@@ -338,76 +318,6 @@ def _postvalidate_extractions(state: TurnState) -> None:
                 reason=completeness.reason,
             )
         )
-
-
-async def _apply_clarification_guard(
-    state: TurnState,
-    event_sink: EventSinkLike,
-) -> None:
-    if state.understand_action is not UnderstandAction.ASK_USER:
-        return
-    if state.clarification is None:  # Pydantic が防ぐ
-        state.understand_action = UnderstandAction.DONE
-        return
-    decision = validate_clarification(
-        state.clarification,
-        allowed_spot_ids=set(state.spot_id_vocab),
-        existing_spot_ids=set(state.spot_catalog),
-        resolved_ambiguities=state.resolved_ambiguities,
-        clarify_streak=state.clarify_streak,
-        # action=ask_user は schema 上 plan=[] なので、G9 は
-        # intent=unclear かどうかも見ないと実行時に決して発火しない。
-        has_viable_plan=(
-            bool(state.plan)
-            or state.intent not in {None, Intent.UNCLEAR}
-        ),
-    )
-    if not decision.accepted:
-        state.rejected_steps.append(
-            RejectedStep(
-                step_id=None,
-                tool=None,
-                rule=decision.rule or "G6-G9",
-                reason=decision.reason or "聞き返しをガードが破棄しました",
-                step={"clarify": state.clarification.model_dump(mode="json")},
-            )
-        )
-        # G8 だけ最初の具体値を仮定する。G6 の不正値や
-        # G7/G9 で棄却した聞き返しから新たな照応を作らない。
-        if decision.rule == "G8":
-            first = (
-                state.clarification.options[0]
-                if state.clarification.options
-                else None
-            )
-            if first is not None and first.resolves_to.kind == "spot_id":
-                state.references.append(
-                    ReferenceResolution(
-                        surface=state.clarification.surface,
-                        spot_id=first.resolves_to.value,
-                    )
-                )
-            if first is not None:
-                state.assumptions.append(
-                    f"「{state.clarification.surface}」は {first.label} と仮定しました"
-                )
-        state.understand_action = UnderstandAction.DONE
-        state.clarification = None
-        return
-    await emit(
-        event_sink,
-        state_event(
-            "clarify",
-            surface=state.clarification.surface,
-            options=[
-                {
-                    "label": option.label,
-                    "value": option.resolves_to.value,
-                }
-                for option in state.clarification.options
-            ],
-        ),
-    )
 
 
 def _unique_by(values: Sequence[Any], key: Any) -> list[Any]:

@@ -10,13 +10,11 @@
       :status-text="message.statusText"
       :candidates="message.candidates"
       :itinerary="message.itinerary"
-      :prompt="message.prompt"
       :profile="message.profile"
       :notices="message.notices"
       :error="message.error"
       :undo-error="message.undoError"
       :is-undoing="isUndoing"
-      @select-option="$emit('select-option', $event)"
       @undo="$emit('undo', $event)"
     />
   </div>
@@ -36,5 +34,5 @@ defineProps({
   },
 });
 
-defineEmits(['select-option', 'undo']);
+defineEmits(['undo']);
 </script>

@@ -4,23 +4,17 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any, Protocol
 from uuid import uuid4
 
 from app.domains.conversation.history import build_conversation_history
 from app.domains.conversation.state import (
     ContextSnapshot,
-    ExplicitResolution,
     SpotFact,
     TurnState,
 )
-
-_INTERPRETATION_VALUES = {
-    "all_matches",
-    "single_match",
-    "current_itinerary",
-    "last_candidates",
-}
+from app.domains.conversation.types import AskUserResult
 
 
 class ContextRepositoryPort(Protocol):
@@ -39,16 +33,16 @@ async def load_context(
 
     snapshot = await repository.load_snapshot(user_id)
     history = build_conversation_history(snapshot.messages)
-    explicit_resolution = _validate_explicit_resolution(
-        resolves,
-        snapshot.pending_clarification,
-        snapshot.spots,
+    resumed_tool_result = _resume_pending_ask(
+        snapshot.pending_ask,
+        utterance=utterance,
+        resolves=resolves,
     )
     vocabulary = _spot_vocabulary(
         snapshot,
         utterance=utterance,
         history_spot_ids=history.mentioned_spot_ids,
-        explicit_resolution=explicit_resolution,
+        resumed_tool_result=resumed_tool_result,
     )
     default_origin = _default_origin(snapshot)
     initial_version = (
@@ -67,22 +61,22 @@ async def load_context(
         presented_spot_ids=snapshot.presented_spot_ids,
         asked_slots=snapshot.asked_slots,
         ask_streak=snapshot.ask_streak,
-        pending_clarification=snapshot.pending_clarification,
         resolved_ambiguities=snapshot.resolved_ambiguities,
-        clarify_streak=snapshot.clarify_streak,
         pending_constraints=snapshot.pending_constraints,
         realtime=snapshot.realtime,
         spot_id_vocab=vocabulary,
         spot_names={spot_id: value.name_ja for spot_id, value in snapshot.spots.items()},
         spot_catalog=snapshot.spots,
+        tag_vocabulary=list(snapshot.tag_vocabulary),
         default_origin_spot_id=default_origin,
-        explicit_resolution=explicit_resolution,
+        tool_results=([resumed_tool_result] if resumed_tool_result is not None else []),
         log_fields={
             "history_tokens": history.estimated_tokens,
             "history_raw_turns": history.raw_turns,
             "history_compressed_turns": history.compressed_turns,
             "history_dropped_turns": history.dropped_turns,
             "initial_itinerary_version": initial_version,
+            "resumed_from_ask": resumed_tool_result is not None,
         },
     )
 
@@ -92,7 +86,7 @@ def _spot_vocabulary(
     *,
     utterance: str,
     history_spot_ids: tuple[str, ...],
-    explicit_resolution: ExplicitResolution | None,
+    resumed_tool_result: dict[str, Any] | None,
 ) -> list[str]:
     ordered: list[str] = []
     if snapshot.itinerary is not None:
@@ -103,9 +97,10 @@ def _spot_vocabulary(
     ordered.extend(value.spot_id for value in snapshot.last_candidates)
     ordered.extend(history_spot_ids)
     ordered.extend(_alias_matches(utterance, snapshot.spots))
-    if explicit_resolution is not None:
-        if explicit_resolution.value in snapshot.spots:
-            ordered.append(explicit_resolution.value)
+    if resumed_tool_result is not None:
+        output = resumed_tool_result.get("output")
+        if isinstance(output, dict) and output.get("answer") in snapshot.spots:
+            ordered.append(str(output["answer"]))
     return [
         spot_id
         for spot_id in dict.fromkeys(ordered)
@@ -148,33 +143,75 @@ def _default_origin(snapshot: ContextSnapshot) -> str | None:
     return min(snapshot.spots, default=None)
 
 
-def _validate_explicit_resolution(
-    resolves: Mapping[str, Any] | None,
+def _resume_pending_ask(
     pending: dict[str, Any] | None,
-    spots: dict[str, SpotFact],
-) -> ExplicitResolution | None:
-    if resolves is None or pending is None:
+    *,
+    utterance: str,
+    resolves: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """生きている pending_ask を、この入力ターンだけ Tool 結果へ復帰する。"""
+
+    if pending is None:
         return None
-    surface = resolves.get("surface")
-    value = resolves.get("value")
-    if not isinstance(surface, str) or not isinstance(value, str):
+    kind = pending.get("kind")
+    if kind not in {"preference", "clarify"}:
         return None
-    if surface != pending.get("surface"):
+    slot = pending.get("slot")
+    surface = pending.get("surface")
+    if kind == "preference" and not isinstance(slot, str):
         return None
-    allowed: set[str] = set()
+    if kind == "clarify" and not isinstance(surface, str):
+        return None
+
+    options = _pending_options(pending)
+    selected_value: str | None = None
+    if resolves is not None:
+        resolved_surface = resolves.get("surface")
+        resolved_value = resolves.get("value")
+        if (
+            kind == "clarify"
+            and isinstance(resolved_surface, str)
+            and resolved_surface == surface
+            and isinstance(resolved_value, str)
+            and resolved_value in {option["value"] for option in options}
+        ):
+            selected_value = resolved_value
+
+    output = AskUserResult(
+        answer=selected_value or utterance,
+        answered_by="chip" if selected_value is not None else "free_text",
+        slot=slot if kind == "preference" else None,
+        surface=surface if kind == "clarify" else None,
+    ).model_dump(mode="json", exclude_none=True)
+    tool_input = {
+        "kind": kind,
+        "reason": str(pending.get("reason", "")),
+        "options": options,
+    }
+    if kind == "preference":
+        tool_input["slot"] = slot
+    else:
+        tool_input["surface"] = surface
+    for key in ("original_utterance", "asked_at_message_id"):
+        if key in pending:
+            tool_input[key] = deepcopy(pending[key])
+    return {"tool": "ask_user", "input": tool_input, "output": output}
+
+
+def _pending_options(pending: Mapping[str, Any]) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
     options = pending.get("options")
-    if isinstance(options, list):
-        for option in options:
-            if not isinstance(option, dict):
-                continue
-            resolution = option.get("resolves_to")
-            if isinstance(resolution, dict) and isinstance(resolution.get("value"), str):
-                allowed.add(resolution["value"])
-            legacy_value = option.get("value")
-            if isinstance(legacy_value, str):
-                allowed.add(legacy_value)
-    if value not in allowed:
-        return None
-    if value not in spots and value not in _INTERPRETATION_VALUES:
-        return None
-    return ExplicitResolution(surface=surface, value=value)
+    if not isinstance(options, list):
+        return result
+    for raw in options:
+        if not isinstance(raw, Mapping):
+            continue
+        label = raw.get("label")
+        value = raw.get("value")
+        if not isinstance(value, str):
+            resolution = raw.get("resolves_to")
+            if isinstance(resolution, Mapping):
+                value = resolution.get("value")
+        if isinstance(label, str) and isinstance(value, str):
+            result.append({"label": label, "value": value})
+    return result

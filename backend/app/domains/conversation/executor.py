@@ -124,7 +124,7 @@ async def act(
         _apply_result(state, result)
         if result.tool is ToolName.ASK_USER:
             state.should_end_turn = True
-            state.ask_user_payload = result.data
+            state.pending_ask = dict(result.data)
             break
 
     state.log_fields["executed_tools"] = [

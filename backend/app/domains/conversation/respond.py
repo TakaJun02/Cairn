@@ -16,7 +16,6 @@ from app.domains.conversation.types import (
     Intent,
     ResponseMode,
     ToolName,
-    UnderstandAction,
 )
 from app.domains.conversation.understand import has_repeated_ngram
 
@@ -115,8 +114,6 @@ async def respond(
 
 
 def response_mode(state: TurnState) -> ResponseMode:
-    if state.understand_action is UnderstandAction.ASK_USER and state.clarification is not None:
-        return ResponseMode.CLARIFICATION
     if state.should_end_turn:
         return ResponseMode.QUESTION
     if state.understand_failed:

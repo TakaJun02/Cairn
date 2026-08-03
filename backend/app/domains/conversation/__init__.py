@@ -11,7 +11,6 @@ from app.domains.conversation.types import (
     ToolError,
     ToolErrorCode,
     ToolName,
-    UnderstandAction,
     UnderstandOutput,
 )
 
@@ -25,7 +24,6 @@ __all__ = [
     "ToolErrorCode",
     "ToolName",
     "TurnState",
-    "UnderstandAction",
     "UnderstandOutput",
     "run_turn",
 ]

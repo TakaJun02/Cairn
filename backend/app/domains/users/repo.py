@@ -142,9 +142,7 @@ class UserRepository:
             )
         )
         profile = await self._read_profile(user_id)
-        pending = dict(thread.pending_clarification) if thread.pending_clarification else None
-        if pending is not None:
-            pending = {**pending, "kind": "clarify"}
+        pending = _public_pending(thread.pending_ask)
         return ThreadData(
             messages=[_message_data(message) for message in message_rows],
             itinerary=(
@@ -187,6 +185,51 @@ def _profile_data(profile: Profile) -> ProfileData:
         notes=profile.notes,
         updated_at=profile.updated_at,
     )
+
+
+def _public_pending(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    """pending_ask を既存の SSE/UI kind と options 形へ写す。"""
+
+    if not value:
+        return None
+    kind = value.get("kind")
+    reason = value.get("reason")
+    options = value.get("options")
+    if not isinstance(options, list):
+        return None
+    if kind == "preference":
+        slot = value.get("slot")
+        if not isinstance(slot, str):
+            return None
+        labels = [
+            option.get("label")
+            for option in options
+            if isinstance(option, dict) and isinstance(option.get("label"), str)
+        ]
+        return {
+            "kind": "ask_user",
+            "slot": slot,
+            "reason": reason,
+            "options": labels,
+        }
+    if kind == "clarify":
+        surface = value.get("surface")
+        if not isinstance(surface, str):
+            return None
+        public_options = [
+            {"label": option.get("label"), "value": option.get("value")}
+            for option in options
+            if isinstance(option, dict)
+            and isinstance(option.get("label"), str)
+            and isinstance(option.get("value"), str)
+        ]
+        return {
+            "kind": "clarify",
+            "surface": surface,
+            "reason": reason,
+            "options": public_options,
+        }
+    return None
 
 
 def _message_data(message: Message) -> MessageData:

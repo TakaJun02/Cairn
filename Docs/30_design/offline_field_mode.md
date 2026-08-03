@@ -32,7 +32,7 @@ flowchart LR
   class D,T o
 ```
 
-**入力は 3 つだけ**: 端末内のパック / GPS / LoRa の数十バイト。**LLM は動かない**([agent_planning_phase.md §12](agent_planning_phase.md))。
+**入力は 3 つだけ**: 端末内のパック / GPS / LoRa の数十バイト。**LLM は動かない**([00_project.md](../00_project.md) の 2 フェーズ定義: 観光フェーズは計画フェーズで事前生成済みの資材で成立する)。
 
 ---
 

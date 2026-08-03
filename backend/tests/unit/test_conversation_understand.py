@@ -63,10 +63,8 @@ def _output(**overrides: Any) -> str:
         "score_adjustments": [],
         "selection_hints": [],
         "unmodeled": [],
-        "action": "done",
         "intent": "recommend",
         "plan": [{"id": 1, "tool": "recommend", "args": {"k": 2}}],
-        "clarify": None,
     }
     value.update(overrides)
     return json.dumps(value, ensure_ascii=False)
@@ -152,92 +150,31 @@ async def test_unknown_predicate_and_out_of_world_reference_are_not_silent() -> 
     assert any(item.text == "屋台" for item in state.unmodeled)
 
 
-async def test_valid_clarification_emits_strict_state_payload() -> None:
+async def test_clarification_is_returned_as_single_ask_user_plan_step() -> None:
     state = _state()
     sink = MemoryEventSink()
     value = _output(
-        action="ask_user",
         intent="unclear",
-        plan=[],
-        clarify={
-            "surface": "2番目",
-            "why": "候補が2つあります",
-            "options": [
-                {
-                    "label": "鶴間池",
-                    "resolves_to": {"kind": "spot_id", "value": "spot_001"},
+        plan=[
+            {
+                "id": 1,
+                "tool": "ask_user",
+                "args": {
+                    "kind": "clarify",
+                    "surface": "2番目",
+                    "reason": "候補が2つあります",
+                    "options": [
+                        {"label": "鶴間池", "value": "spot_001"},
+                        {"label": "元滝伏流水", "value": "spot_002"},
+                    ],
                 },
-                {
-                    "label": "元滝伏流水",
-                    "resolves_to": {"kind": "spot_id", "value": "spot_002"},
-                },
-            ],
-        },
+            }
+        ],
     )
 
     await understand(state, client=ScriptedClient([value]), event_sink=sink)
 
-    assert state.understand_action.value == "ask_user"
-    assert sink.events[0].data == {
-        "kind": "clarify",
-        "surface": "2番目",
-        "options": [
-            {"label": "鶴間池", "value": "spot_001"},
-            {"label": "元滝伏流水", "value": "spot_002"},
-        ],
-    }
-
-
-async def test_g6_rejection_does_not_turn_invalid_option_into_reference() -> None:
-    state = _state()
-    value = _output(
-        action="ask_user",
-        intent="unclear",
-        plan=[],
-        clarify={
-            "surface": "2番目",
-            "why": "候補が1つしかありません",
-            "options": [
-                {
-                    "label": "架空の地点",
-                    "resolves_to": {"kind": "spot_id", "value": "spot_999"},
-                }
-            ],
-        },
-    )
-
-    await understand(state, client=ScriptedClient([value]))
-
-    assert state.understand_action.value == "done"
-    assert state.references == []
-    assert state.assumptions == []
-    assert state.rejected_steps[-1].rule == "G6"
-
-
-async def test_g9_rejects_clarification_when_intent_is_actionable() -> None:
-    state = _state()
-    value = _output(
-        action="ask_user",
-        intent="recommend",
-        plan=[],
-        clarify={
-            "surface": "滝",
-            "why": "念のため確認します",
-            "options": [
-                {
-                    "label": "鶴間池",
-                    "resolves_to": {"kind": "spot_id", "value": "spot_001"},
-                },
-                {
-                    "label": "元滝伏流水",
-                    "resolves_to": {"kind": "spot_id", "value": "spot_002"},
-                },
-            ],
-        },
-    )
-
-    await understand(state, client=ScriptedClient([value]))
-
-    assert state.understand_action.value == "done"
-    assert state.references == []
-    assert state.rejected_steps[-1].rule == "G9"
+    assert len(state.plan) == 1
+    assert state.plan[0].tool == "ask_user"
+    assert state.plan[0].args["kind"] == "clarify"
+    assert sink.events == []

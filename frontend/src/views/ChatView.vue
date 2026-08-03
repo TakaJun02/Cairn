@@ -9,15 +9,19 @@ import NavWindow from '@/components/NavWindow.vue'
 
 // New UI components
 import OC_ChatMessages from '@/components/OC_ChatMessages.vue';
+import OC_AskUserForm from '@/components/OC_AskUserForm.vue';
 import OC_ChatInput from '@/components/OC_ChatInput.vue';
 
 const userStore = useUserStore()
 const chatStore = useChatStore()
-const { messages, isLoading, isSessionLoaded, isUndoing } = storeToRefs(chatStore)
+const { messages, isLoading, isSessionLoaded, isUndoing, currentPrompt } = storeToRefs(chatStore)
 
 const messagesContainer = ref(null);
 
 const chatInputText = ref('');
+const isPromptDismissed = ref(false);
+
+const isAskUserFormVisible = computed(() => Boolean(currentPrompt.value) && !isPromptDismissed.value);
 
 // --- Dynamic placeholder for input ---
 const placeholderText = computed(() => {
@@ -68,8 +72,16 @@ async function handleSendMessage(message = chatInputText.value) {
   // The input will be cleared by the child component via v-model update
 }
 
-function handlePromptOption({ messageId, option }) {
-  void chatStore.selectPromptOption(messageId, option)
+function handlePromptOption(option) {
+  void chatStore.selectPromptOption(option)
+}
+
+function handlePromptAnswer(answer) {
+  void chatStore.sendMessage(answer)
+}
+
+function handlePromptDismiss() {
+  isPromptDismissed.value = true
 }
 
 function handleUndo(messageId) {
@@ -92,6 +104,10 @@ watch(() => messages.value.length, () => {
 
 watch(() => messages.value.at(-1)?.content, () => {
   scrollToBottom();
+});
+
+watch(currentPrompt, () => {
+  isPromptDismissed.value = false;
 });
 
 watch(isSessionLoaded, (isLoaded) => {
@@ -138,13 +154,15 @@ onMounted(() => {
       <OC_ChatMessages
         :messages="messages"
         :is-undoing="isUndoing"
-        @select-option="handlePromptOption"
         @undo="handleUndo"
       />
     </div>
 
     <!-- Floating Suggestion Cards -->
-    <div class="tw-absolute tw-bottom-[100px] sm:tw-bottom-[88px] tw-left-0 tw-w-full tw-z-10 tw-transition-all tw-touch-action-none">
+    <div
+      v-if="!isAskUserFormVisible"
+      class="tw-absolute tw-bottom-[100px] sm:tw-bottom-[88px] tw-left-0 tw-w-full tw-z-10 tw-transition-all tw-touch-action-none"
+    >
       <div class="no-scrollbar tw-flex tw-gap-3 tw-overflow-x-auto tw-px-4">
         <div
           v-for="suggestion in suggestionTemplates"
@@ -162,6 +180,14 @@ onMounted(() => {
 
     <!-- Input Area -->
     <div class="tw-shrink-0 tw-touch-action-none">
+      <OC_AskUserForm
+        v-if="isAskUserFormVisible"
+        :prompt="currentPrompt"
+        :is-sending="isLoading"
+        @select-option="handlePromptOption"
+        @answer="handlePromptAnswer"
+        @dismiss="handlePromptDismiss"
+      />
       <OC_ChatInput 
         v-model="chatInputText" 
         @sendMessage="handleSendMessage" 

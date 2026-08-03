@@ -8,9 +8,8 @@ import pytest
 
 from app.domains.conversation.guards import (
     normalize_revert_ops,
+    validate_ask_user,
     validate_classification_completeness,
-    validate_clarification,
-    validate_preference_question,
 )
 from app.domains.conversation.planner import _cyclic_step_ids, validate_plan
 from app.domains.conversation.state import (
@@ -21,7 +20,6 @@ from app.domains.conversation.state import (
 )
 from app.domains.conversation.types import (
     AskUserArgs,
-    Clarification,
     ConstraintDraft,
     Intent,
     PlanStep,
@@ -80,6 +78,18 @@ def _search(step_id: int) -> PlanStep:
     )
 
 
+def _preference_args(slot: str = "pace") -> dict[str, object]:
+    return {
+        "kind": "preference",
+        "slot": slot,
+        "reason": "選好を確認します",
+        "options": [
+            {"label": "ゆったり", "value": "relaxed"},
+            {"label": "多め", "value": "packed"},
+        ],
+    }
+
+
 async def test_p2_to_p6_run_before_p1_so_valid_fourth_step_survives() -> None:
     state = _state(
         [
@@ -120,11 +130,7 @@ async def test_p2_to_p6_run_before_p1_so_valid_fourth_step_survives() -> None:
                 PlanStep(
                     id=1,
                     tool="ask_user",
-                    args={
-                        "slot": "pace",
-                        "reason": "確認",
-                        "options": ["ゆったり", "多め"],
-                    },
+                    args=_preference_args(),
                 ),
                 _search(2),
             ],
@@ -147,6 +153,29 @@ async def test_plan_rules_leave_reason_in_rejected_steps(
     await validate_plan(state)
 
     assert any(value.rule == rule for value in state.rejected_steps)
+
+
+async def test_p5_allows_ask_user_only_at_tail_and_at_most_once() -> None:
+    not_at_tail = _state(
+        [
+            PlanStep(id=1, tool="ask_user", args=_preference_args()),
+            _search(2),
+        ]
+    )
+    duplicated = _state(
+        [
+            PlanStep(id=1, tool="ask_user", args=_preference_args("pace")),
+            PlanStep(id=2, tool="ask_user", args=_preference_args("mobility")),
+        ]
+    )
+
+    await validate_plan(not_at_tail)
+    await validate_plan(duplicated)
+
+    assert [step.tool for step in not_at_tail.accepted_steps] == ["search_knowledge"]
+    assert any(value.rule == "P5" for value in not_at_tail.rejected_steps)
+    assert sum(step.tool == "ask_user" for step in duplicated.accepted_steps) <= 1
+    assert any(value.rule == "G1" for value in duplicated.rejected_steps)
 
 
 async def test_closed_world_and_edit_precondition_are_rejected() -> None:
@@ -250,11 +279,7 @@ async def test_g4_planner_adds_result_before_preference_question() -> None:
             PlanStep(
                 id=1,
                 tool="ask_user",
-                args={
-                    "slot": "pace",
-                    "reason": "ペースを確認",
-                    "options": ["ゆったり", "多め"],
-                },
+                args=_preference_args(),
             )
         ],
         intent=Intent.RECOMMEND,
@@ -308,10 +333,10 @@ async def test_revert_requires_version_two_and_discards_other_ops() -> None:
 
 
 def test_g1_to_g5() -> None:
-    base = AskUserArgs(slot="pace", options=["ゆったり", "多め"])
+    base = AskUserArgs.model_validate(_preference_args())
     profile = ProfileState(party="solo")
 
-    assert validate_preference_question(
+    assert validate_ask_user(
         base,
         asked_slots=[],
         ask_streak=0,
@@ -320,7 +345,7 @@ def test_g1_to_g5() -> None:
         has_non_question_step=False,
         question_count=2,
     ).rule == "G1"
-    assert validate_preference_question(
+    assert validate_ask_user(
         base,
         asked_slots=["pace"],
         ask_streak=0,
@@ -328,7 +353,7 @@ def test_g1_to_g5() -> None:
         profile=profile,
         has_non_question_step=False,
     ).rule == "G2"
-    assert validate_preference_question(
+    assert validate_ask_user(
         base,
         asked_slots=[],
         ask_streak=2,
@@ -336,7 +361,7 @@ def test_g1_to_g5() -> None:
         profile=profile,
         has_non_question_step=False,
     ).rule == "G3"
-    assert validate_preference_question(
+    assert validate_ask_user(
         base,
         asked_slots=[],
         ask_streak=0,
@@ -344,67 +369,84 @@ def test_g1_to_g5() -> None:
         profile=profile,
         has_non_question_step=False,
     ).rule == "G4"
-    assert validate_preference_question(
-        AskUserArgs(slot="pace", options=["1つだけ"]),
+    one_option = _preference_args()
+    one_option["options"] = [{"label": "1つだけ", "value": "one"}]
+    assert validate_ask_user(
+        AskUserArgs.model_validate(one_option),
         asked_slots=[],
         ask_streak=0,
         intent=Intent.EDIT,
         profile=profile,
         has_non_question_step=False,
     ).rule == "G5"
+    assert validate_ask_user(
+        base,
+        asked_slots=[],
+        ask_streak=0,
+        intent=Intent.EDIT,
+        profile=profile,
+        has_non_question_step=False,
+        has_viable_plan=True,
+    ).rule == "G9"
 
 
-def _clarification(option_count: int = 2) -> Clarification:
-    return Clarification.model_validate(
+def _clarification(*, invalid_value: str | None = None) -> AskUserArgs:
+    return AskUserArgs.model_validate(
         {
+            "kind": "clarify",
             "surface": "2番目",
-            "why": "候補が複数あります",
+            "reason": "候補が複数あります",
             "options": [
                 {
                     "label": f"地点{index}",
-                    "resolves_to": {
-                        "kind": "spot_id",
-                        "value": f"spot_{index:03d}",
-                    },
+                    "value": (
+                        invalid_value
+                        if index == 2 and invalid_value
+                        else f"spot_{index:03d}"
+                    ),
                 }
-                for index in range(1, option_count + 1)
+                for index in range(1, 3)
             ],
         }
     )
 
 
-def test_g6_to_g9_are_separate_from_preference_guards() -> None:
+def test_g3_g6_g7_and_g9_apply_to_unified_ask_user() -> None:
     existing = {"spot_001", "spot_002", "spot_003", "spot_004", "spot_005"}
-    assert validate_clarification(
-        _clarification(1),
-        allowed_spot_ids=existing,
-        existing_spot_ids=existing,
+    common = {
+        "asked_slots": [],
+        "intent": Intent.UNCLEAR,
+        "profile": ProfileState(),
+        "has_non_question_step": False,
+        "allowed_spot_ids": existing,
+        "existing_spot_ids": existing,
+    }
+    assert validate_ask_user(
+        _clarification(),
+        **common,
         resolved_ambiguities=[],
-        clarify_streak=0,
+        ask_streak=2,
+        has_viable_plan=False,
+    ).rule == "G3"
+    assert validate_ask_user(
+        _clarification(invalid_value="spot_999"),
+        **common,
+        resolved_ambiguities=[],
+        ask_streak=0,
         has_viable_plan=False,
     ).rule == "G6"
-    assert validate_clarification(
+    assert validate_ask_user(
         _clarification(),
-        allowed_spot_ids=existing,
-        existing_spot_ids=existing,
+        **common,
         resolved_ambiguities=[{"surface": "2番目"}],
-        clarify_streak=0,
+        ask_streak=0,
         has_viable_plan=False,
     ).rule == "G7"
-    assert validate_clarification(
+    assert validate_ask_user(
         _clarification(),
-        allowed_spot_ids=existing,
-        existing_spot_ids=existing,
+        **common,
         resolved_ambiguities=[],
-        clarify_streak=1,
-        has_viable_plan=False,
-    ).rule == "G8"
-    assert validate_clarification(
-        _clarification(),
-        allowed_spot_ids=existing,
-        existing_spot_ids=existing,
-        resolved_ambiguities=[],
-        clarify_streak=0,
+        ask_streak=0,
         has_viable_plan=True,
     ).rule == "G9"
 

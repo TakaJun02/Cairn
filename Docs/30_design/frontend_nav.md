@@ -48,7 +48,7 @@
 | ベース URL | `'/back/api'` → **`import.meta.env.VITE_API_BASE ?? '/api/v1'`**。Vite のプロキシ設定で開発時を吸収する([22 §13-8](../22_current_issues.md) の「`import.meta.env` 使用 0 件」もここで解消) |
 | 認証 | **`Authorization: Bearer <token>`** を付ける([chat_sse.md §4](../40_api/chat_sse.md))。トークンは `POST /login` の応答を `stores/user.js` が持つ |
 | **`uuid` の自動注入を削除** | 全リクエストのクエリとボディに `uuid` を差し込んでいる([22 §12-6](../22_current_issues.md))。**消費者はログミドルウェアだけ**で、そのミドルウェアごと廃止される |
-| エンドポイント | `POST /chat`(SSE。§2.2)/ `GET /thread` / `GET /spots` / `POST /itinerary/undo` / `POST /packs` / `GET /jobs/{id}` |
+| エンドポイント | `POST /chat`(SSE。§2.2)/ **`POST /chat/answer`(質問への回答。§2.3)** / `GET /thread` / `GET /spots` / `POST /itinerary/undo` / `POST /packs` / `GET /jobs/{id}` |
 
 ### 2.2 チャットを SSE にする(`stores/chat.js`)
 
@@ -60,19 +60,19 @@ const ctrl = new AbortController()
 const res  = await fetch('/api/v1/chat', {
   method: 'POST', signal: ctrl.signal,
   headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
-  body: JSON.stringify({ message, ...(resolves && { resolves }) })
+  body: JSON.stringify({ message })
 })
 // res.body.getReader() を回して event: / data: を組み立て、kind で分岐
+// 質問への回答は POST /api/v1/chat/answer（§2.3）。イベントはこのストリームに流れ続ける
 ```
 
 | 受け取るもの | UI での扱い |
 | --- | --- |
 | `token` | 本文に追記(既存の `isPending` アニメーションはそのまま使える) |
-| `state{kind:"plan"}` | 「何をしているか」の小さな表示(任意) |
 | `state{kind:"candidates"}` | **推薦カード。**`phase:"provisional"` で描き、`"final"` で差し替える |
 | `state{kind:"itinerary"}` | **旅程カード + 地図。**同上 |
-| `state{kind:"ask_user"}` / `{kind:"clarify"}` | **チップ(§2.3)** |
-| `state{kind:"searching"}` | 「◯◯を調べています」の一行表示 |
+| `state{kind:"ask_user"}` / `{kind:"clarify"}` | **`ask_user` 専用の入力フォーム(§2.3)。ターンの途中で来る — ストリームは開いたままにし、回答後の続きのイベントを同じリーダーで受ける**(2026-08-04、[chat_sse.md §1.4](../40_api/chat_sse.md)) |
+| `state{kind:"step"}` | 「◯◯を探しています」等、手の実況の一行表示(2026-08-04: 旧 `searching` を統合。[chat_sse.md §1.2](../40_api/chat_sse.md)) |
 | `state{kind:"profile"}` | プロファイル表示の更新 |
 | `error` | `degraded:true` なら控えめな注記、`false` ならエラー表示 |
 | `done` | ローディング解除 |
@@ -81,27 +81,77 @@ const res  = await fetch('/api/v1/chat', {
 - **切断・リロード後は `GET /thread` で丸ごと取り直す**([chat_sse.md §1.5](../40_api/chat_sse.md))。再開機構は作らない
 - **現行の「応答後に `navStore.fetchRoute` を呼ぶ」経路は削除する。**経路はサーバーが持ち、`state:itinerary` に `route_id` が入って届く([geo.md §3](geo.md))
 
-### 2.3 【新規】チップ UI(`ask_user` / `clarify`)
+### 2.3 【新規】`ask_user` 専用の入力フォーム(2026-08-03 改訂)
 
-**ユーザーが明示的に挙げた「`ask_user` 用の入力欄」がこれである。**
+**決定(2026-08-03、ユーザー指示): 質問への回答は、メッセージ内のチップではなく「`ask_user` 専用の入力フォーム」で受ける。**
+
+> **改訂前の決定を差し替える。**旧版は「`OC_ChatMessage.vue` にチップの行を足すだけで、新しいコンポーネントを増やさない」としていた。**実機で 2 つの実害が出たため改める**([23_ux_issues.md](../23_ux_issues.md)):
+> - **§6-8**: サーバー側の `pending` が `null` なのにチップが残り、**古い問いに答えたつもりの送信**が起きる
+> - **§6-5**: リロードすると同じチップ/カードが**複数のメッセージの下に重複描画**される
+>
+> 回答 UI を**会話ログから切り離し、現在の問いに対して 1 つだけ存在する**ようにすれば、どちらも構造的に起きなくなる。
+
+#### 2.3.1 置き場所と形
+
+**チャット入力欄の直上にドッキングする。**モーダルにはしない(NFR-4 / G5)。
 
 ```
-┌─────────────────────────────────────────┐
-│ どのくらい歩けますか？                    │  ← 本文は token で流れてくる
-│  [あまり歩きたくない] [30分程度なら]      │  ← state:ask_user.options
-│  [登山もしたい]                          │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  ……（会話ログ。質問文は token で流れてくる）   │
+│                                              │
+├──────────────────────────────────────────────┤
+│ ❓ AI からの質問                    [あとで]  │  ← ask_user 専用フォーム
+│    どのくらい歩けますか？                     │     現在の問いに対して 1 つだけ
+│                                              │
+│    ( ) あまり歩きたくない                     │  ← state.options
+│    ( ) 30分程度なら                          │
+│    ( ) 登山もしたい                          │
+│                                              │
+│    ┌────────────────────────┐  [ 回答する ]  │  ← 自由入力も併置（G5・FR-3.2）
+│    │ 自由に書いても答えられます │               │
+│    └────────────────────────┘               │
+├──────────────────────────────────────────────┤
+│  [ 質問してみましょう                    ]   │  ← 通常の入力欄（塞がない）
+└──────────────────────────────────────────────┘
 ```
 
-| 決めたこと | 理由 |
-| --- | --- |
-| **チップは選択肢を出すだけで、送信は通常の `POST /chat`** | 専用エンドポイントを作らない([chat_sse.md §1.4](../40_api/chat_sse.md)) |
-| **`clarify` のときは `resolves` を付けて送る** | サーバーが `pending_clarification` と突き合わせる |
-| **チップが出ていても自由入力できる** | G5・FR-3.2。**入力欄を塞がない** |
-| **チップは 1 度押したら消える** | 二重送信の防止(サーバー側も 409 で弾く) |
-| **リロードしてもチップが残る** | `GET /thread` の `pending` から復元([chat_sse.md §3.1](../40_api/chat_sse.md)) |
+| # | 決めたこと | 理由 |
+| --- | --- | --- |
+| 1 | **フォームは `currentPrompt`(= サーバーの `pending_ask`)に対して 1 つだけ**。会話ログの中には出さない | 重複描画と、古い問いへの回答を構造的に無くす |
+| 2 | **`pending` が消えたらフォームも消える** | [23_ux_issues.md §6-8](../23_ux_issues.md) の再発防止。**`GET /thread` の `pending` が唯一の真実** |
+| 3 | **選択肢を選ぶと即送信**(1 タップで完了) | 現行のチップの速さを落とさない |
+| 4 | **自由入力欄をフォーム内にも置く** | G5・FR-3.2。**選択肢に無い答えをその場で書ける** |
+| 5 | **下の通常入力欄は塞がない**。ただし**回答待ちの間はその送信も `/chat/answer` に回す**(実行中ターンがある間 `POST /chat` は 409) | 質問に沿わない内容でもそのまま答えとして届き、扱いはエージェントが判断する |
+| 6 | **送信は `POST /api/v1/chat/answer`**(2026-08-04 改訂。HITL) | 回答は実行中のターンに返り、**同じ SSE ストリームが続きを流す**([chat_sse.md §1.4](../40_api/chat_sse.md)) |
+| 7 | **`kind:"clarify"` のときは `resolves` を付けて送る** | サーバーが `pending_ask` と突き合わせる([ADR-0019](../adr/0019-react-main-agent-subagents.md)) |
+| 8 | **自由入力で答えたときは `resolves` を付けない** | サーバーが `answered_by:"free_text"` として扱う |
+| 9 | **[あとで] で閉じられる**。閉じても `pending` は消えない | 質問が邪魔で操作できない状態を作らない。`pending` が生きている間(タイムアウト 10 分まで)はいつでも再表示できる |
+| 10 | **送信中は選択肢と送信ボタンを `disabled` にする** | 二重送信の防止(サーバー側も弾く) |
+| 11 | **リロードしても復元する** | `GET /thread` の `pending` から([chat_sse.md §3.1](../40_api/chat_sse.md)) |
+| 12 | **フォーム表示中はスターターカードを隠す** | [23_ux_issues.md §5-3](../23_ux_issues.md)。重なって両方読めなくなる |
 
-実装は `components/OC_ChatMessage.vue` に**チップの行を足す**だけで、新しいコンポーネントを増やさない。
+#### 2.3.2 `kind` による書き分け
+
+**1 つのコンポーネントで両方を扱う**(`ask_user` は 1 つの Tool で `kind` が 2 用途を担うため。[ADR-0019](../adr/0019-react-main-agent-subagents.md))。違うのは見出しと、`clarify` が `surface` を持つことだけ。
+
+| | `kind: "preference"` | `kind: "clarify"` |
+| --- | --- | --- |
+| 見出し | **AI からの質問** | **確認させてください** |
+| 本文 | **`reason` をそのまま出す** | **「〇〇」はどちらですか**(`surface` を強調)+ `reason` |
+| 送信時 | `resolves` **なし** | `resolves: {surface, value}` |
+
+> **本文は `reason` を出す。フロント側で slot ごとの固定文を持たない**(2026-08-03 追記)。
+> **実機で不整合が出たため明記する。**`slot:"origin"` の問いに対して固定文「どこから出発しますか？」を表示したが、実際の選択肢は「この条件で進める」「条件を変更する」で、**問いと選択肢が食い違った。**サーバー側の `pending_ask` は `reason:"仮定した旅程条件の確認"` を持っていたのに、**SSE と `GET /thread` の `pending` がそれを返していなかった**ことが原因である。
+>
+> したがって **`reason` を `state:ask_user` / `state:clarify` と `GET /thread` の `pending` に含める**([chat_sse.md §1.2](../40_api/chat_sse.md))。フォームは受け取った `reason` を表示し、**固定の対応表を持たない。**
+
+#### 2.3.3 実装
+
+**新規コンポーネント `components/OC_AskUserForm.vue` を 1 つだけ足す。**[ADR-0017](../adr/0017-frontend-incremental-change.md)(差分改修に限る)の範囲内で、**既存の見た目に合わせる**(原則 F3)。
+
+- `views/ChatView.vue` の入力欄の直上に置く
+- `stores/chat.js` の `currentPrompt` を唯一の供給源にする。**`OC_ChatMessage.vue` のチップ行は削除する**(2 か所に回答 UI を持たない)
+- `sessionStorage` による補完([90_backlog.md §H-2](../90_backlog.md))は**サーバーの `pending` が正しく返るようになったら外す**
 
 ### 2.4 【新規】旅程カードと undo ボタン
 
@@ -171,8 +221,8 @@ applyDownlink({ packEpoch, codes }, manifest) {
 | # | 条件 |
 | --- | --- |
 | 1 | チャットがトークン単位で流れ、**停止ボタンで止まる。止めても見えた旅程が残る** |
-| 2 | `ask_user` / `clarify` のチップが出て、**押しても自由入力しても同じように進む** |
-| 3 | **リロードしても画面が完全に戻る**(`GET /thread` 1 回。チップも残る) |
+| 2 | `ask_user` / `clarify` で**専用フォームが入力欄の直上に出て**、選択肢を押しても自由入力しても同じように進む |
+| 3 | **リロードしても画面が完全に戻る**(`GET /thread` 1 回。**専用フォームも残り、重複しない**) |
 | 4 | 推薦カードと地図が **provisional で先に描かれ、final で差し替わる** |
 | 5 | [元に戻す] が LLM を通さずに版を戻し、**二重クリックが 409 で弾かれる** |
 | 6 | パック生成中もチャットが使え、**`partial` が「完了」と表示されない** |
@@ -187,8 +237,8 @@ applyDownlink({ packEpoch, codes }, manifest) {
 | --- | --- | --- |
 | 1 | **`NavView.vue` を分割しない** | [ADR-0017](../adr/0017-frontend-incremental-change.md)(ユーザー指示)。分割線は実機を通してからでないと引けない |
 | 2 | **SW は作り直さず URL 判定だけ直す** | 同上。空回りの原因はホスト不一致の 1 点 |
-| 3 | **チップは既存のメッセージコンポーネントに行を足すだけ** | 新しいコンポーネントを増やさない |
-| 4 | **チップが出ていても入力欄を塞がない** | G5・FR-3.2。自由入力でも答えられる必要がある |
+| 3 | ~~チップは既存のメッセージコンポーネントに行を足すだけ~~ → **2026-08-03 差し替え: `ask_user` 専用フォームを 1 コンポーネント足す**(§2.3) | 会話ログ内に回答 UI を置くと**重複描画と古い問いへの回答**が起きた([23_ux_issues.md §6-5 / §6-8](../23_ux_issues.md)) |
+| 4 | **フォームが出ていても下の入力欄を塞がない** | G5・FR-3.2。自由入力でも答えられ、質問を無視して別の話も始められる |
 | 5 | **undo はボタンから専用 REST を直接叩く** | [chat_sse.md §2.1](../40_api/chat_sse.md)。確実性を要する操作に解釈を挟まない |
 | 6 | **進捗はポーリング・非モーダル** | 生成中もアプリが使えること(NFR-4) |
 | 7 | **`uuid` の自動注入を削除する** | 消費者がいなくなる。[22 §12-6](../22_current_issues.md) |
@@ -203,7 +253,8 @@ applyDownlink({ packEpoch, codes }, manifest) {
 | --- | --- |
 | `NavView.vue` を機能別コンポーネントに分割 | [ADR-0017](../adr/0017-frontend-incremental-change.md)。バックエンド全面改修と同時に行うと切り分け不能になる |
 | Service Worker を書き直す | 空回りの原因は URL 判定 1 点。作り直す必要がない |
-| チップ専用のエンドポイントを作る | 自由入力でも答えられる必要があり、`POST /chat` に寄せるのが自然 |
+| ~~回答専用のエンドポイントを作らない~~ | **2026-08-04 に転換**: `ask_user` の HITL 化([ADR-0019](../adr/0019-react-main-agent-subagents.md))で回答は実行中ターンに返す必要が生じ、**`POST /chat/answer` を新設**した(自由入力もこのエンドポイントで受ける) |
+| **`ask_user` をモーダルで出す** | **生成中もアプリが使えること**(NFR-4)と、質問を無視して別の話を始められること(G5)に反する |
 | SSE ではなく定期ポーリング | 最初のトークンまでの時間が伸びる(NFR-3) |
 | TypeScript 化 | 差分改修の方針([ADR-0017](../adr/0017-frontend-incremental-change.md))と衝突する。**型は `openapi-typescript` で生成した `types.d.ts` を JSDoc から参照する**にとどめる |
 | 状態管理を Pinia から入れ替える | 動いている。入れ替える理由がない |
@@ -212,7 +263,7 @@ applyDownlink({ packEpoch, codes }, manifest) {
 
 | # | 項目 |
 | --- | --- |
-| 1 | チップの見た目(既存の Tailwind クラスに合わせる) |
+| 1 | `ask_user` 専用フォームの見た目(既存の Tailwind クラスに合わせる。原則 F3) |
 | 2 | 進捗パネルの置き場所(サイドバー内かトースト上か) |
 | 3 | SSE パーサの実装(40 行程度。ライブラリを入れるかは実装者判断) |
 | 4 | `VITE_API_BASE` の既定値と Vite プロキシの設定 |

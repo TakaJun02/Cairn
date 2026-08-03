@@ -1,7 +1,19 @@
 # 残タスク(次のセッションの起点)
 
-- 最終更新: **2026-08-02**
+- 最終更新: **2026-08-04**
 - 用途: **会話セッションをまたぐときの引き継ぎ。**新しいセッションはこの文書から読み始める
+
+> # 🔄 現在地(2026-08-04)— **計画フェーズのエージェントを ReAct 構成へ完全作り替え(設計決定済み・実装未着手)**
+>
+> **ユーザー指示(2026-08-03/04)により、一括プラン方式を廃止し、ReAct メインエージェント + サブエージェント構成に「完全に作り替える」ことが決まった(修正ではない)。**
+>
+> - **設計の正: [30_design/agent_react_architecture.md](30_design/agent_react_architecture.md)(決定稿。論点 9 件は 2026-08-04 に全決着)**
+> - **[ADR-0019](adr/0019-react-main-agent-subagents.md) 承認**(ADR-0008・0009・**0018** を supersede)
+> - **`ask_user` は Human-in-the-Loop の通常ツール**(2026-08-04 ユーザー訂正)。**ターンを中断しない** — UI 経由で質問し、回答(`POST /api/v1/chat/answer`)を**同一ターン内で**呼び出し元エージェントの act に持ち帰る。旧案の `pending_turn`・scope 復帰・SA 再実行は廃止
+> - **[agent_planning_phase.md](30_design/agent_planning_phase.md) / [understand_node.md](30_design/understand_node.md) は廃止(凍結)。**実装の参照先にしない
+> - **契約文書の改訂も完了(2026-08-04)**: [chat_sse.md](40_api/chat_sse.md)(`state:step` 新設・`plan` 廃止・`searching` 統合・**`POST /chat/answer` 新設**)/ [data_model.md](30_design/data_model.md)(`history_summary`・`summarized_until_message_id` 追加、`pending_ask` は表示中の質問の復元用に再定義 = migration 0004、§6 を LLM 要約方式に)/ [narration_qa.md](30_design/narration_qa.md)(内側 Tool に `ask_user`)/ [20_architecture.md](20_architecture.md) §4 / [frontend_nav.md](30_design/frontend_nav.md) §2.2〜2.3
+> - **次の作業**: [agent_react_architecture.md §16](30_design/agent_react_architecture.md) の **5 段で Codex へ実装委譲**(`gpt-5.6-sol` / Effort max。各段の指示書を作ってから)
+> - 現行実装(下記 2026-08-02 の成果)は**旧方式のまま動いている**。[23_ux_issues.md](23_ux_issues.md) の §1-2〜1-5(地図消失の競合)等の個別修正は、エージェント外の問題を除き**作り替え後に再評価**する
 
 > # ✅ 現在地(2026-08-02)— **Phase 1〜4 の実装が完了し、ブラウザから通しで動く**
 >
@@ -503,7 +515,7 @@
 | # | 項目 | 詳細 |
 | --- | --- | --- |
 | 1 | **`understand` が時間指定を `unmodeled` に落とすことがある** | 「9時から17時で」が `days[].start/end` に正しく反映されているのに、`respond` が「一部システムで未処理」と述べる。**プロンプトの調整**([agent_planning_phase.md §3.1](30_design/agent_planning_phase.md) の `handling` 判定)。機能上の実害はないが、応答が分かりにくい |
-| 2 | **`ask_user` のチップのリロード復元** | `GET /thread` の `pending` は `clarify` 用の `pending_clarification` しか返さない。フロントは sessionStorage で補完している。**正しくは `messages.meta` に選択肢を載せて `pending` から返す** |
+| 2 | **`ask_user` のチップのリロード復元** | `GET /thread` の `pending` が全 kind を返していない。フロントは sessionStorage で補完している。**正しくは `messages.meta` に選択肢を載せて `pending` から返す**(**ADR-0018 の `pending_ask` 統合に合わせて直す**) |
 | 3 | **`build-geo` の徒歩 0 分問題** | 車道スナップ点が選ばれた 4 地点(赤田の大仏 119 m / 遊佐町総合運動公園 55 m / 胴腹滝 96 m / 牛渡川 289 m)は foot グラフ上で同一ノードにスナップし `walk_sec = 0` になる。**誤差は 1 地点あたり最大 ±4 分**([geo.md §2.3.1](30_design/geo.md) に記録) |
 | 4 | **ILS の最適性ギャップが未実測** | 43 地点なら厳密解が計算できる([recommendation_planning.md §7](30_design/recommendation_planning.md))。**一度だけ測ってパラメータを確定する**(現在は反復 160 回・β 0.6) |
 | 5 | **推薦スコアの同点が多い** | 粗いタグ語彙のため上位が同点で並ぶ(例: 温泉選好で 5 件が 3.5 点)。**LLM リランクが差をつける前提**の設計([ADR-0006](adr/0006-recommendation-hybrid.md))だが、重みの調整余地がある |
@@ -511,9 +523,43 @@
 | 7 | **フロントの残骸** | `PlanView.vue` / `PlanForm.vue` / `stores/counter.js` / `components/icons/*`。`PlanView` は router から参照されているので、消すなら router も直す |
 | 8 | **実機が要る検証** | 機内モードでの観光フェーズ通し / LoRa 端末での decode / TTN のダウンリンク。**現在いずれも使えないため未検証**([offline_field_mode.md §9](30_design/offline_field_mode.md)) |
 
-## I. 次にやること
+## I. 実機を触って出た課題(2026-08-03)
 
-1. **`feat/rebuild-implementation` を develop にマージするか判断する**(16 コミット)
-2. §H の 1〜2 を直す(応答の分かりにくさと復元の穴)
-3. §H の 4 を測って ILS のパラメータを確定する
-4. 実機が用意できたら §H の 8
+### I-1. UX 問題インベントリ
+
+**`http://localhost:5173/` を実際に操作した所見を [23_ux_issues.md](23_ux_issues.md) に記録した。**計画フェーズを通す 8 手のうち **3 手が行き止まり**になっている。優先度は同文書 §9。
+
+### I-2. `ask_user` を「結果を返す 1 つの Tool」に統合する(**2026-08-03 実装完了**)
+
+**[ADR-0018](adr/0018-ask-user-resumable-tool.md) で決定(2026-08-03、ユーザー指示)。[ADR-0010](adr/0010-understand-bounded-agent.md) を置き換える。**
+
+`ask_user` が 2 系統(T5 Tool と `understand` のノード内分岐)に割れており、**どちらも返り値を持たない**「呼んで終わり」の道具だった。これを **1 つの Tool + ターンの中断・復帰**に統合する。
+
+**文書は反映済み**: [ADR-0018](adr/0018-ask-user-resumable-tool.md) / [agent_planning_phase.md](30_design/agent_planning_phase.md) §1.3・§2・**§3.1**・**§3.4**・§4.1・**§5.1**・§6・§10・§15.3〜15.7・§16.5・§18.7・§19.3・§20.2・§23・§24.3 / [understand_node.md](30_design/understand_node.md) §0・§0.1 / [chat_sse.md](40_api/chat_sse.md) §1.2・**§1.4**・§3.1 / [data_model.md](30_design/data_model.md) §4.2・§4.3
+
+**実装で触るもの**
+
+| 層 | 変更 |
+| --- | --- |
+| `understand` | guided schema から `action` / `clarify` を削除。`plan` の Tool enum に `ask_user` を入れる。`tool_results` をプロンプトに載せる |
+| `guards` | G6〜G9 を `understand` から `validate_plan`/`act` 側へ移し、G1〜G5 と 1 組に統合(旧 G8 は G3 に吸収) |
+| `planner` | P5 を「末尾のみ + plan 全体で 1 手」に |
+| `tool_adapters` / `executor` | `ask_user` が `kind` を受け、`state:ask_user` / `state:clarify` を出し分ける。`pending_ask` を立てる |
+| `context` | `pending_ask` があれば答えを Tool の結果に組み立て `tool_results` に入れる。**1 ターンで失効** |
+| `repository` / DB | `threads.pending_clarification` → **`pending_ask`**、`clarify_streak` を `ask_streak` に統合(**マイグレーション**) |
+| `pipeline` | **E6 の分岐を削除** |
+| `respond` | 「聞き返し」モードを「質問」モードに統合(4 → 3) |
+| フロントエンド | **`ask_user` 専用の入力フォームを新設する**(2026-08-03 追加、ユーザー指示。[frontend_nav.md §2.3](30_design/frontend_nav.md))。`OC_AskUserForm.vue` を 1 つ足し、入力欄の直上にドッキング。**`OC_ChatMessage.vue` のチップ行は削除**(回答 UI を 2 か所に持たない)。SSE の kind と `resolves` の形は変えない |
+
+### I-3. プロンプトに「コードが検証する語彙」を載せる(**2026-08-03 実装完了**)
+
+`understand` プロンプトに**生タグ 80 語**(`static.tag_vocabulary`)と **`recommend.filter.mobility` の enum 値**ほかを載せた。**載せていなかったために、平易な発話で推薦が 0 件になっていた**([agent_planning_phase.md §7](30_design/agent_planning_phase.md) の改訂 / [23_ux_issues.md §0.3](23_ux_issues.md))。
+
+## J. 次にやること
+
+1. **[23_ux_issues.md](23_ux_issues.md) §8 の優先度順に直す。**まず **§1-1(最初の 1 手が空振り)**と **§1-2〜1-5(旅程を作ると地図が消える)**
+2. **判断を仰ぐ 2 件**: **§7-2**(引数 1 項目の不正で手を丸ごと破棄してよいか。[agent_planning_phase.md §23 論点 20](30_design/agent_planning_phase.md))/ **§7-3**(ガードレールが手を破棄したあとのフォールバック。案 A/B/C)
+3. **`feat/rebuild-implementation` を develop にマージするか判断する**
+4. §H の 1〜2 を直す(応答の分かりにくさと復元の穴)
+5. §H の 4 を測って ILS のパラメータを確定する
+6. 実機が用意できたら §H の 8
