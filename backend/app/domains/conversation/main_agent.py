@@ -10,6 +10,11 @@ Tool を実行して軌跡(§3.1 ⑤)へ積み、次の周へ進む。`done` で
 既存 Tool(`tool_adapters.ToolAdapters`)は spot_id ベースの契約のまま変更しない。
 このモジュールが「メインエージェントが書いたスポット名 → spot_id」の変換と、
 その逆(結果 → 名前空間ダイジェスト)を橋渡しする。
+
+段3で `recommend` の `_dispatch_recommend` はレコメンドサブエージェント
+(`recommend_agent.run_recommend_subagent`)を経由するようになった。
+`instruction`(自然言語)→ `filter` の翻訳はそちらが guided decoding で行い、
+このモジュールは翻訳結果をそのまま既存 Tool へ渡すだけである(§4)。
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ from app.domains.conversation.prompts import (
     main_agent_done_only_schema,
     main_agent_guided_schema,
 )
+from app.domains.conversation.recommend_agent import run_recommend_subagent
 from app.domains.conversation.state import (
     CandidateReference,
     DegradedState,
@@ -57,6 +63,7 @@ from app.domains.conversation.types import (
     MainConstraintOps,
     MainEditItineraryArgs,
     MainPlanItineraryArgs,
+    MainRecommendArgs,
     MainSearchKnowledgeArgs,
     MainToolName,
     PlanItineraryArgs,
@@ -249,6 +256,8 @@ async def run_main_agent(
             tool=tool,
             raw_args=turn.action.args,
             step_id=dispatch_index,
+            client=client,
+            event_sink=event_sink,
         )
         await emit(
             event_sink,
@@ -350,10 +359,14 @@ async def _dispatch(
     tool: str,
     raw_args: dict[str, Any],
     step_id: int,
+    client: GenerationPort,
+    event_sink: EventSinkLike,
 ) -> tuple[str, dict[str, Any] | None]:
     try:
         if tool == MainToolName.RECOMMEND.value:
-            return await _dispatch_recommend(state, tools, raw_args, step_id)
+            return await _dispatch_recommend(
+                state, tools, raw_args, step_id, client=client, event_sink=event_sink
+            )
         if tool == MainToolName.PLAN_ITINERARY.value:
             return await _dispatch_plan_itinerary(state, tools, raw_args, step_id)
         if tool == MainToolName.EDIT_ITINERARY.value:
@@ -385,10 +398,39 @@ async def _dispatch_recommend(
     tools: ConversationToolPort,
     raw_args: dict[str, Any],
     step_id: int,
+    *,
+    client: GenerationPort,
+    event_sink: EventSinkLike,
 ) -> tuple[str, dict[str, Any] | None]:
-    del raw_args  # instruction はフィルタ翻訳に使わない(段2のスコープ外・段3で実装)。
+    """§4 レコメンド SA: `instruction` → `filter` 翻訳の後、既存推薦処理へ渡す。
+
+    SA の判定 LLM(guided decoding)は `recommend_agent.run_recommend_subagent`
+    が担う。タグ 80 語・`mobility` の enum はそちらのプロンプトにだけ載る
+    (このモジュールには一切現れない。§4 の設計判断)。
+    """
+
+    parsed = MainRecommendArgs.model_validate(raw_args)
     context = _build_recommendation_context(state)
-    args = RecommendArgs(filter={}, k=5, exclude=list(state.presented_spot_ids))
+    act_result = await run_recommend_subagent(
+        instruction=parsed.instruction,
+        profile=context.profile,
+        tag_vocabulary=state.tag_vocabulary,
+        client=client,
+        event_sink=event_sink,
+    )
+    if act_result.degraded:
+        state.degraded.append(
+            DegradedState(
+                code="recommend_agent_degraded",
+                stage="recommend",
+                message="指示の翻訳に失敗し、条件を絞らずに推薦しました",
+            )
+        )
+    args = RecommendArgs(
+        filter=act_result.filter.model_dump(mode="json", exclude_none=True),
+        k=5,
+        exclude=list(state.presented_spot_ids),
+    )
     result = await tools.recommend(
         step_id=step_id,
         args=args,
@@ -399,7 +441,13 @@ async def _dispatch_recommend(
         return result.message_ja, _error_payload(result)
     state.step_results[step_id] = result
     _apply_recommend_result(state, result)
-    return _format_recommend_digest(result, state.spot_names), None
+    digest = _format_recommend_digest(
+        result,
+        state.spot_names,
+        assumptions=act_result.assumptions,
+        dropped=act_result.dropped,
+    )
+    return digest, None
 
 
 async def _dispatch_search_knowledge(
@@ -781,25 +829,38 @@ def _apply_itinerary_result(
 # ---------------------------------------------------------------------------
 
 
-def _format_recommend_digest(result: ToolResult, spot_names: dict[str, str]) -> str:
+def _format_recommend_digest(
+    result: ToolResult,
+    spot_names: dict[str, str],
+    *,
+    assumptions: list[str] | None = None,
+    dropped: list[str] | None = None,
+) -> str:
     candidates = result.data.get("candidates", [])
     if not candidates:
-        return "おすすめは見つかりませんでした。"
-    lines = ["おすすめ:"]
-    for value in candidates:
-        if not isinstance(value, dict):
-            continue
-        spot_id = value.get("spot_id")
-        name = spot_names.get(spot_id, spot_id) if isinstance(spot_id, str) else "?"
-        rank = value.get("rank", "?")
-        reason = value.get("reason_materials", {}) or {}
-        tags = reason.get("matched_tags", [])
-        travel = reason.get("travel_time_text", "")
-        detail = "、".join(str(value) for value in tags[:3]) if tags else ""
-        suffix = "".join(
-            filter(None, [f"(タグ: {detail})" if detail else "", f" {travel}" if travel else ""])
-        )
-        lines.append(f"  {rank}. {name}{suffix}")
+        lines = ["おすすめは見つかりませんでした。"]
+    else:
+        lines = ["おすすめ:"]
+        for value in candidates:
+            if not isinstance(value, dict):
+                continue
+            spot_id = value.get("spot_id")
+            name = spot_names.get(spot_id, spot_id) if isinstance(spot_id, str) else "?"
+            rank = value.get("rank", "?")
+            reason = value.get("reason_materials", {}) or {}
+            tags = reason.get("matched_tags", [])
+            travel = reason.get("travel_time_text", "")
+            detail = "、".join(str(value) for value in tags[:3]) if tags else ""
+            suffix = "".join(
+                filter(
+                    None, [f"(タグ: {detail})" if detail else "", f" {travel}" if travel else ""]
+                )
+            )
+            lines.append(f"  {rank}. {name}{suffix}")
+    if assumptions:
+        lines.append("置いた仮定: " + "、".join(assumptions))
+    if dropped:
+        lines.append("除外した条件: " + "、".join(dropped))
     return "\n".join(lines)
 
 

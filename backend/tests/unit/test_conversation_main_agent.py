@@ -31,6 +31,35 @@ def _turn_json(tool: str, args: dict[str, Any], *, thought: str = "考える") -
     )
 
 
+def _recommend_act_json(
+    *,
+    filter: dict[str, Any] | None = None,
+    assumptions: list[str] | None = None,
+    thought: str = "条件を考える",
+) -> str:
+    """段3: レコメンド SA の判定 LLM(`recommend_agent`)の guided 応答。
+
+    `run_main_agent` は `recommend` action を実行するたびに、まずこの SA を
+    1 回呼んでから既存のレコメンド処理へ渡す。`ScriptedMainAgentClient` は
+    メインループと SA で同じ応答キューを共有するため、`recommend` action の
+    直後にはこの形の応答を 1 つ挟む。
+    """
+
+    return json.dumps(
+        {
+            "thought": thought,
+            "action": {
+                "tool": "done",
+                "args": {
+                    "filter": filter or {},
+                    "assumptions": assumptions or [],
+                },
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
 class ScriptedMainAgentClient:
     """`generate()` を呼ぶたびに、スクリプトした応答を 1 つずつ返す。"""
 
@@ -93,6 +122,9 @@ def _state() -> TurnState:
         spot_id_vocab=list(spots),
         spot_names={key: value.name_ja for key, value in spots.items()},
         spot_catalog=spots,
+        # レコメンド SA の guided schema/検証が読む生タグ 80 語相当(§4)。
+        # テストでは実データを模した小さな語彙で十分。
+        tag_vocabulary=["自然", "滝", "登山", "温泉"],
         default_origin_spot_id="spot_001",
     )
 
@@ -171,12 +203,15 @@ async def test_recommend_then_done_completes_in_two_turns() -> None:
     client = ScriptedMainAgentClient(
         [
             _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _recommend_act_json(filter={"tags": ["滝"]}),
             _turn_json("done", {}),
         ]
     )
 
     await run_main_agent(state, tools=tools, client=client)
 
+    # main_agent_turns はメインループの周回だけを数える(SA の判定 LLM は
+    # 別カウンタで、main_agent_turns には含まれない)。
     assert state.main_agent_turns == 2
     assert state.executed_tool_count == 1
     assert [call[0] for call in tools.calls] == ["recommend"]
@@ -185,6 +220,113 @@ async def test_recommend_then_done_completes_in_two_turns() -> None:
     assert "鶴間池" in state.trajectory[0].observation
     assert "spot_001" not in state.trajectory[0].observation
     assert state.step_results[1].tool is ToolName.RECOMMEND
+    # SA が翻訳した filter がそのまま既存のレコメンド処理へ渡っている。
+    recommend_call = next(call for call in tools.calls if call[0] == "recommend")
+    assert recommend_call[1]["args"].filter == {"tags": ["滝"]}
+
+
+async def test_recommend_dispatch_drops_invalid_tag_element_and_keeps_valid() -> None:
+    """23_ux_issues.md §0.3 / §7-2 の実害シナリオ(C4: 要素単位で落とす)。
+
+    「滝や湧水などの自然が好きです。車で回ります」のような指示から、SA が
+    実在しないタグ(「山」)や不正な mobility(「car」— 歩行耐性ではなく
+    移動手段)を返しても、その要素だけが落ち、有効な「滝」は残ったまま
+    既存のレコメンド処理が実行される(0 件応答にしない)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [_recommend_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", {"instruction": "滝や湧水が好きです。車で回ります"}),
+            _recommend_act_json(filter={"tags": ["滝", "山"], "mobility": "car"}),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    recommend_call = next(call for call in tools.calls if call[0] == "recommend")
+    # 「山」はタグ語彙に無いため落ち、「滝」だけが残る。mobility の
+    # "car" も enum(avoid_walk/short_walk_ok/hike_ok)に無いため落ちる。
+    assert recommend_call[1]["args"].filter == {"tags": ["滝"]}
+    assert "mobility" not in recommend_call[1]["args"].filter
+    # 落とした事実は結果ダイジェスト(このターンの軌跡)に必ず現れる(無言破棄の禁止)。
+    observation = state.trajectory[0].observation
+    assert "山" in observation
+    assert "car" in observation
+    assert "除外した条件" in observation
+
+
+async def test_recommend_dispatch_executes_with_empty_filter_when_all_elements_invalid() -> None:
+    """C4: 全要素が不正でも filter なしで実行し、0 件応答にしない。"""
+
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [_recommend_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", {"instruction": "よくわからないけど何か教えて"}),
+            _recommend_act_json(filter={"tags": ["架空タグ"], "mobility": "car"}),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    recommend_call = next(call for call in tools.calls if call[0] == "recommend")
+    # tags/mobility とも全滅しても、生き残った要素だけの filter(= 実質
+    # 絞り込み無し)になり、tools.recommend は実行される(手ごと破棄されない)。
+    assert recommend_call[1]["args"].filter == {"tags": []}
+    assert [call[0] for call in tools.calls] == ["recommend"]
+    assert state.trajectory[0].error is None
+
+
+async def test_recommend_dispatch_reports_assumptions_in_digest() -> None:
+    """A7: 質問できない場面では仮定して推薦し、置いた仮定を結果で報告する。"""
+
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [_recommend_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", {"instruction": "おすすめを教えて"}),
+            _recommend_act_json(
+                filter={},
+                assumptions=["同行者の情報が無いため、対象者は絞りませんでした"],
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    observation = state.trajectory[0].observation
+    assert "置いた仮定" in observation
+    assert "同行者の情報が無いため、対象者は絞りませんでした" in observation
+
+
+async def test_recommend_dispatch_falls_back_to_no_filter_when_subagent_call_fails() -> None:
+    """SA の判定 LLM 呼び出し自体が壊れても、推薦そのものは止めない(NFR-5)。"""
+
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [_recommend_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", {"instruction": "おすすめを教えて"}),
+            "not a json",
+            "not a json",  # 再試行後も契約違反 → SA はフォールバックする
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    recommend_call = next(call for call in tools.calls if call[0] == "recommend")
+    assert recommend_call[1]["args"].filter == {"tags": []}
+    assert any(value.code == "recommend_agent_degraded" for value in state.degraded)
 
 
 async def test_search_knowledge_then_done_completes_in_two_turns() -> None:
@@ -278,6 +420,7 @@ async def test_r3_repeated_action_is_not_executed_twice() -> None:
     client = ScriptedMainAgentClient(
         [
             _turn_json("recommend", same_args),
+            _recommend_act_json(),
             _turn_json("recommend", same_args),
             _turn_json("done", {}),
         ]
@@ -305,6 +448,7 @@ async def test_tool_error_recoverable_continues_loop() -> None:
     client = ScriptedMainAgentClient(
         [
             _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _recommend_act_json(),
             _turn_json("search_knowledge", {"request": "由来", "spot_name": None}),
             _turn_json("done", {}),
         ]
@@ -332,6 +476,7 @@ async def test_tool_error_non_recoverable_aborts_loop() -> None:
     client = ScriptedMainAgentClient(
         [
             _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _recommend_act_json(),
             _turn_json("search_knowledge", {"request": "この行は呼ばれない", "spot_name": None}),
         ]
     )
@@ -340,7 +485,10 @@ async def test_tool_error_non_recoverable_aborts_loop() -> None:
     await run_main_agent(state, tools=tools, client=client, event_sink=sink)
 
     assert [call[0] for call in tools.calls] == ["recommend"]
-    assert len(client.calls) == 1
+    # 1回目はメインループの action 選択、2回目はレコメンド SA の判定 LLM。
+    # ToolError(非回復)でループが打ち切られるため、3個目(search_knowledge 用)
+    # は消費されない。
+    assert len(client.calls) == 2
     assert state.trajectory[0].error["recoverable"] is False
     error_events = [event for event in sink.events if event.event == "error"]
     assert error_events[0].data["stage"] == "recommend"
@@ -354,6 +502,7 @@ async def test_state_step_fires_started_then_finished_and_never_plan() -> None:
     client = ScriptedMainAgentClient(
         [
             _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _recommend_act_json(),
             _turn_json("done", {}),
         ]
     )
@@ -366,7 +515,8 @@ async def test_state_step_fires_started_then_finished_and_never_plan() -> None:
         for event in sink.events
         if event.event == "state"
     ]
-    assert kinds_and_status == [("step", "started"), ("step", "finished")]
+    # started(メイン) → progress(レコメンド SA の判定 LLM 実行中) → finished。
+    assert kinds_and_status == [("step", "started"), ("step", "progress"), ("step", "finished")]
     assert all(value[0] != "plan" for value in kinds_and_status)
 
 

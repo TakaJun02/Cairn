@@ -37,6 +37,20 @@ def _done_json() -> str:
     return _turn_json("done", {})
 
 
+def _recommend_act_json(
+    *, filter: dict[str, Any] | None = None, assumptions: list[str] | None = None
+) -> str:
+    """段3: レコメンド SA(`recommend_agent.run_recommend_subagent`)の guided 応答。
+
+    `recommend` action を実行するたびに、既存のレコメンド処理の前に SA の
+    判定 LLM が 1 回挟まる。`TurnClient` は update_profile/main_agent/SA の
+    区別なく `generate()` 呼び出し順にキューを消費するため、`recommend`
+    action の直後にはこの形の応答を 1 つ挟む。
+    """
+
+    return _turn_json("done", {"filter": filter or {}, "assumptions": assumptions or []})
+
+
 def _update_profile_output(
     *,
     profile_delta: dict[str, Any] | None = None,
@@ -194,6 +208,7 @@ async def test_simple_recommend_turn_completes_end_to_end() -> None:
         [
             _update_profile_output(),
             _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _recommend_act_json(),
             _done_json(),
         ],
         response_chunks=["鶴間池をご案内します。", "今回考慮した条件: なし。"],
@@ -214,12 +229,15 @@ async def test_simple_recommend_turn_completes_end_to_end() -> None:
         "state",
         "state",
         "state",
+        "state",
         "token",
         "token",
         "done",
     ]
     kinds = [event.data.get("kind") for event in sink.events if event.event == "state"]
-    assert kinds == ["step", "candidates", "candidates", "step"]
+    # started(メイン) → progress(レコメンド SA の判定 LLM 実行中) →
+    # candidates(provisional/final) → finished(メイン)。
+    assert kinds == ["step", "step", "candidates", "candidates", "step"]
     assert sink.events[0].data == {
         "kind": "step",
         "tool": "recommend",
@@ -269,6 +287,7 @@ async def test_respond_input_includes_this_turns_trajectory() -> None:
         [
             _update_profile_output(),
             _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _recommend_act_json(),
             _done_json(),
         ],
         response_chunks=["鶴間池をご案内します。"],
@@ -281,8 +300,9 @@ async def test_respond_input_includes_this_turns_trajectory() -> None:
         tools=tools,
     ).run(user_id=1, utterance="おすすめは？")
 
-    # generate_calls: [update_profile, main_agent#1, main_agent#2] → stream() は
-    # 別カウントなので最後の呼び出しが respond のメッセージになる。
+    # generate_calls: [update_profile, main_agent#1(recommend action),
+    # レコメンド SA の判定 LLM, main_agent#2(done)] → stream() は別カウント
+    # なので最後の呼び出しは main_agent#2(done)のメッセージになる。
     respond_messages = client.generate_calls[-1]
     respond_dynamic = respond_messages[1]["content"]
     assert "tool=recommend" in respond_dynamic
@@ -300,7 +320,11 @@ async def test_non_recoverable_tool_error_still_reaches_persist_and_done() -> No
         )
     ]
     client = TurnClient(
-        [_update_profile_output(), _turn_json("recommend", {"instruction": "滝が見たい"})],
+        [
+            _update_profile_output(),
+            _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _recommend_act_json(),
+        ],
         response_chunks=["申し訳ありません、処理できませんでした。"],
     )
 
