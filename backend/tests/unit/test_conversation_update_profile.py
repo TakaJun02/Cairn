@@ -30,6 +30,18 @@ class ScriptedClient:
         return self.response
 
 
+class SequencedClient:
+    """`generate()` を呼ぶたびに、キューした応答を1つずつ返す(再試行検証用)。"""
+
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    async def generate(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+        self.calls.append({"messages": messages, **kwargs})
+        return self.responses.pop(0)
+
+
 def _output(
     profile_delta: dict[str, Any] | None = None,
     score_adjustments: list[dict[str, Any]] | None = None,
@@ -187,6 +199,70 @@ async def test_generation_failure_degrades_without_raising() -> None:
     assert state.profile_delta is None
     assert sink.events == []
     assert state.degraded[0].code == "update_profile_failed"
+
+
+async def test_broken_guided_json_retries_without_guided_and_succeeds() -> None:
+    """不具合1の是正: guided decoding が壊れた JSON を返しても、guided を
+    外した再試行(`prompts.build_update_profile_fallback_messages`)で
+    1 回だけ立て直す。2026-08-04 実機調査で vLLM/xgrammar の guided
+    decoding が無限空白ループに陥り JSON が壊れる不具合を確認した際の
+    実際の壊れ方(数値を書いた直後で途切れる)を模している。
+    """
+
+    broken = (
+        '{"profile_delta": null, "score_adjustments": '
+        '[{"spot_id": "spot_001", "delta": -0.1   '
+    )
+    # フォールバックはコードフェンス付き・guided 前提の schema.enum に無い
+    # 値(-100)で返ってもクランプで復元できることも合わせて確認する。
+    recovered = (
+        "```json\n"
+        + json.dumps(
+            {
+                "profile_delta": None,
+                "score_adjustments": [
+                    {
+                        "spot_id": "spot_001",
+                        "delta": -100,
+                        "why": "ユーザーが除外を希望したため",
+                        "handling": "weight",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n```"
+    )
+    state = _state()
+    client = SequencedClient([broken, recovered])
+
+    await update_profile(state, client=client)
+
+    assert len(client.calls) == 2
+    assert state.log_fields.get("update_profile_failed") is None
+    assert "extra_body" in client.calls[0]  # 1回目は guided decoding
+    assert client.calls[1].get("extra_body") is None  # 2回目は guided を外す
+    assert [value.spot_id for value in state.score_adjustments] == ["spot_001"]
+    assert state.score_adjustments[0].delta == -0.5  # クランプされる(範囲外の -100 → -0.5)
+    assert state.degraded == []
+
+
+async def test_broken_guided_json_both_attempts_fail_degrades() -> None:
+    """再試行も壊れていれば、従来どおり縮退して差分なしで続行する(NFR-5)。"""
+
+    broken1 = '{"profile_delta": null, "score_adjustments": [{"spot_id": "spot_001"   '
+    broken2 = "not json at all"
+    state = _state()
+    sink = MemoryEventSink()
+    client = SequencedClient([broken1, broken2])
+
+    await update_profile(state, client=client, event_sink=sink)
+
+    assert len(client.calls) == 2
+    assert state.profile_delta is None
+    assert sink.events == []
+    assert state.degraded[0].code == "update_profile_failed"
+    assert state.log_fields.get("update_profile_failed") is True
 
 
 def test_is_profile_delta_empty() -> None:

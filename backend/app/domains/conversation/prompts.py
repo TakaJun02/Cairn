@@ -76,6 +76,33 @@ update_profile ステップです。
 """
 
 
+# 2026-08-04 実機調査(不具合1): vLLM/xgrammar の guided decoding が、この
+# update_profile のスキーマ+プロンプトの組み合わせで無限空白ループに陥り
+# JSON が壊れたまま max_tokens で打ち切られる不具合を実機(127.0.0.1:8000、
+# google/gemma-4-31B-it-qat-w4a16-ct)で確認した。schema 側の number の
+# minimum/maximum・enum 化・入れ子の複雑さ・temperature のいずれを変えても
+# 再現し、guided decoding(response_format)自体を外すと同じ入力から即座に
+# 正しい JSON が返ることを確認済み。そのため 1 回目が壊れたら、
+# `main_agent._call_main_agent` のような「同じ guided 呼び出しの再試行」
+# ではなく、guided を外してテキスト指示で JSON 1 個を書かせる形で再試行する
+# (`update_profile.py` の `_generate_update_profile` から使う)。
+UPDATE_PROFILE_FALLBACK_NOTE = f"""
+【再試行(guided decoding 無し)】
+今回は JSON Schema の強制無しで生成します。次の形の JSON オブジェクトを
+1 個だけ出力してください。コードフェンス(```)や説明文は付けません。
+{{"profile_delta": null または
+  {{"interests": {{選好キー({_PREFERENCE_VOCABULARY})の一部を任意で、値は -1.0〜1.0}},
+   "party": null または "family_kids"|"couple"|"solo"|"senior"|"group",
+   "mobility": null または {_MOBILITY_VOCABULARY} のいずれか,
+   "pace": null または "packed"|"relaxed",
+   "avoid": [文字列, ...],
+   "notes": null または文字列}},
+ "score_adjustments": [{{"spot_id": "②の spot_id 語彙のいずれか",
+   "delta": -0.5〜0.5 の数値, "why": "理由の短文",
+   "handling": "weight"}}, ...](無ければ空配列)}}
+"""
+
+
 MAIN_AGENT_SYSTEM_PROMPT = f"""あなたは鳥海山観光ガイダンスの
 ReAct メインエージェントです。
 1 周ごとに「考えて、一手打つ」を繰り返します。指定された JSON Schema の
@@ -192,6 +219,25 @@ def build_update_profile_messages(
     ]
 
 
+def build_update_profile_fallback_messages(
+    messages: list[dict[str, str]], *, reason: str
+) -> list[dict[str, str]]:
+    """guided decoding が壊れたときの再試行用メッセージ(不具合1の是正)。
+
+    `build_update_profile_messages` が組み立てた ①〜④ の内容はそのまま
+    保ち、guided decoding を外す旨とスキーマの説明をテキストで追記する。
+    `UPDATE_PROFILE_FALLBACK_NOTE` の由来は同モジュールの調査コメントを
+    参照。
+    """
+
+    retry_messages = [dict(value) for value in messages]
+    retry_messages[-1] = dict(retry_messages[-1])
+    retry_messages[-1]["content"] += (
+        f"\n\n【1 回目の失敗理由】{reason[:240]}\n" + UPDATE_PROFILE_FALLBACK_NOTE
+    )
+    return retry_messages
+
+
 def update_profile_guided_schema(spot_ids: list[str]) -> dict[str, Any]:
     """N1.5 `update_profile` の guided JSON schema。`uniqueItems` は使わない。"""
 
@@ -241,7 +287,7 @@ def build_main_agent_messages(
         + "\n有効な制約:\n"
         + _compact_json(constraints_digest),
         "④ 会話履歴:\n" + (state.history or "(なし)"),
-        "⑤ このターンの軌跡:\n" + _trajectory_text(state.trajectory),
+        "⑤ このターンの軌跡:\n" + trajectory_text(state.trajectory),
     ]
     if reduced:
         sections.append(
@@ -269,7 +315,7 @@ def build_respond_messages(
     dynamic = "\n\n".join(
         [
             f"mode: {mode.value}",
-            "① このターンの軌跡:\n" + _trajectory_text(state.trajectory),
+            "① このターンの軌跡:\n" + trajectory_text(state.trajectory),
             "② 譲歩・縮退:\n" + degraded_json,
             "③ 会話履歴:\n" + (state.history or "(なし)"),
             "④ ユーザーの発話:\n" + state.utterance,
@@ -668,7 +714,7 @@ def _score_adjustments_schema(
     }
 
 
-def _trajectory_text(trajectory: Sequence[TrajectoryStep]) -> str:
+def trajectory_text(trajectory: Sequence[TrajectoryStep]) -> str:
     if not trajectory:
         return "(まだありません)"
     lines: list[str] = []

@@ -94,10 +94,17 @@ class ProfileDelta(ConversationModel):
     def validate_interests(
         cls, values: dict[PreferenceKey, float]
     ) -> dict[PreferenceKey, float]:
+        # 2026-08-04 実機調査(不具合1): guided JSON の minimum/maximum は
+        # vLLM/xgrammar 側で確実に強制されるとは限らない(update_profile.py
+        # の調査コメント参照)。範囲外は棄てず -1.0〜1.0 にクランプする
+        # (NFR-5: 抽出ステップの部分的な逸脱でターン全体を落とさない)。
+        # 非有限値(NaN/Infinity)だけは異常値として引き続き拒否する。
+        result: dict[PreferenceKey, float] = {}
         for key, value in values.items():
-            if not math.isfinite(value) or not -1.0 <= value <= 1.0:
-                raise ValueError(f"interests.{key.value} は -1.0〜1.0 にしてください")
-        return values
+            if not math.isfinite(value):
+                raise ValueError(f"interests.{key.value} は有限の値にしてください")
+            result[key] = max(-1.0, min(1.0, value))
+        return result
 
     @field_validator("avoid")
     @classmethod
@@ -153,9 +160,12 @@ class ScoreAdjustment(ConversationModel):
     @field_validator("delta")
     @classmethod
     def validate_delta(cls, value: float) -> float:
-        if not math.isfinite(value) or not -0.5 <= value <= 0.5:
-            raise ValueError("score_adjustments.delta は -0.5〜0.5 にしてください")
-        return value
+        # 2026-08-04 実機調査(不具合1): ProfileDelta.validate_interests と同じ
+        # 理由でクランプにする(guided decoding が壊れて外した再試行では
+        # minimum/maximum の強制自体が無い)。非有限値だけ拒否する。
+        if not math.isfinite(value):
+            raise ValueError("score_adjustments.delta は有限の値にしてください")
+        return max(-0.5, min(0.5, value))
 
 
 class UpdateProfileOutput(ConversationModel):

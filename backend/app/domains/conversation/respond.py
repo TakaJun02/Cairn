@@ -18,7 +18,7 @@ from typing import Any, Protocol, runtime_checkable
 from app.core.llm import GenerationClient
 from app.domains.conversation.events import EventSinkLike, emit, error_event, token_event
 from app.domains.conversation.guards import has_repeated_ngram, validate_response_spot_names
-from app.domains.conversation.prompts import build_respond_messages
+from app.domains.conversation.prompts import build_respond_messages, trajectory_text
 from app.domains.conversation.state import DegradedState, TurnState
 from app.domains.conversation.types import ResponseMode
 
@@ -192,6 +192,20 @@ def _allowed_spot_ids(state: TurnState) -> set[str]:
             values.add(day.origin.spot_id)
             values.update(item.spot_id for item in day.items)
             values.add(day.destination.spot_id)
+    # 不具合2の是正(2026-08-04 実機調査): 上の構造化フィールドだけでは、
+    # recommend の移動時間文(「〈起点施設〉から車で約 25 分」)に出る起点や、
+    # 旅程ダイジェストの整形文にだけ現れる地点名を拾えず、respond がそれを
+    # 使うと誤って closed-world 違反として検知していた
+    # (`response_closed_world_violation`: 「鳥海高原家族旅行村」が未提示扱い
+    # になった実機ログを確認)。`trajectory_text` は respond が実際に読む
+    # ①軌跡の本文そのものなので、そこに登場するスポット名は無条件で
+    # 許可する(起点・終点を含め、素材に出た名前を respond が使うのは正当)。
+    material_text = trajectory_text(state.trajectory)
+    values.update(
+        spot_id
+        for spot_id, name in state.spot_names.items()
+        if name and name in material_text
+    )
     return values
 
 
