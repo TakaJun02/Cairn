@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal, Protocol, TypeAlias
+from typing import Any, Literal, Protocol, TypeAlias, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
+
+logger = logging.getLogger("app.conversation.events")
 
 
 class ConversationEvent(BaseModel):
@@ -75,14 +78,34 @@ ErrorStage = Literal[
     "persist",
 ]
 
+_VALID_ERROR_STAGES: frozenset[str] = frozenset(get_args(ErrorStage))
+_FALLBACK_ERROR_STAGE: ErrorStage = "main_agent"
+
 
 def error_event(
     *,
-    stage: ErrorStage,
+    stage: str,
     code: str,
     degraded: bool,
     message: str,
 ) -> ConversationEvent:
+    """`error` イベントを組み立てる。
+
+    `stage` は API 契約(`ErrorStage`)の語彙で検証する(2026-08-04、レビュー
+    是正: Critical)。旧実装は `"act"` のような契約外の値をそのまま
+    `ChatEventBuffer.emit` まで運び、Pydantic 検証で例外を投げていた
+    ([chat_sse.md §1.2](../../../../Docs/40_api/chat_sse.md))。ここで**構築時に**
+    検証し、不正なら安全側(`main_agent`)へ落としてログするため、Tool の
+    結果適用の途中で例外が伝播して不変条件(persist に必ず到達)を壊すことが
+    なくなる。
+    """
+
+    if stage not in _VALID_ERROR_STAGES:
+        logger.warning(
+            "invalid_error_stage",
+            extra={"stage": stage, "code": code, "message": message},
+        )
+        stage = _FALLBACK_ERROR_STAGE
     return ConversationEvent(
         event="error",
         data={

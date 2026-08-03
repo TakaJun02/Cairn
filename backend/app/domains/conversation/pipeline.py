@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,7 +28,11 @@ from app.domains.conversation.events import (
     error_event,
 )
 from app.domains.conversation.main_agent import run_main_agent
-from app.domains.conversation.persist import PersistRepositoryPort, persist
+from app.domains.conversation.persist import (
+    HistoryRepositoryFactory,
+    PersistRepositoryPort,
+    persist,
+)
 from app.domains.conversation.respond import RespondGenerationError, respond
 from app.domains.conversation.state import TurnState
 from app.domains.conversation.tool_ports import ConversationToolPort
@@ -144,6 +150,7 @@ class ConversationPipeline:
                 repository=self.repository,  # type: ignore[arg-type]
                 event_sink=self.event_sink,
                 history_client=self.llm_client,  # type: ignore[arg-type]
+                history_repository_factory=self._history_repository_factory(),
             )
         except Exception:
             logger.exception("conversation_persist_failed")
@@ -168,6 +175,31 @@ class ConversationPipeline:
                     degraded=bool(state.degraded),
                 ),
             )
+
+    def _history_repository_factory(self) -> HistoryRepositoryFactory | None:
+        """履歴要約(§8・裁定19)がバックグラウンドで使う、独立セッションの factory。
+
+        `self.settings` が無ければ(テストの既定経路)`None` を返し、
+        `persist()` が `repository` をそのまま使う後方互換経路へフォールバック
+        する。本番は必ず `settings` が渡るため、常にこの独立セッション経路
+        (`persist()` を呼び出したセッションが閉じても要約タスクは動き続ける)
+        を通る。
+        """
+
+        if self.settings is None:
+            return None
+        settings = self.settings
+
+        @asynccontextmanager
+        async def factory() -> AsyncIterator[Any]:
+            from app.core.db import get_session_factory
+            from app.domains.conversation.repository import ConversationRepository
+
+            session_factory = get_session_factory(settings)
+            async with session_factory() as session:
+                yield ConversationRepository(session)
+
+        return factory
 
     def _default_tools(self, state: TurnState) -> ConversationToolPort:
         from app.domains.conversation.tool_adapters import ToolAdapters

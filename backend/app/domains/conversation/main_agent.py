@@ -262,7 +262,7 @@ async def run_main_agent(
                 label_ja=_STEP_LABELS[tool]["started"],
             ),
         )
-        observation, error_payload = await _dispatch(
+        observation, error_payload, executed = await _dispatch(
             state,
             tools,
             tool=tool,
@@ -289,7 +289,12 @@ async def run_main_agent(
                 error=error_payload,
             )
         )
-        executed_count += 1
+        # R1(§3.5・§10): 手数上限は「実行された手」だけを数える
+        # (2026-08-04、レビュー是正・裁定18)。`ask_user` がガード
+        # (R4/A1〜A6)で実行されなかった場合は、選ばれただけで実際には
+        # 何も起きていないので加算しない。
+        if executed:
+            executed_count += 1
         if error_payload is not None and not error_payload.get("recoverable", True):
             await emit(
                 event_sink,
@@ -373,20 +378,33 @@ async def _dispatch(
     step_id: int,
     client: GenerationPort,
     event_sink: EventSinkLike,
-) -> tuple[str, dict[str, Any] | None]:
+) -> tuple[str, dict[str, Any] | None, bool]:
+    """`(observation, error_payload, executed)` を返す。
+
+    `executed` は R1(§3.5)が数える「実行された手」の判定に使う
+    (2026-08-04、レビュー是正・裁定18)。`ask_user` 以外は Tool が
+    ディスパッチされた時点で必ず何か実行されるため常に `True`。`ask_user`
+    だけはガード(R4/A1〜A6)で実行されないことがあるため、
+    `_dispatch_ask_user` の判定をそのまま伝える。
+    """
+
     try:
         if tool == MainToolName.RECOMMEND.value:
-            return await _dispatch_recommend(
+            observation, error = await _dispatch_recommend(
                 state, tools, raw_args, step_id, client=client, event_sink=event_sink
             )
+            return observation, error, True
         if tool == MainToolName.PLAN_ITINERARY.value:
-            return await run_plan_itinerary(state, tools, raw_args, step_id)
+            observation, error = await run_plan_itinerary(state, tools, raw_args, step_id)
+            return observation, error, True
         if tool == MainToolName.EDIT_ITINERARY.value:
-            return await run_edit_itinerary(state, tools, raw_args, step_id)
+            observation, error = await run_edit_itinerary(state, tools, raw_args, step_id)
+            return observation, error, True
         if tool == MainToolName.SEARCH_KNOWLEDGE.value:
-            return await _dispatch_search_knowledge(
+            observation, error = await _dispatch_search_knowledge(
                 state, tools, raw_args, step_id, client=client, event_sink=event_sink
             )
+            return observation, error, True
         if tool == MainToolName.ASK_USER.value:
             return await _dispatch_ask_user(
                 state, tools, raw_args, step_id, client=client, event_sink=event_sink
@@ -399,7 +417,7 @@ async def _dispatch(
             recoverable=False,
             details={"error_type": type(exc).__name__},
         )
-        return error.message_ja, _error_payload(error)
+        return error.message_ja, _error_payload(error), True
     raise AssertionError(f"未対応の Tool です: {tool}")  # pragma: no cover
 
 
@@ -428,10 +446,9 @@ async def _dispatch_recommend(
     """
 
     parsed = MainRecommendArgs.model_validate(raw_args)
-    context = build_recommendation_context(state)
     act_result = await run_recommend_subagent(
         instruction=parsed.instruction,
-        profile=context.profile,
+        profile=build_recommendation_context(state).profile,
         tag_vocabulary=state.tag_vocabulary,
         client=client,
         event_sink=event_sink,
@@ -447,6 +464,15 @@ async def _dispatch_recommend(
                 message="指示の翻訳に失敗し、条件を絞らずに推薦しました",
             )
         )
+    # 2026-08-04 レビュー是正(High・裁定3b): SA が ask_user で質問した場合、
+    # `state.profile`/`state.score_adjustments` はターン内で既に更新されて
+    # いる(§2・§4「回答 → update_profile → 更新後プロフィールで続行」)。
+    # ここで `RecommendationContext` を**実推薦の直前に**作り直すことで、
+    # 回答内容(interests/party/mobility 等だけでなく score_adjustments も)を
+    # 実際のスコアリング・リランクへ反映する。SA 実行前に作った context を
+    # 使い回すと、質問の回答が候補抽出・スコアへ一切効かなかった
+    # (2026-08-04 レビュー指摘の実バグ)。
+    context = build_recommendation_context(state)
     args = RecommendArgs(
         filter=act_result.filter.model_dump(mode="json", exclude_none=True),
         k=5,
@@ -544,10 +570,18 @@ async def _dispatch_search_knowledge(
         )
         return outcome.digest
 
+    # 2026-08-04 レビュー是正(Medium・裁定16): R4 に到達済みなら
+    # `ask_callback` 自体を渡さない。`KnowledgeSearchAgent._available_tools`
+    # は `ask_callback is None` のとき `ask_user` を guided schema の enum
+    # から外すため、narration 側にカウンタを持ち込まずに同じ効果を得られる
+    # (narration → conversation の逆依存を作らない設計を保つ)。
+    ask_budget_available = (
+        state.ask_user_count < MAX_ASK_USER_PER_TURN and state.ask_streak < MAX_ASK_STREAK
+    )
     result = await tools.search_knowledge(
         step_id=step_id,
         args=SearchKnowledgeArgs(request=parsed.request, spot_id=spot_id),
-        ask_callback=ask_callback,
+        ask_callback=ask_callback if ask_budget_available else None,
     )
     if isinstance(result, ToolError):
         return result.message_ja, _error_payload(result)
@@ -564,7 +598,7 @@ async def _dispatch_ask_user(
     *,
     client: GenerationPort,
     event_sink: EventSinkLike,
-) -> tuple[str, dict[str, Any] | None]:
+) -> tuple[str, dict[str, Any] | None, bool]:
     """メインエージェント自身の `ask_user`(§3.3・§7)。
 
     メインエージェントは spot_id を見ない・書かないため(§3.3)、
@@ -576,6 +610,19 @@ async def _dispatch_ask_user(
     parsed = AskUserArgs.model_validate(raw_args)
     if parsed.kind == "clarify":
         context = _name_context(state)
+        # A6(2026-08-04、レビュー是正・裁定17。最小実装): `surface` 自体が
+        # 既に一意に解決できるなら「念のための確認」なので聞かない。
+        surface_match = context.resolve_detailed(parsed.surface or "")
+        if surface_match.status == "resolved":
+            resolved_name = state.spot_names.get(
+                surface_match.spot_id or "", surface_match.spot_id or ""
+            )
+            return (
+                f"「{parsed.surface}」は{resolved_name}として解決済みです。"
+                "聞き返さずにそのまま進めてください。",
+                None,
+                False,
+            )
         unresolved: list[str] = []
         resolved_options: list[AskUserOption] = []
         for option in parsed.options:
@@ -590,6 +637,7 @@ async def _dispatch_ask_user(
                 f"({'、'.join(unresolved)} を地点として解決できません)。"
                 "最も妥当な解釈を採って進めてください。",
                 None,
+                False,
             )
         parsed = parsed.model_copy(update={"options": resolved_options})
 
@@ -604,7 +652,7 @@ async def _dispatch_ask_user(
         allowed_spot_ids=allowed_spot_ids,
         existing_spot_ids=allowed_spot_ids,
     )
-    return outcome.digest, outcome.error
+    return outcome.digest, outcome.error, outcome.executed
 
 
 # ---------------------------------------------------------------------------

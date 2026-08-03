@@ -121,6 +121,59 @@ async def test_score_adjustments_out_of_vocabulary_are_dropped() -> None:
     assert [value.spot_id for value in state.score_adjustments] == ["spot_001"]
 
 
+async def test_score_adjustments_merge_across_reruns_instead_of_replacing() -> None:
+    """裁定13(2026-08-04レビュー是正): `ask_user` の回答に対して本ステップを
+
+    ターン内でもう 1 回走らせても(§2・§7)、ターン冒頭の発話由来の
+    score_adjustments は消えない(置換ではなくマージ。同じ spot_id は
+    後勝ちで上書き)。
+    """
+
+    state = _state()
+    first_pass = _output(
+        score_adjustments=[
+            {"spot_id": "spot_001", "delta": 0.3, "why": "静か", "handling": "weight"},
+        ]
+    )
+    await update_profile(state, client=ScriptedClient(first_pass))
+    assert [value.spot_id for value in state.score_adjustments] == ["spot_001"]
+
+    second_pass = _output(
+        score_adjustments=[
+            {"spot_id": "spot_002", "delta": 0.4, "why": "回答後の追加", "handling": "weight"},
+        ]
+    )
+    await update_profile(
+        state,
+        client=ScriptedClient(second_pass),
+        utterance_override="(質問: どのくらい歩けますか) 30分程度なら",
+    )
+
+    ids = {value.spot_id for value in state.score_adjustments}
+    assert ids == {"spot_001", "spot_002"}
+
+
+async def test_score_adjustments_merge_overwrites_same_spot_id_with_the_latest() -> None:
+    state = _state()
+    first_pass = _output(
+        score_adjustments=[
+            {"spot_id": "spot_001", "delta": 0.3, "why": "静か", "handling": "weight"},
+        ]
+    )
+    await update_profile(state, client=ScriptedClient(first_pass))
+
+    second_pass = _output(
+        score_adjustments=[
+            {"spot_id": "spot_001", "delta": -0.1, "why": "撤回", "handling": "weight"},
+        ]
+    )
+    await update_profile(state, client=ScriptedClient(second_pass))
+
+    assert len(state.score_adjustments) == 1
+    assert state.score_adjustments[0].delta == -0.1
+    assert state.score_adjustments[0].why == "撤回"
+
+
 async def test_generation_failure_degrades_without_raising() -> None:
     class FailingClient:
         async def generate(self, messages: list[dict[str, str]], **kwargs: Any) -> str:

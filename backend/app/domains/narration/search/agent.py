@@ -336,7 +336,10 @@ class KnowledgeSearchAgent:
     ) -> SearchResult | ToolError:
         self._reset(request, spot_id)
         try:
-            async with asyncio.timeout(self.timeout_seconds):
+            async with asyncio.timeout(self.timeout_seconds) as handle:
+                # `ask_user` 待機中に締切を一時解除できるよう、Timeout
+                # ハンドルを保持しておく(§6・裁定10)。
+                self._timeout_handle = handle
                 return await self._run()
         except TimeoutError:
             self._sync_trace()
@@ -345,6 +348,8 @@ class KnowledgeSearchAgent:
                 message_ja="知識検索が時間内に完了しませんでした。",
                 details={"timeout_seconds": self.timeout_seconds},
             )
+        finally:
+            self._timeout_handle = None
 
     async def _run(self) -> SearchResult:
         for round_number in range(1, self.recursion_safety_limit + 1):
@@ -639,6 +644,29 @@ class KnowledgeSearchAgent:
             assert isinstance(args, _AskUser)
             if self.ask_callback is None:  # pragma: no cover - 防御的分岐
                 return "ask_user は現在利用できません。他の Tool を使うか answer してください。"
+            return await self._call_ask_callback(args)
+
+        raise AssertionError(f"terminal tool は実行できません: {tool}")
+
+    async def _call_ask_callback(self, args: _AskUser) -> str:
+        """`ask_callback` を、検索全体のウォールクロック予算を止めて呼ぶ。
+
+        2026-08-04 レビュー是正(High・裁定10): `ask_user` の待機は
+        `ask_registry` 側の 10 分タイマーが管理するものであり、検索の
+        180 秒予算に含めない。`asyncio.timeout` ハンドルの締切を一時的に
+        解除(`reschedule(None)`)し、待機が終わったら**同じ残り時間**で
+        再開する(pause/resume。回答が 0 秒でも 10 分でも、検索側の残り予算
+        は変化しない)。
+        """
+
+        assert self.ask_callback is not None  # 呼び出し元(_execute)が保証する
+        handle = self._timeout_handle
+        remaining: float | None = None
+        if handle is not None:
+            loop = asyncio.get_running_loop()
+            remaining = handle.when() - loop.time()
+            handle.reschedule(None)
+        try:
             return await self.ask_callback(
                 kind=args.kind,
                 slot=args.slot,
@@ -646,8 +674,10 @@ class KnowledgeSearchAgent:
                 reason=args.reason,
                 options=[option.model_dump() for option in args.options],
             )
-
-        raise AssertionError(f"terminal tool は実行できません: {tool}")
+        finally:
+            if handle is not None and remaining is not None:
+                loop = asyncio.get_running_loop()
+                handle.reschedule(loop.time() + remaining)
 
     def _knowledge_observation(
         self,
@@ -919,6 +949,9 @@ class KnowledgeSearchAgent:
         self._tool_executions = 0
         self._database_unavailable = False
         self.last_trace = SearchTrace()
+        # `search()` の `asyncio.timeout` ハンドル(ask_user 待機中の
+        # 締切一時解除に使う。§6・裁定10)。
+        self._timeout_handle: asyncio.Timeout | None = None
 
 
 def _parse_tool_args(tool: SearchToolName, args: Mapping[str, Any]) -> ToolArgs:

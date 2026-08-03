@@ -157,15 +157,43 @@ def summarize_assistant_event(meta: Mapping[str, Any]) -> str:
 
 
 def group_turns(messages: Sequence[HistoryMessage]) -> list[Turn]:
-    """user 発話を境に会話をターンへまとめる（history_summary.py とも共有）。"""
+    """`meta.turn_id` を境に会話をターンへまとめる（history_summary.py とも共有）。
+
+    2026-08-04 レビュー是正(High・裁定11): `ask_user` への回答(§7)は同じ
+    ターン内で複数の user 行として persist される
+    (`repository.py:persist_turn`。元発話 + 各回答 + assistant 行が同一
+    `turn_id` を共有する)。旧実装は「user 発話ごとに新しいターン」という
+    ヒューリスティックだけを使っており、質問を挟んだターンを 3 ターンに
+    分割し、④(直近2ターン生)から元発話が脱落しうった。
+
+    `turn_id` を持つ行はそれを正として同一ターンにまとめる。`turn_id` が
+    無い(移行前の)行は、従来のヒューリスティック(user 行ごとに新ターン)
+    にフォールバックする。
+    """
 
     turns: list[list[HistoryMessage]] = []
+    current_turn_id: str | None = None
     for message in messages:
+        message_turn_id = _turn_id(message)
+        if message_turn_id is not None:
+            if not turns or current_turn_id != message_turn_id:
+                turns.append([message])
+                current_turn_id = message_turn_id
+            else:
+                turns[-1].append(message)
+            continue
+        # turn_id が無い旧行: 従来のヒューリスティックへフォールバックする。
+        current_turn_id = None
         if message.role == "user" or not turns:
             turns.append([message])
         else:
             turns[-1].append(message)
     return [Turn(index=index, messages=tuple(turn)) for index, turn in enumerate(turns)]
+
+
+def _turn_id(message: HistoryMessage) -> str | None:
+    value = message.meta.get("turn_id")
+    return value if isinstance(value, str) and value else None
 
 
 def first_unfolded_turn_index(
@@ -198,11 +226,41 @@ def _turn_summary_line(turn: Turn) -> str:
 def _raw_lines(turn: Turn) -> list[str]:
     lines: list[str] = []
     for message in turn.messages:
-        prefix = "u" if message.role == "user" else "a"
-        body = message.content.strip()
-        if body:
-            lines.append(f"{prefix}: {body}")
+        line = format_raw_message_line(message)
+        if line:
+            lines.append(line)
     return lines
+
+
+def format_raw_message_line(message: HistoryMessage) -> str | None:
+    """1 メッセージを生層(④)向けの1行に整形する。
+
+    2026-08-04 レビュー是正(High・裁定11): `ask_user` への回答行
+    (`meta.answer_to` を持つ user 行。§7・data_model.md §4.4)は、回答
+    だけでなく質問文も出す(`[質問: ...] → 回答: ...`)。回答単独では
+    「何を聞かれて何と答えたか」が生層からも要約入力からも読めず、
+    LLM が指示語・文脈を解けない(history_summary.py の fold_text も
+    本関数を共有する)。
+    """
+
+    body = message.content.strip()
+    if not body:
+        return None
+    if message.role == "user":
+        question = _answer_to_question_text(message.meta)
+        if question:
+            return f"u: [質問: {question}] → 回答: {body}"
+        return f"u: {body}"
+    return f"a: {body}"
+
+
+def _answer_to_question_text(meta: Mapping[str, Any]) -> str | None:
+    answer_to = meta.get("answer_to")
+    if isinstance(answer_to, Mapping):
+        reason = answer_to.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            return reason.strip()
+    return None
 
 
 def _collect_candidate_lines(turns: Sequence[Turn]) -> list[tuple[int, str]]:
@@ -218,12 +276,38 @@ def _collect_candidate_lines(turns: Sequence[Turn]) -> list[tuple[int, str]]:
 
 
 def _candidate_line(meta: Mapping[str, Any]) -> str | None:
-    candidate_names = _string_list(meta.get("candidate_names"))
-    candidate_ids = _string_list(meta.get("candidate_spot_ids"))
-    candidates = candidate_names or candidate_ids
+    names, ids = _presented_names_and_ids(meta)
+    candidates = names or ids
     if not candidates:
         return None
     return f"[推薦{len(candidates)}件: {' / '.join(candidates)}]"
+
+
+def _presented_names_and_ids(meta: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    """`meta.presented`(data_model.md §4.4。裁定14)から順序つき名前/id を取る。
+
+    `presented` が無い(移行前の)行は、旧フィールド
+    `candidate_names`/`candidate_spot_ids` にフォールバックする。
+    """
+
+    presented = meta.get("presented")
+    if isinstance(presented, list) and presented:
+        names: list[str] = []
+        ids: list[str] = []
+        for item in presented:
+            if not isinstance(item, Mapping):
+                continue
+            spot_id = item.get("spot_id")
+            name = item.get("name_ja")
+            if isinstance(spot_id, str):
+                ids.append(spot_id)
+            if isinstance(name, str):
+                names.append(name)
+        if names or ids:
+            return names, ids
+    return _string_list(meta.get("candidate_names")), _string_list(
+        meta.get("candidate_spot_ids")
+    )
 
 
 def _assemble(
@@ -263,12 +347,9 @@ def _meta_spot_ids_for_turns(turns: Sequence[Turn], indices: Any) -> list[str]:
 
 
 def _spot_ids_from_meta(meta: Mapping[str, Any]) -> list[str]:
-    values: list[str] = []
-    for key in (
-        "candidate_spot_ids",
-        "itinerary_spot_ids",
-        "mentioned_spot_ids",
-    ):
+    _, presented_ids = _presented_names_and_ids(meta)
+    values: list[str] = list(presented_ids)
+    for key in ("itinerary_spot_ids", "mentioned_spot_ids"):
         values.extend(_string_list(meta.get(key)))
     qa_spot_id = meta.get("qa_spot_id")
     if isinstance(qa_spot_id, str):

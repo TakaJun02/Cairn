@@ -37,7 +37,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.domains.conversation.ask_execution import execute_ask_user
 from app.domains.conversation.events import EventSinkLike, emit, state_event
-from app.domains.conversation.guards import has_repeated_ngram
+from app.domains.conversation.guards import (
+    MAX_ASK_STREAK,
+    MAX_ASK_USER_PER_TURN,
+    has_repeated_ngram,
+)
 from app.domains.conversation.state import TurnState
 from app.domains.conversation.tool_ports import ConversationToolPort
 from app.domains.conversation.types import AskUserArgs, AskUserOption, Slot, slot_values
@@ -163,10 +167,27 @@ async def run_recommend_subagent(
     `done` の単発判定のまま動く。
     """
 
-    ask_enabled = state is not None and tools is not None
+    # 2026-08-04 レビュー是正(Medium・裁定16): R4(メイン・SA 合算で
+    # 1 ターン 2 回まで)に到達済みなら、この SA の guided schema からも
+    # `ask_user` を外す。実行時の共通ガード(`execute_ask_user` →
+    # `evaluate_ask_user`)は既に超過を拒否するが、それだけだと SA は
+    # 無効な質問を選んで 1 周を浪費できてしまう(§10 R4 の「スキーマから
+    # 外す」を字義どおり満たす)。
+    ask_enabled = (
+        state is not None
+        and tools is not None
+        and state.ask_user_count < MAX_ASK_USER_PER_TURN
+        and state.ask_streak < MAX_ASK_STREAK
+    )
     asked = False
     current_profile = profile
     vocabulary = list(dict.fromkeys(tag_vocabulary))
+    # 2026-08-04 レビュー是正(High・裁定3a): 質問した場合、再判定プロンプトに
+    # 「質問文 + ユーザーの回答」を含める。`current_profile` の更新だけでは、
+    # `ProfileDelta` のフィールドではない自由記述の回答(dates/origin 等)が
+    # 完全に失われうる(§4 (b) の「回答は本サブエージェントの act に返る」を
+    # 字義どおり満たすため、生の Q&A を必ず持ち越す)。
+    qa_pairs: list[tuple[str, str]] = []
 
     while True:
         await emit(
@@ -184,6 +205,7 @@ async def run_recommend_subagent(
             profile=current_profile,
             tag_vocabulary=vocabulary,
             allow_ask_user=allow_ask,
+            qa_pairs=qa_pairs,
         )
         schema = recommend_agent_guided_schema(vocabulary, allow_ask_user=allow_ask)
         turn = await _call(
@@ -216,10 +238,11 @@ async def run_recommend_subagent(
                     client=client,
                     event_sink=event_sink,
                 )
-                if outcome.executed:
+                if outcome.executed and outcome.answer_text is not None:
                     current_profile = RecommendationProfile.model_validate(
                         state.profile.model_dump(mode="python")
                     )
+                    qa_pairs.append((question.reason, outcome.answer_text))
             continue
 
         sanitized_filter, dropped = _sanitize_filter(
@@ -327,8 +350,14 @@ def build_recommend_agent_messages(
     profile: RecommendationProfile,
     tag_vocabulary: list[str],
     allow_ask_user: bool = False,
+    qa_pairs: Sequence[tuple[str, str]] = (),
 ) -> list[dict[str, str]]:
-    """SA のプロンプトを組み立てる。タグ 80 語・mobility の enum はここにだけ載る。"""
+    """SA のプロンプトを組み立てる。タグ 80 語・mobility の enum はここにだけ載る。
+
+    `qa_pairs`(2026-08-04、レビュー是正・裁定3a): このターン内で既に聞いた
+    質問と回答の生テキストを③として必ず含める。`profile` の更新だけでは
+    `ProfileDelta` に無いフィールド(dates/origin 等)の回答が消えるため。
+    """
 
     system = _SYSTEM_PROMPT_TEMPLATE.format(
         max_tags=MAX_FILTER_TAGS,
@@ -347,12 +376,16 @@ def build_recommend_agent_messages(
             else "質問はできません。"
         ),
     )
-    dynamic = "\n\n".join(
-        [
-            "① メインエージェントからの指示:\n" + instruction,
-            "② プロフィール:\n" + _compact_json(profile.model_dump(mode="json")),
-        ]
-    )
+    sections = [
+        "① メインエージェントからの指示:\n" + instruction,
+        "② プロフィール:\n" + _compact_json(profile.model_dump(mode="json")),
+    ]
+    if qa_pairs:
+        qa_text = "\n".join(
+            f"Q: {question}\nA: {answer}" for question, answer in qa_pairs
+        )
+        sections.append("③ このターンで既に聞いた質問と回答:\n" + qa_text)
+    dynamic = "\n\n".join(sections)
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": dynamic},

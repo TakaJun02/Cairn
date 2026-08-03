@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -187,7 +187,7 @@ class ToolAdapters:
             await emit(
                 self.event_sink,
                 error_event(
-                    stage="act",
+                    stage="recommend",
                     code="rerank_degraded",
                     degraded=True,
                     message="候補をスコア順で確定しました",
@@ -229,13 +229,14 @@ class ToolAdapters:
                 ),
                 selector=selector,
                 provisional_sink=provisional_sink,
+                stage="plan_itinerary",
             )
         except Exception as exc:  # noqa: BLE001
             return _exception_error(exc)
         if isinstance(result, ItineraryToolError):
             return _convert_itinerary_error(result)
         payload = result.model_dump(mode="json", by_alias=True)
-        selection_degraded = await self._selection_degradation(selector)
+        selection_degraded = await self._selection_degradation(selector, stage="plan_itinerary")
         if selection_degraded:
             payload["selection_used"] = False
         await self._emit_itinerary_state(
@@ -286,13 +287,14 @@ class ToolAdapters:
                 ),
                 selector=selector,
                 provisional_sink=provisional_sink,
+                stage="edit_itinerary",
             )
         except Exception as exc:  # noqa: BLE001
             return _exception_error(exc)
         if isinstance(result, ItineraryToolError):
             return _convert_itinerary_error(result)
         payload = result.model_dump(mode="json", by_alias=True)
-        selection_degraded = await self._selection_degradation(selector)
+        selection_degraded = await self._selection_degradation(selector, stage="edit_itinerary")
         if selection_degraded:
             payload["selection_used"] = False
         await self._emit_itinerary_state(
@@ -365,13 +367,23 @@ class ToolAdapters:
     ) -> ToolResult | ToolError:
         """`ask_user` の HITL 実体(§7)。
 
-        1. `state:ask_user`/`clarify` を送出(ストリームは開いたまま)
-        2. `threads.pending_ask` を別トランザクションで即時反映
-           (`GET /thread` が進行中でも見えるように)
-        3. レジストリで回答を待つ(タイムアウト 10 分)
-        4. 回答受領・タイムアウトいずれでも `pending_ask` を即時 NULL に戻す
-        5. `AskResult{answer, answered_by}` を呼び出し元へそのまま返す
+        2026-08-04 レビュー是正(High・裁定6): 手順を
+        「① レジストリに waiter 登録 → ② `state:ask_user`/`clarify` を送出
+        (ストリームは開いたまま) → ③ `threads.pending_ask` を別トランザク
+        ションで即時反映 → ④ 回答を待つ(タイムアウト 10 分) → ⑤ 回答受領・
+        タイムアウトいずれでも `pending_ask` を即時 NULL に戻す → ⑥
+        `AskResult{answer, answered_by}` を呼び出し元へそのまま返す」に変更
+        した。旧順序(SSE 送出 → DB 書き込み → レジストリ登録)には 2 つの
+        競合窓があった: (a) 表示直後にユーザーが即答すると waiter が未登録で
+        409 になる、(b) ② と ③ の間に来た `GET /thread` が「pending_ask は
+        あるが waiter は無い」を「死んだ待機」と誤認して掃除してしまう。
+        ① を最初にすることで `GET /thread`(`ask_registry.is_waiting`)は
+        waiter 登録済みを live と判定でき、両方の競合窓が閉じる。
         """
+
+        future = None
+        if self.user_id is not None:
+            future = self.ask_registry.begin(self.user_id)
 
         if args.kind == "preference":
             await emit(
@@ -407,7 +419,10 @@ class ToolAdapters:
         answer = None
         if self.user_id is not None:
             answer = await wait_for_answer(
-                self.ask_registry, key=self.user_id, timeout_sec=self.ask_timeout_sec
+                self.ask_registry,
+                key=self.user_id,
+                future=future,
+                timeout_sec=self.ask_timeout_sec,
             )
 
         if self.thread_id is not None:
@@ -454,6 +469,7 @@ class ToolAdapters:
         *,
         selector: SolutionSelector | None,
         provisional_sink: ProvisionalItinerarySink | None,
+        stage: Literal["plan_itinerary", "edit_itinerary"],
     ) -> tuple[Any, bool]:
         if not self.attach_routes:
             return (
@@ -493,7 +509,7 @@ class ToolAdapters:
                     await emit(
                         self.event_sink,
                         error_event(
-                            stage="act",
+                            stage=stage,
                             code="route_degraded",
                             degraded=True,
                             message=(
@@ -507,7 +523,7 @@ class ToolAdapters:
             await emit(
                 self.event_sink,
                 error_event(
-                    stage="act",
+                    stage=stage,
                     code="route_degraded",
                     degraded=True,
                     message=(
@@ -539,13 +555,15 @@ class ToolAdapters:
     async def _selection_degradation(
         self,
         selector: LLMItinerarySelector | None,
+        *,
+        stage: Literal["plan_itinerary", "edit_itinerary"],
     ) -> list[str]:
         if selector is None or not selector.degraded:
             return []
         await emit(
             self.event_sink,
             error_event(
-                stage="act",
+                stage=stage,
                 code="selection_degraded",
                 degraded=True,
                 message="旅程候補は決定的な解 A で確定しました",

@@ -81,7 +81,11 @@ def _itinerary_payload(version: int = 1, *, spot_ids: list[str] | None = None) -
 
 
 def _plan_result(
-    step_id: int = 1, *, version: int = 1, spot_ids: list[str] | None = None
+    step_id: int = 1,
+    *,
+    version: int = 1,
+    spot_ids: list[str] | None = None,
+    constraints: list[dict[str, Any]] | None = None,
 ) -> ToolResult:
     return ToolResult(
         step_id=step_id,
@@ -93,12 +97,19 @@ def _plan_result(
             "selection_used": False,
             "spot_ids": spot_ids or [],
             "unmodeled": [],
+            # Service が確定した制約(2026-08-04、レビュー是正・裁定7)。
+            # 未指定なら「制約なし」として空のまま返す。
+            "constraints": constraints if constraints is not None else [],
         },
     )
 
 
 def _edit_result(
-    step_id: int = 1, *, version: int = 2, spot_ids: list[str] | None = None
+    step_id: int = 1,
+    *,
+    version: int = 2,
+    spot_ids: list[str] | None = None,
+    constraints: list[dict[str, Any]] | None = None,
 ) -> ToolResult:
     return ToolResult(
         step_id=step_id,
@@ -111,6 +122,8 @@ def _edit_result(
             "spot_ids": spot_ids or [],
             "unmodeled": [],
             "diff": {"added": [], "removed": [], "moved": [], "retimed": []},
+            # Service が確定した制約(2026-08-04、レビュー是正・裁定7)。
+            "constraints": constraints if constraints is not None else [],
         },
     )
 
@@ -216,8 +229,13 @@ def _existing_itinerary(*, constraints: list[dict[str, Any]]) -> ItineraryState:
     return ItineraryState(itinerary=itinerary, constraints=constraints, parent_version=None)
 
 
-async def test_edit_itinerary_merges_inherited_constraints_with_add_and_remove() -> None:
-    """フロー2: 現行versionから継承する既存constraints + add/removeのマージ。"""
+async def test_edit_itinerary_resolves_names_and_adopts_the_tools_returned_constraints() -> None:
+    """フロー2: 名前解決した制約案を渡し、Service が返した constraints を
+
+    `state.itinerary.constraints` としてそのまま採用する(2026-08-04、
+    レビュー是正・裁定7: 既存 constraints とのマージは Service の責務になり、
+    conversation 側でのローカル再マージは廃止した)。
+    """
 
     existing = [
         {"id": "c_001", "pred": "require", "args": {"target": "spot_a"}, "weight": 1.0},
@@ -225,7 +243,18 @@ async def test_edit_itinerary_merges_inherited_constraints_with_add_and_remove()
     ]
     state = _state(itinerary=_existing_itinerary(constraints=existing))
     tools = FakeItineraryTools()
-    tools.edit_queue = [_edit_result(spot_ids=["spot_a"])]
+    # Service が実際に返すであろう制約(c_001 は remove 済み、c_002 は継続、
+    # stay_at_least が新規 id c_003 で追加された、という想定)。
+    returned_constraints = [
+        {"id": "c_002", "pred": "exclude", "args": {"target": "spot_b"}, "weight": 1.0},
+        {
+            "id": "c_003",
+            "pred": "stay_at_least",
+            "args": {"target": "spot_a", "min": 60},
+            "weight": 1.0,
+        },
+    ]
+    tools.edit_queue = [_edit_result(spot_ids=["spot_a"], constraints=returned_constraints)]
 
     digest, error = await run_edit_itinerary(
         state,
@@ -256,11 +285,8 @@ async def test_edit_itinerary_merges_inherited_constraints_with_add_and_remove()
     assert added_ids.isdisjoint({"c_001", "c_002"})
     assert call["constraints"][0].args["target"] == "spot_a"
 
-    # フロー3実行後、会話状態側の表示コピーは c_001 を落とし c_002 を残す。
-    kept_ids = {value.get("id") for value in state.itinerary.constraints}
-    assert "c_001" not in kept_ids
-    assert "c_002" in kept_ids
-    assert len(kept_ids) == 2  # c_002 + 新規追加分
+    # 会話状態側は Service が返した constraints をそのまま採用する。
+    assert state.itinerary.constraints == returned_constraints
 
 
 async def test_edit_itinerary_remove_targets_unknown_id_is_dropped_and_reported() -> None:
@@ -337,6 +363,104 @@ async def test_edit_itinerary_without_existing_itinerary_returns_precondition_er
     assert error is not None
     assert error["code"] == ToolErrorCode.PRECONDITION_UNMET.value
     assert tools.edit_calls == []
+    assert "保存済み" not in error["message_ja"]
+    assert state.pending_constraints == []
+
+
+async def test_edit_without_itinerary_saves_constraints_add_to_pending_constraints() -> None:
+    """§5「旅程がまだ無いターンの制約はスレッド行に一時保持する」(2026-08-04、
+
+    レビュー是正・裁定4: `edit_itinerary` が precondition_unmet で失敗した
+    ターンでも、`constraints.add` は `threads.pending_constraints`
+    (= `state.pending_constraints`)へ保存する。これが新アーキで
+    `pending_constraints` へ書き込める唯一の経路である)。
+    """
+
+    state = _state(itinerary=None)
+    tools = FakeItineraryTools()
+
+    digest, error = await run_edit_itinerary(
+        state,
+        tools,
+        {
+            "ops": [],
+            "constraints": {
+                "add": [
+                    {
+                        "pred": "stay_at_least",
+                        "args": {"target": "地点エー", "min": 60},
+                        "weight": 0.6,
+                        "source_text": "ゆっくりしたい",
+                    }
+                ],
+                "remove": [],
+            },
+            "notes": None,
+        },
+        step_id=1,
+    )
+
+    assert error is not None
+    assert error["code"] == ToolErrorCode.PRECONDITION_UNMET.value
+    assert "保存済み" in error["message_ja"]
+    assert tools.edit_calls == []
+    assert len(state.pending_constraints) == 1
+    assert state.pending_constraints[0]["pred"] == "stay_at_least"
+    # スポット名は id へ解決された状態で保存される。
+    assert state.pending_constraints[0]["args"]["target"] == "spot_a"
+
+
+async def test_add_op_resolves_after_target_name_to_spot_id() -> None:
+    """`add` op の `after` もスポット名 → id へ解決する(2026-08-04、
+
+    レビュー是正: High。旧実装は `targets` だけ解決し `after` を素通り
+    させていたため、「地点Bを地点Aの後に追加」が常に失敗していた。
+    """
+
+    state = _state(itinerary=_existing_itinerary(constraints=[]))
+    tools = FakeItineraryTools()
+    tools.edit_queue = [_edit_result(spot_ids=["spot_a", "spot_b"])]
+
+    digest, error = await run_edit_itinerary(
+        state,
+        tools,
+        {
+            "ops": [{"op": "add", "targets": ["地点ビー"], "day": None, "after": "地点エー"}],
+            "constraints": None,
+            "notes": None,
+        },
+        step_id=1,
+    )
+
+    assert error is None
+    call = tools.edit_calls[0]
+    assert call["args"].ops == [
+        {"op": "add", "targets": ["spot_b"], "day": None, "after": "spot_a"}
+    ]
+
+
+async def test_add_op_drops_unresolved_after_but_still_executes() -> None:
+    """`after` が解決できなくても手全体は落とさず、`after` だけ落として報告する(C4)。"""
+
+    state = _state(itinerary=_existing_itinerary(constraints=[]))
+    tools = FakeItineraryTools()
+    tools.edit_queue = [_edit_result(spot_ids=["spot_a", "spot_b"])]
+
+    digest, error = await run_edit_itinerary(
+        state,
+        tools,
+        {
+            "ops": [{"op": "add", "targets": ["地点ビー"], "day": None, "after": "架空スポット"}],
+            "constraints": None,
+            "notes": None,
+        },
+        step_id=1,
+    )
+
+    assert error is None
+    call = tools.edit_calls[0]
+    assert call["args"].ops == [{"op": "add", "targets": ["spot_b"], "day": None, "after": None}]
+    assert "架空スポット" in digest
 
 
 async def test_plan_itinerary_returns_reference_unresolved_when_no_days() -> None:
@@ -379,15 +503,29 @@ async def test_tool_error_from_edit_itinerary_is_returned_without_mutating_state
 async def test_two_edits_in_one_turn_thread_version_and_avoid_constraint_id_collision() -> None:
     """1ターンに複数回の旅程書き換え(既に段2で許可)が version 管理と整合する。
 
-    2回目の edit_itinerary が1回目で追加した制約 id を `used_ids` として
-    正しく引き継ぎ、新規採番が衝突しないことを検査する(§5)。
+    2回目の edit_itinerary が1回目で(Service が返し `state.itinerary` に
+    採用された)制約 id を `used_ids` として正しく引き継ぎ、Tool へ渡す新規
+    採番が衝突しないことを検査する(§5。2026-08-04 レビュー是正・裁定7で
+    `state.itinerary.constraints` は Service の返り値そのものになったため、
+    Fake の返り値もそれを模した現実的な内容にする)。
     """
 
     state = _state(itinerary=_existing_itinerary(constraints=[]))
     tools = FakeItineraryTools()
+    first_returned_constraints = [
+        {"id": "c_001", "pred": "require", "args": {"target": "spot_a"}, "weight": 1.0},
+    ]
+    second_returned_constraints = [
+        *first_returned_constraints,
+        {"id": "c_002", "pred": "require", "args": {"target": "spot_b"}, "weight": 1.0},
+    ]
     tools.edit_queue = [
-        _edit_result(step_id=1, version=2, spot_ids=["spot_a"]),
-        _edit_result(step_id=2, version=3, spot_ids=["spot_a"]),
+        _edit_result(
+            step_id=1, version=2, spot_ids=["spot_a"], constraints=first_returned_constraints
+        ),
+        _edit_result(
+            step_id=2, version=3, spot_ids=["spot_a"], constraints=second_returned_constraints
+        ),
     ]
 
     _, error1 = await run_edit_itinerary(
@@ -412,6 +550,7 @@ async def test_two_edits_in_one_turn_thread_version_and_avoid_constraint_id_coll
     )
     assert error1 is None
     assert state.itinerary.version == 2
+    assert state.itinerary.constraints == first_returned_constraints
     first_ids = {value.get("id") for value in state.itinerary.constraints}
     assert len(first_ids) == 1
 
@@ -438,7 +577,11 @@ async def test_two_edits_in_one_turn_thread_version_and_avoid_constraint_id_coll
 
     assert error2 is None
     assert state.itinerary.version == 3
+    assert state.itinerary.constraints == second_returned_constraints
     all_ids = [value.get("id") for value in state.itinerary.constraints]
-    # 2回目の追加分は1回目の id と衝突しない(id の重複が無い)。
     assert len(all_ids) == len(set(all_ids)) == 2
     assert first_ids.issubset(set(all_ids))
+    # 2回目に Tool へ渡した新規制約案の id も 1回目の id と衝突しない
+    # (itinerary_subagent.py 自身の採番ロジック。`used_ids` の引き継ぎ)。
+    second_call_added_ids = {value.id for value in tools.edit_calls[1]["constraints"]}
+    assert second_call_added_ids.isdisjoint(first_ids)

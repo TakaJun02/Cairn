@@ -359,6 +359,32 @@ async def test_search_knowledge_then_done_completes_in_two_turns() -> None:
     assert "由来は江戸期の伝承です" in state.trajectory[0].observation
 
 
+async def test_search_knowledge_omits_ask_callback_when_r4_budget_already_exhausted() -> None:
+    """裁定16(2026-08-04レビュー是正): R4(メイン・SA合算で1ターン2回まで)に
+
+    既に到達していれば、知識検索 SA へは `ask_callback` 自体を渡さない。
+    `KnowledgeSearchAgent._available_tools` は `ask_callback is None` のとき
+    `ask_user` を guided schema の enum から外すため、narration 側へ
+    カウンタを持ち込まずに同じ効果が得られる。
+    """
+
+    state = _state()
+    state.ask_user_count = 2  # 既に上限に到達済み。
+    tools = FakeTools()
+    tools.search_queue = [_search_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("search_knowledge", {"request": "由来を教えて", "spot_name": None}),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    search_call = next(call for call in tools.calls if call[0] == "search_knowledge")
+    assert search_call[1]["ask_callback"] is None
+
+
 async def test_r1_step_budget_switches_to_done_only_schema() -> None:
     state = _state()
     tools = FakeTools()
@@ -714,6 +740,72 @@ async def test_ask_user_clarify_with_unresolvable_name_is_not_executed() -> None
     assert tools.calls == []  # 実行されない(ガード前に名前解決で落ちる)
     assert "解決" in state.trajectory[0].observation
     assert state.ask_user_count == 0
+
+
+async def test_ask_user_clarify_short_circuits_when_surface_already_resolves() -> None:
+    """A6(2026-08-04レビュー是正・裁定17): surface 自体が既に一意に解決
+
+    できるなら聞かない。R1(裁定18)もこの手を「実行された手」に数えない。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="clarify",
+                    surface="鶴間池",
+                    reason="念のため確認します",
+                    options=[
+                        {"label": "鶴間池", "value": "鶴間池"},
+                        {"label": "元滝伏流水", "value": "元滝伏流水"},
+                    ],
+                ),
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert tools.calls == []
+    assert "解決済み" in state.trajectory[0].observation
+    assert state.ask_user_count == 0
+    assert state.executed_tool_count == 0
+
+
+async def test_ask_user_preference_short_circuits_when_slot_already_in_profile() -> None:
+    """A6: プロフィールに既に値がある slot は聞かない(仮定して進める)。"""
+
+    state = _state()
+    state.profile.mobility = "avoid_walk"
+    tools = FakeTools()
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="preference",
+                    slot="mobility",
+                    reason="どのくらい歩けますか",
+                    options=[
+                        {"label": "あまり歩きたくない", "value": "avoid_walk"},
+                        {"label": "30分程度なら", "value": "short_walk_ok"},
+                    ],
+                ),
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert tools.calls == []
+    assert state.ask_user_count == 0
+    assert state.executed_tool_count == 0
+    assert "最も確からしい解釈" in state.trajectory[0].observation
 
 
 async def test_ask_user_guard_rejection_reports_reason_and_continues() -> None:

@@ -153,13 +153,17 @@ async def test_successful_preference_answer_updates_state_and_reruns_update_prof
     # update_profile はターンの元発話ではなく回答文を入力にする。
     assert "30分程度なら" in client.calls[0][1]["content"]
     assert "鶴間池に行きたい" not in client.calls[0][1]["content"].split("④")[-1]
+    # 裁定13: 再実行プロンプトには質問文も含める(dates/origin のような
+    # ProfileDelta に無いフィールドの回答も、質問文とセットなら文脈から
+    # LLM が読み取れるようにするため)。
+    assert "どのくらい歩けますか" in client.calls[0][1]["content"].split("④")[-1]
 
 
 async def test_successful_clarify_answer_records_resolved_ambiguity() -> None:
     state = _state()
     tools = FakeAskTools()
     tools.queue = [_ask_result(answer="鶴間池", answered_by="chip")]
-    client = ScriptedClient([_update_profile_json()])
+    client = ScriptedClient([])
 
     outcome = await execute_ask_user(
         state, tools, _clarify_question(), step_id=1, client=client
@@ -168,17 +172,29 @@ async def test_successful_clarify_answer_records_resolved_ambiguity() -> None:
     assert outcome.executed is True
     assert outcome.resolved_spot_id == "spot_001"
     assert state.resolved_ambiguities == [{"surface": "2番目のやつ", "resolved_to": "spot_001"}]
+    # 裁定13: clarify は update_profile を回さない(main の preference だけが
+    # 対象)。曖昧参照の選択を恒久的選好と誤認しない。
+    assert client.calls == []
 
 
-async def test_timeout_answer_still_continues_and_updates_profile() -> None:
-    """§7: タイムアウトでも `answered_by:"timeout"` として続行する。"""
+async def test_timeout_answer_continues_without_writing_user_row_or_update_profile() -> None:
+    """裁定12(2026-08-04レビュー是正): timeout は「未回答」として扱う。
+
+    (a) user 行(`qa_answers`)を書かない (b) `resolved_ambiguities` に
+    登録しない (c) `update_profile` を回さない (d) 軌跡には
+    「未回答(タイムアウト)。仮定して進めよ」を observation として返す。
+
+    旧実装はタイムアウトを架空のユーザー発話として `qa_answers` に書き、
+    `update_profile` を再実行していた(誤実装をテストが仕様として固定して
+    いた。レビュー指摘により是正)。
+    """
 
     state = _state()
     tools = FakeAskTools()
     tools.queue = [
         _ask_result(answer="(タイムアウトのため回答がありませんでした)", answered_by="timeout")
     ]
-    client = ScriptedClient([_update_profile_json()])
+    client = ScriptedClient([])
 
     outcome = await execute_ask_user(
         state, tools, _preference_question(), step_id=1, client=client
@@ -186,8 +202,33 @@ async def test_timeout_answer_still_continues_and_updates_profile() -> None:
 
     assert outcome.executed is True
     assert outcome.answered_by == "timeout"
+    assert outcome.answer_text is None
+    assert "未回答" in outcome.digest
+    assert "仮定" in outcome.digest
+    # R4/A2/A1 のカウンタ・slot 記録は「質問を提示した」こと自体には効く
+    # (聞き直しをタイムアウトのたびに許さないため)。
     assert state.ask_user_count == 1
-    assert len(client.calls) == 1  # update_profile は再実行された
+    assert state.asked_slots == ["mobility"]
+    assert state.qa_answers == []
+    assert state.resolved_ambiguities == []
+    assert client.calls == []  # update_profile は再実行されない
+
+
+async def test_timeout_clarify_answer_does_not_register_resolved_ambiguity() -> None:
+    state = _state()
+    tools = FakeAskTools()
+    tools.queue = [_ask_result(answer="(タイムアウトのため回答がありませんでした)", answered_by="timeout")]
+    client = ScriptedClient([])
+
+    outcome = await execute_ask_user(
+        state, tools, _clarify_question(), step_id=1, client=client
+    )
+
+    assert outcome.executed is True
+    assert outcome.answered_by == "timeout"
+    assert state.qa_answers == []
+    assert state.resolved_ambiguities == []
+    assert client.calls == []
 
 
 async def test_tool_error_from_ask_user_is_not_executed() -> None:

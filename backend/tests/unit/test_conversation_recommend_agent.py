@@ -467,6 +467,14 @@ async def test_ask_user_then_update_profile_then_redecision_then_done() -> None:
     third_schema = client.calls[2]["extra_body"]["response_format"]["json_schema"]["schema"]
     assert third_schema["properties"]["action"]["properties"]["tool"]["enum"] == ["done"]
 
+    # 2026-08-04 レビュー是正(High・裁定3a): 再判定プロンプト(3回目の
+    # 呼び出し)には質問文 + 回答の両方が含まれる。プロフィール更新だけに
+    # 頼ると `ProfileDelta` に無いフィールド(dates/origin 等)の回答が
+    # 完全に失われうるため。
+    redecision_prompt = client.calls[2]["messages"][1]["content"]
+    assert "どなたと行かれますか" in redecision_prompt
+    assert "家族です" in redecision_prompt
+
 
 async def test_second_ask_user_attempt_degrades_to_done_without_asking_again() -> None:
     """A7: 質問は 1 回まで。ガードで落ちた/再質問された場合も done へ縮退する。"""
@@ -494,3 +502,31 @@ async def test_second_ask_user_attempt_degrades_to_done_without_asking_again() -
     assert result.filter.tags == ["温泉"]
     assert tools.calls == []  # ガードで落ちたので実際には呼ばれない
     assert state.ask_user_count == 0
+
+
+async def test_ask_user_branch_excluded_when_r4_budget_already_exhausted() -> None:
+    """裁定16(2026-08-04レビュー是正): R4(メイン・SA合算で1ターン2回まで)に
+
+    既に到達していれば、SA の guided schema からも `ask_user` を外す。
+    実行時ガード(R4)だけだと、SA が無効な質問を選んで1周を浪費できる。
+    """
+
+    state = _state()
+    state.ask_user_count = 2  # 既にメイン側で 2 回使い切っている想定。
+    tools = FakeAskTools()
+    client = ScriptedClient([_act_json(filter={"tags": ["温泉"]})])
+
+    result = await run_recommend_subagent(
+        instruction="おすすめを教えて",
+        profile=_profile(),
+        tag_vocabulary=_TAG_VOCABULARY,
+        client=client,
+        state=state,
+        tools=tools,
+        step_id=1,
+    )
+
+    assert result.filter.tags == ["温泉"]
+    assert tools.calls == []
+    schema = client.calls[0]["extra_body"]["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["action"]["properties"]["tool"]["enum"] == ["done"]

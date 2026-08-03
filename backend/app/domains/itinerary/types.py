@@ -210,6 +210,12 @@ class PlanItineraryResult(DomainModel):
     selection_used: bool
     spot_ids: list[str]
     unmodeled: list[UnmodeledConstraint] = Field(default_factory=list)
+    # Service が確定した制約(再採番後・must_visit/op 由来の暗黙制約・revert 先の
+    # 版の制約)をそのまま返す(2026-08-04、レビュー是正・裁定7: 後方互換な
+    # 追加フィールド)。conversation 側はこれを正として
+    # `state.itinerary.constraints`/`active_constraint_ids` を更新する
+    # (Docs/30_design/agent_react_architecture.md §5)。
+    constraints: list[Constraint] = Field(default_factory=list)
 
 
 class EditItineraryResult(PlanItineraryResult):

@@ -182,10 +182,20 @@ class ItineraryRepository:
     async def get_pending_constraints(
         self, user_id: int, *, for_update: bool = False
     ) -> list[dict[str, Any]]:
-        statement = select(Thread).where(Thread.user_id == user_id)
-        if for_update:
-            statement = statement.with_for_update()
-        thread = await self.session.scalar(statement)
+        """`threads.pending_constraints` を読む。
+
+        `for_update` は受け取るが**常に無視する**(2026-08-04、レビュー是正:
+        Critical — `plan_itinerary` 実行中に `threads` 行を `SELECT ... FOR
+        UPDATE` すると、同じターンが後で `ask_user` を実行したとき
+        `write_pending_ask_now` が別セッションで同じ行を UPDATE しようとして
+        ロック待ちになり、待っているのはターン自身のコルーチンなので自己
+        デッドロックになる。同時実行は `ActiveTurnRegistry` の 409 が既に
+        防いでいるため、ターン処理中に `threads` 行ロックを保持する必要は
+        ない)。引数は既存呼び出し元との互換のため残す。
+        """
+
+        del for_update
+        thread = await self.session.scalar(select(Thread).where(Thread.user_id == user_id))
         if thread is None:
             return []
         return deepcopy(list(thread.pending_constraints))

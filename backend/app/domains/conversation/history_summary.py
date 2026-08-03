@@ -20,6 +20,7 @@ from app.core.llm import GenerationClient
 from app.domains.conversation.history import (
     DEFAULT_RAW_TURN_COUNT,
     first_unfolded_turn_index,
+    format_raw_message_line,
     group_turns,
 )
 from app.domains.conversation.state import MessageState, TurnState
@@ -102,11 +103,14 @@ async def _update_history_summary(
     if not foldable_turns:
         return
 
+    # 2026-08-04 レビュー是正(High・裁定11): 生層(history.py)と同じ整形器
+    # を使い、`ask_user` への回答行にも質問文を含める(要約が「回答だけ」を
+    # 畳み込んで質問の文脈を失わないように)。
     fold_text = "\n".join(
-        f"{'u' if message.role == 'user' else 'a'}: {message.content.strip()}"
+        line
         for turn in foldable_turns
         for message in turn.messages
-        if message.content.strip()
+        if (line := format_raw_message_line(message))
     )
     if not fold_text:
         return

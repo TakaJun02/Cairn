@@ -12,6 +12,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from app.domains.conversation.name_resolution import (
     build_name_resolution_context,
     describe_ambiguous,
@@ -29,9 +32,33 @@ from app.domains.itinerary.types import (
     SpotEndpoint,
 )
 
+_SEEDS_DIRECTORY = Path(__file__).resolve().parents[2] / "data" / "seeds"
+
 
 def _spot(spot_id: str, name_ja: str, *, aliases: list[str] | None = None) -> SpotFact:
     return SpotFact(spot_id=spot_id, name_ja=name_ja, kind="poi", aliases_ja=aliases or [])
+
+
+def _load_real_spot_catalog() -> dict[str, SpotFact]:
+    """`backend/data/seeds` の実データを `SpotFact` へ読み込む。
+
+    Docs/README.md の注意書き(文書中の spot_id 例は実データと一致しない)は
+    フィクスチャの spot_id には当てはまるが、名寄せの実バグ(黄桜温泉/鳥海温泉
+    の別名衝突)は実データそのものを読まないと再現・固定できないため、
+    ここだけ実シードを読む(2026-08-04、レビュー是正: テストの穴)。
+    """
+
+    spots: dict[str, SpotFact] = {}
+    for filename in ("POI.json", "facilities.json"):
+        data = json.loads((_SEEDS_DIRECTORY / filename).read_text(encoding="utf-8"))
+        for item in data:
+            spot_id = item["spot_id"]
+            name_ja = item["official_name"]["ja"]
+            aliases_ja = item.get("aliases", {}).get("ja", [])
+            spots[spot_id] = SpotFact(
+                spot_id=spot_id, name_ja=name_ja, kind="poi", aliases_ja=list(aliases_ja)
+            )
+    return spots
 
 
 def _itinerary_with(spot_id: str) -> Itinerary:
@@ -201,3 +228,95 @@ def test_resolve_constraint_target_detailed_flags_ambiguous_without_resolving() 
 
     assert value == "湧水"  # 曖昧なので書き換えない
     assert match.status == "ambiguous"
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-04 レビュー是正: スコア化した名寄せ(裁定9)
+# ---------------------------------------------------------------------------
+
+
+def test_official_name_partial_match_outranks_alias_exact_match() -> None:
+    """正式名部分一致(単語単位)は別名完全一致より優先される(裁定9の優先順:
+
+    正式名完全一致 > 正式名部分一致 > 別名完全一致 > 別名部分一致)。
+    実データの「黄桜温泉」/「鳥海温泉」の衝突を最小フィクスチャで再現する。
+    """
+
+    spots = {
+        "spot_a": _spot("spot_a", "黄桜温泉 湯楽里", aliases=["きざくらおんせんゆらり"]),
+        "spot_b": _spot("spot_b", "鳥海温泉 遊楽里", aliases=["ゆらり"]),
+    }
+    context = build_name_resolution_context(spot_catalog=spots)
+
+    assert context.resolve("黄桜温泉ゆらり") == "spot_a"
+
+
+def test_real_seed_resolves_kizakura_onsen_yurari_to_spot_028_not_spot_030() -> None:
+    """実バグの再現・固定テスト(2026-08-04、レビュー是正: High)。
+
+    「黄桜温泉ゆらり」は spot_028(黄桜温泉 湯楽里)を指す口語表現だが、旧実装
+    は部分一致を全別名・全正式名についてキー単位でしか見ておらず、
+    spot_030(鳥海温泉 遊楽里)の短い別名「ゆらり」が唯一の部分一致ヒットに
+    なって誤って spot_030 へ解決していた(C1 違反)。
+    """
+
+    spots = _load_real_spot_catalog()
+    assert spots["spot_028"].name_ja == "黄桜温泉 湯楽里"
+    assert spots["spot_030"].name_ja == "鳥海温泉 遊楽里"
+    context = build_name_resolution_context(spot_catalog=spots)
+
+    match = context.resolve_detailed("黄桜温泉ゆらり")
+
+    assert match.status == "resolved"
+    assert match.spot_id == "spot_028"
+
+
+def test_real_seed_still_resolves_official_names_exactly() -> None:
+    spots = _load_real_spot_catalog()
+    context = build_name_resolution_context(spot_catalog=spots)
+
+    assert context.resolve("黄桜温泉 湯楽里") == "spot_028"
+    assert context.resolve("鳥海温泉 遊楽里") == "spot_030"
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-04 レビュー是正: 序数参照(last_candidates.rank から解決。裁定9)
+# ---------------------------------------------------------------------------
+
+
+def test_ordinal_reference_resolves_from_last_candidates_rank() -> None:
+    spots = {
+        "spot_a": _spot("spot_a", "鶴間池"),
+        "spot_b": _spot("spot_b", "元滝伏流水"),
+    }
+    context = build_name_resolution_context(
+        spot_catalog=spots,
+        last_candidates=[
+            CandidateReference(spot_id="spot_a", name_ja="鶴間池", rank=1),
+            CandidateReference(spot_id="spot_b", name_ja="元滝伏流水", rank=2),
+        ],
+    )
+
+    assert context.resolve("2番目") == "spot_b"
+    assert context.resolve("2番目のやつ") == "spot_b"
+    assert context.resolve("1つ目") == "spot_a"
+    assert context.resolve("1個目") == "spot_a"
+
+
+def test_ordinal_reference_out_of_range_is_unresolved() -> None:
+    spots = {"spot_a": _spot("spot_a", "鶴間池")}
+    context = build_name_resolution_context(
+        spot_catalog=spots,
+        last_candidates=[CandidateReference(spot_id="spot_a", name_ja="鶴間池", rank=1)],
+    )
+
+    match = context.resolve_detailed("5番目")
+
+    assert match.status == "unresolved"
+
+
+def test_ordinal_reference_without_candidates_is_unresolved() -> None:
+    spots = {"spot_a": _spot("spot_a", "鶴間池")}
+    context = build_name_resolution_context(spot_catalog=spots)
+
+    assert context.resolve_detailed("2番目").status == "unresolved"

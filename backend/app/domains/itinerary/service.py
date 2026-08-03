@@ -108,7 +108,10 @@ class ItineraryService:
             parsed_days = _parse_days(days, planning)
         except ValueError as exc:
             return _reference_error(exc)
-        pending = await self.repository.get_pending_constraints(user_id, for_update=True)
+        # for_update=True は渡さない(ItineraryRepository.get_pending_constraints
+        # の docstring のとおり、ターン中の threads 行ロックは自己デッドロックの
+        # 原因になるため撤去した。2026-08-04 レビュー是正)。
+        pending = await self.repository.get_pending_constraints(user_id)
         # pending の id は旅程外の仮番号なので、v1 へ移すときに必ず採番し直す。
         pending_without_ids = [
             {key: value for key, value in raw.items() if key != "id"} for raw in pending
@@ -190,6 +193,7 @@ class ItineraryService:
             selection_used=selection_used,
             spot_ids=itinerary_spot_ids(final),
             unmodeled=normalized.unmodeled,
+            constraints=[Constraint.model_validate(value) for value in stored.constraints],
         )
 
     async def edit_itinerary(
@@ -231,6 +235,11 @@ class ItineraryService:
                 selection_used=False,
                 spot_ids=itinerary_spot_ids(reverted.itinerary),
                 unmodeled=[],
+                # revert 先の版の制約(§5「revert では対象版の制約へ戻す」)を
+                # そのまま返す。2026-08-04 レビュー是正・裁定7。
+                constraints=[
+                    Constraint.model_validate(value) for value in reverted.constraints
+                ],
             )
         planning = await self.repository.load_planning_data()
         try:
@@ -361,6 +370,7 @@ class ItineraryService:
                 *added.unmodeled,
                 *operation_constraints.unmodeled,
             ],
+            constraints=[Constraint.model_validate(value) for value in stored.constraints],
         )
 
 

@@ -23,11 +23,11 @@ from app.main import create_app
 
 
 class MemoryChatUserRepository:
-    def __init__(self) -> None:
+    def __init__(self, *, pending: dict[str, Any] | None = None) -> None:
         now = datetime.now(UTC)
         self.user = UserData(1, "chat-user", "chat-token", None, now, now)
         self.profile = ProfileData(1, {}, None, None, None, [], [], [], None, now)
-        self.thread = ThreadData([], None, self.profile, None)
+        self.thread = ThreadData([], None, self.profile, pending)
 
     async def find_by_token(self, token: str) -> UserData | None:
         return self.user if token == self.user.api_token else None
@@ -333,8 +333,28 @@ async def test_chat_answer_resolves_the_waiting_turn_with_free_text() -> None:
     assert answer.resolves is None
 
 
+_CLARIFY_PENDING = {
+    "kind": "clarify",
+    "surface": "2番目",
+    "reason": "候補が複数あります",
+    "options": [
+        {"label": "鶴間池", "value": "spot_012"},
+        {"label": "元滝伏流水", "value": "spot_007"},
+    ],
+}
+
+_PREFERENCE_PENDING = {
+    "kind": "ask_user",
+    "slot": "mobility",
+    "reason": "どのくらい歩けますか",
+    # `state:ask_user` の options はラベル文字列のみ(§1.2)。フロントは
+    # value にラベルそのものを送る(`lib/askAnswer.js`)。
+    "options": ["あまり歩きたくない", "30分程度なら"],
+}
+
+
 async def test_chat_answer_with_resolves_is_recorded_as_chip() -> None:
-    repository = MemoryChatUserRepository()
+    repository = MemoryChatUserRepository(pending=_CLARIFY_PENDING)
     app = _app(repository, ScriptedRunner())
     registry = AskUserRegistry()
     app.state.ask_registry = registry
@@ -358,7 +378,7 @@ async def test_chat_answer_with_resolves_is_recorded_as_chip() -> None:
 
 
 async def test_chat_answer_with_slot_resolves_is_also_a_chip() -> None:
-    repository = MemoryChatUserRepository()
+    repository = MemoryChatUserRepository(pending=_PREFERENCE_PENDING)
     app = _app(repository, ScriptedRunner())
     registry = AskUserRegistry()
     app.state.ask_registry = registry
@@ -372,7 +392,7 @@ async def test_chat_answer_with_slot_resolves_is_also_a_chip() -> None:
             "/api/v1/chat/answer",
             json={
                 "answer": "30分程度なら",
-                "resolves": {"slot": "mobility", "value": "short_walk_ok"},
+                "resolves": {"slot": "mobility", "value": "30分程度なら"},
             },
             headers={"Authorization": "Bearer chat-token"},
         )
@@ -381,7 +401,91 @@ async def test_chat_answer_with_slot_resolves_is_also_a_chip() -> None:
     assert response.status_code == 204
     assert answer is not None
     assert answer.answered_by == "chip"
-    assert answer.resolves == {"slot": "mobility", "value": "short_walk_ok"}
+    assert answer.resolves == {"slot": "mobility", "value": "30分程度なら"}
+
+
+async def test_chat_answer_resolves_for_a_stale_clarify_question_is_409() -> None:
+    """裁定5(2026-08-04レビュー是正): Q1 への遅延回答が Q2 登録後に届くと
+
+    409 で拒否される(古い質問の `surface` は現在の `pending` と一致しない)。
+    """
+
+    repository = MemoryChatUserRepository(pending=_CLARIFY_PENDING)
+    app = _app(repository, ScriptedRunner())
+    registry = AskUserRegistry()
+    app.state.ask_registry = registry
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        waiter = asyncio.create_task(wait_for_answer(registry, key=1, timeout_sec=2))
+        await asyncio.sleep(0)
+        response = await client.post(
+            "/api/v1/chat/answer",
+            json={
+                "answer": "元滝伏流水",
+                # 現在の pending は "2番目" を聞いている。これは別の(古い)質問。
+                "resolves": {"surface": "何日目に入れますか", "value": "spot_007"},
+            },
+            headers={"Authorization": "Bearer chat-token"},
+        )
+        # Future は解決されずに残るので、タイムアウトを待たずに片付ける。
+        registry.end(1)
+
+    assert response.status_code == 409
+    assert waiter.cancelled() is False
+    waiter.cancel()
+
+
+async def test_chat_answer_resolves_with_unknown_value_is_409() -> None:
+    """選択肢の value が現在の pending に存在しなければ 409(A4 相当の検査)。"""
+
+    repository = MemoryChatUserRepository(pending=_PREFERENCE_PENDING)
+    app = _app(repository, ScriptedRunner())
+    registry = AskUserRegistry()
+    app.state.ask_registry = registry
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        waiter = asyncio.create_task(wait_for_answer(registry, key=1, timeout_sec=2))
+        await asyncio.sleep(0)
+        response = await client.post(
+            "/api/v1/chat/answer",
+            json={
+                "answer": "山登りもしたい",
+                "resolves": {"slot": "mobility", "value": "山登りもしたい"},
+            },
+            headers={"Authorization": "Bearer chat-token"},
+        )
+        registry.end(1)
+
+    assert response.status_code == 409
+    waiter.cancel()
+
+
+async def test_chat_answer_resolves_without_any_pending_is_409() -> None:
+    """`pending` が無い(既に回答済み・掃除済み)のに `resolves` 付きで来たら 409。"""
+
+    repository = MemoryChatUserRepository(pending=None)
+    app = _app(repository, ScriptedRunner())
+    registry = AskUserRegistry()
+    app.state.ask_registry = registry
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        waiter = asyncio.create_task(wait_for_answer(registry, key=1, timeout_sec=2))
+        await asyncio.sleep(0)
+        response = await client.post(
+            "/api/v1/chat/answer",
+            json={"answer": "鶴間池", "resolves": {"surface": "2番目", "value": "spot_012"}},
+            headers={"Authorization": "Bearer chat-token"},
+        )
+        registry.end(1)
+
+    assert response.status_code == 409
+    waiter.cancel()
 
 
 async def test_chat_answer_without_a_waiting_turn_is_409() -> None:

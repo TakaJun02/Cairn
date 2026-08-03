@@ -9,13 +9,19 @@ import pytest
 from app.api.schemas.chat import ChatEvent
 from app.api.sse import (
     HEARTBEAT_FRAME,
+    ChatEventBuffer,
     DisconnectAwareGenerationClient,
+    ValidatingEventSink,
     adapt_conversation_event,
     frame_sse,
     iter_sse_frames,
 )
 from app.domains.conversation.ask_registry import AskUserRegistry
-from app.domains.conversation.events import ConversationEvent, MemoryEventSink
+from app.domains.conversation.events import (
+    ConversationEvent,
+    MemoryEventSink,
+    state_event,
+)
 from app.domains.conversation.tool_adapters import ToolAdapters
 from app.domains.conversation.types import AskUserArgs
 
@@ -228,3 +234,100 @@ async def test_disconnect_cancels_understand_but_not_tool_generation() -> None:
     tool_client.release.set()
 
     assert await tool == "completed"
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-04 レビュー是正: Critical(stage="act" の安全網)・裁定20(tool_phase_started の境界)
+# ---------------------------------------------------------------------------
+
+
+async def test_chat_event_buffer_falls_back_safely_on_invalid_error_stage() -> None:
+    """Critical 是正: `error_event` が既に検証しているので通常は起きないが、
+
+    `ChatEventBuffer.emit` 自体も契約違反を安全側(`stage=main_agent`)へ
+    落として例外を投げない(Tool の結果適用の途中で例外が伝播し、persist
+    への到達を妨げないようにする防御)。
+    """
+
+    buffer = ChatEventBuffer(fallback_turn_id="fallback")
+    # 直接 ConversationEvent を組み立てて、`error_event` の検証を迂回する
+    # (「万一契約外のイベントが来ても buffer は落ちない」ことを確認するため)。
+    bad_event = ConversationEvent(
+        event="error",
+        data={"stage": "act", "code": "route_degraded", "degraded": True, "message": "縮退"},
+    )
+
+    await buffer.emit(bad_event)  # 例外を投げない
+
+    queued = await buffer.queue.get()
+    assert queued.root.event == "error"
+    assert queued.root.data.stage == "main_agent"
+    assert queued.root.data.code == "internal"
+
+
+async def test_chat_event_buffer_drops_invalid_state_event_without_raising() -> None:
+    """error 以外の契約違反イベントは、代替できないため落として続行する。"""
+
+    buffer = ChatEventBuffer(fallback_turn_id="fallback")
+    bad_event = ConversationEvent(event="state", data={"kind": "unknown_kind"})
+
+    await buffer.emit(bad_event)  # 例外を投げない
+
+    assert buffer.queue.empty()
+
+
+async def test_validating_event_sink_raises_on_invalid_stage() -> None:
+    """テストの穴 §3 是正: `MemoryEventSink` は API 契約を検証しないため
+
+    `stage="act"` のような契約外の値を検出できなかった。`ValidatingEventSink`
+    は同じ変換を通すため、契約違反が `ValidationError` として直接失敗する。
+    `error_event` 自身は既に安全側へ倒すため、契約違反を直接テストするには
+    検証をバイパスして `ConversationEvent` を組み立てる。
+    """
+
+    from pydantic import ValidationError
+
+    sink = ValidatingEventSink()
+    raw_event = ConversationEvent(
+        event="error",
+        data={"stage": "act", "code": "route_degraded", "degraded": True, "message": "縮退"},
+    )
+
+    with pytest.raises(ValidationError):
+        await sink.emit(raw_event)
+
+    # 検証に失敗する前でも記録(`.events`)は行う。
+    assert len(sink.events) == 1
+
+
+async def test_tool_phase_started_is_cleared_when_the_step_finishes() -> None:
+    """裁定20(2026-08-04レビュー是正): `state:step`(finished)で Tool 境界を
+
+    閉じる。以前は最初の Tool 開始で一度立てたら二度と下ろされず、以降の
+    メイン LLM 呼び出し(次周の判断・respond のストリーミング)まで
+    「Tool 中」として切断キャンセルの対象外になっていた。
+    """
+
+    buffer = ChatEventBuffer(fallback_turn_id="fallback")
+    assert buffer.tool_phase_started.is_set() is False
+
+    await buffer.emit(state_event("step", tool="recommend", status="started", label_ja="探索中"))
+    assert buffer.tool_phase_started.is_set() is True
+
+    await buffer.emit(
+        state_event(
+            "candidates",
+            phase="provisional",
+            items=[{"spot_id": "spot_001", "name_ja": "鶴間池"}],
+        )
+    )
+    assert buffer.tool_phase_started.is_set() is True  # Tool の途中では立ったまま
+
+    await buffer.emit(state_event("step", tool="recommend", status="finished", label_ja="完了"))
+    assert buffer.tool_phase_started.is_set() is False  # Tool 境界で下りる
+
+    # 次の Tool が始まれば、また立つ。
+    await buffer.emit(
+        state_event("step", tool="plan_itinerary", status="started", label_ja="作成中")
+    )
+    assert buffer.tool_phase_started.is_set() is True

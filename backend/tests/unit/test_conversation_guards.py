@@ -15,7 +15,7 @@ from app.domains.conversation.guards import (
     validate_and_normalize_constraints,
     validate_response_spot_names,
 )
-from app.domains.conversation.state import SpotFact
+from app.domains.conversation.state import ProfileState, SpotFact
 from app.domains.conversation.types import AskUserArgs, ConstraintDraft
 
 
@@ -143,6 +143,57 @@ def test_r4_and_a1_a2_a3_reject_preference_questions() -> None:
     # 通常時は受理される。
     assert evaluate_ask_user(
         base, ask_user_count=0, ask_streak=0, asked_slots=[]
+    ).accepted is True
+
+
+def test_a6_rejects_preference_question_when_profile_already_has_the_slot() -> None:
+    """裁定17(2026-08-04レビュー是正): A6 の最小コード判定。
+
+    `profile` を渡したときだけ検査する(渡さない呼び出し元は従来どおり)。
+    `dates`/`origin`/`onboarding` は永続プロフィールに対応する列が無いため
+    常に許可する。
+    """
+
+    common = {"ask_user_count": 0, "ask_streak": 0, "asked_slots": []}
+
+    mobility_known = ProfileState(mobility="short_walk_ok")
+    assert evaluate_ask_user(
+        AskUserArgs.model_validate(_preference_args("mobility")),
+        **common,
+        profile=mobility_known,
+    ).rule == "A6"
+
+    party_known = ProfileState(party="family_kids")
+    assert evaluate_ask_user(
+        AskUserArgs.model_validate(_preference_args("party")),
+        **common,
+        profile=party_known,
+    ).rule == "A6"
+
+    interests_known = ProfileState(interests={"water": 0.5})
+    assert evaluate_ask_user(
+        AskUserArgs.model_validate(_preference_args("interests")),
+        **common,
+        profile=interests_known,
+    ).rule == "A6"
+
+    # 未知(値が無い)なら通常どおり受理される。
+    assert evaluate_ask_user(
+        AskUserArgs.model_validate(_preference_args("mobility")),
+        **common,
+        profile=ProfileState(),
+    ).accepted is True
+
+    # profile を渡さない呼び出し元は A6 を検査しない(後方互換)。
+    assert evaluate_ask_user(
+        AskUserArgs.model_validate(_preference_args("mobility")), **common
+    ).accepted is True
+
+    # dates/origin/onboarding は永続プロフィールに列が無いため常に許可する。
+    assert evaluate_ask_user(
+        AskUserArgs.model_validate(_preference_args("dates")),
+        **common,
+        profile=ProfileState(mobility="short_walk_ok", party="family_kids"),
     ).accepted is True
 
 

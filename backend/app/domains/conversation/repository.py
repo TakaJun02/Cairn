@@ -165,10 +165,17 @@ class ConversationRepository:
         """全 Tool の未コミット変更とメッセージを 1 回だけ commit する。"""
 
         try:
+            # `Thread` 行は FOR UPDATE しない(2026-08-04、レビュー是正: Critical)。
+            # ターン中に `ask_user` が実行されると `write_pending_ask_now` が
+            # 別セッションで同じ `threads` 行を UPDATE する(§7)。ここで行
+            # ロックを取ると、ターン自身が後で待つ相手(pending_ask の書き込み)
+            # を自分でブロックする自己デッドロックになりうる。同時実行は
+            # `ActiveTurnRegistry` の 409 が既に防いでいるため、ターンの
+            # 主セッションが `threads` 行を占有し続ける理由はない。
             thread = await self.session.scalar(
-                select(Thread)
-                .where(Thread.id == state.thread_id, Thread.user_id == state.user_id)
-                .with_for_update()
+                select(Thread).where(
+                    Thread.id == state.thread_id, Thread.user_id == state.user_id
+                )
             )
             profile = await self.session.scalar(
                 select(Profile).where(Profile.user_id == state.user_id).with_for_update()
@@ -340,21 +347,37 @@ def _persist_profile(row: Profile, value: ProfileState) -> None:
 
 
 def _assistant_meta(state: TurnState) -> dict[str, Any]:
-    candidate_ids = [value.spot_id for value in state.last_candidates]
-    candidate_names = [value.name_ja for value in state.last_candidates]
+    """data_model.md §4.4 の assistant `meta` 契約を組み立てる。
+
+    2026-08-04 レビュー是正(High・裁定14): 旧実装は `mode="plan"/"edit"` を
+    使い、`candidate_spot_ids`/`candidate_names` は `recommend` を実行して
+    いないターンでもロード済み `state.last_candidates` を、
+    `itinerary_version` も Tool 結果が無ければ現在旅程を、それぞれ
+    フォールバックとして書いていた。これにより過去に提示した候補・旅程が
+    後続の全 assistant 発話へ「今回提示した」ものとして再記録され続け、
+    直近3リストの機械要約(§8)や序数照応を汚染していた。
+    `presented`/`itinerary_version` は**このターンで実際に Tool を実行した
+    ときだけ**書く(フォールバック廃止)。`ask_user` も `step_results` へ
+    登録されるため(`ask_execution.execute_ask_user`)、`tools`/`mode` に
+    反映される。
+    """
+
+    presented = _presented_candidates(state)
     itinerary = _result_itinerary(state)
     itinerary_ids = _itinerary_ids(itinerary) if itinerary is not None else []
     qa_spot_id = _qa_spot_id(state)
     tools = [result.tool.value for result in state.step_results.values()]
     return {
         "turn_id": state.turn_id,
-        # 旧 `intent` は understand の分類結果だったが、ReAct 化で
-        # 単一の意図分類ステップが無くなったため、実行した Tool 列から
-        # 機械的に導出する(§参照: Docs/30_design/agent_react_architecture.md)。
-        "mode": _derive_mode(tools),
+        # mode: recommend | itinerary | qa | clarify | ask_user | chitchat
+        #     | error(data_model.md §4.4)。
+        "mode": _derive_mode(state, tools),
         "tools": tools,
-        "candidate_spot_ids": candidate_ids,
-        "candidate_names": candidate_names,
+        "presented": [value.model_dump(mode="json") for value in presented],
+        # 旧フィールド名との互換(フロント chat.js の復元・history.py の
+        # 機械要約が読む)。中身は `presented` と常に同期させる。
+        "candidate_spot_ids": [value.spot_id for value in presented],
+        "candidate_names": [value.name_ja for value in presented],
         "itinerary_version": itinerary.version if itinerary is not None else None,
         "itinerary_spot_ids": itinerary_ids,
         "itinerary_spot_names": [
@@ -362,29 +385,59 @@ def _assistant_meta(state: TurnState) -> dict[str, Any]:
         ],
         "qa_spot_id": qa_spot_id,
         "qa_spot_name": state.spot_names.get(qa_spot_id or "") if qa_spot_id else None,
+        "degraded": [value.code for value in state.degraded],
     }
 
 
-def _derive_mode(tools: list[str]) -> str:
-    """実行した Tool 列から履歴要約向けの大まかな分類を機械的に導出する。"""
+def _presented_candidates(state: TurnState) -> list[CandidateReference]:
+    """このターンで `recommend` が実行されたときだけ、順序つき候補を返す。
 
-    if "plan_itinerary" in tools:
-        return "plan"
-    if "edit_itinerary" in tools:
-        return "edit"
+    `state.last_candidates` フォールバックは廃止した(裁定14)。
+    """
+
+    if not any(result.tool.value == "recommend" for result in state.step_results.values()):
+        return []
+    return list(state.last_candidates)
+
+
+def _derive_mode(state: TurnState, tools: list[str]) -> str:
+    """実行した Tool 列から assistant `meta.mode` を導出する(§4.4)。"""
+
+    if state.main_agent_failed:
+        return "error"
+    if "plan_itinerary" in tools or "edit_itinerary" in tools:
+        return "itinerary"
     if "recommend" in tools:
         return "recommend"
     if "search_knowledge" in tools:
         return "qa"
+    if "ask_user" in tools:
+        return _ask_user_mode(state)
     return "chitchat"
 
 
+def _ask_user_mode(state: TurnState) -> str:
+    """直近の `ask_user` 結果の `kind` から `ask_user`/`clarify` を選ぶ。"""
+
+    for result in reversed(list(state.step_results.values())):
+        if result.tool.value == "ask_user":
+            if result.data.get("surface") is not None:
+                return "clarify"
+            return "ask_user"
+    return "ask_user"  # pragma: no cover - tools に ask_user がある前提の防御
+
+
 def _result_itinerary(state: TurnState) -> Itinerary | None:
+    """このターンで `plan_itinerary`/`edit_itinerary` が作った版だけを返す。
+
+    `state.itinerary`(現在旅程)へのフォールバックは廃止した(裁定14)。
+    """
+
     for result in reversed(list(state.step_results.values())):
         raw = result.data.get("itinerary")
         if isinstance(raw, dict):
             return Itinerary.model_validate(raw)
-    return state.itinerary.itinerary if state.itinerary is not None else None
+    return None
 
 
 def _itinerary_ids(itinerary: Itinerary) -> list[str]:

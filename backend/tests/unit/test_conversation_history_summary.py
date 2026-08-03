@@ -16,14 +16,16 @@ from app.domains.conversation.history_summary import (
 from app.domains.conversation.state import MessageState, ProfileState, TurnState
 
 
-def _message(id_: int, role: str, content: str) -> MessageState:
+def _message(
+    id_: int, role: str, content: str, meta: dict[str, Any] | None = None
+) -> MessageState:
     return MessageState(
         id=id_,
         seq=id_,
         role=role,
         content=content,
         status="complete",
-        meta={},
+        meta=meta or {},
         created_at=datetime(2026, 8, 4, tzinfo=UTC),
     )
 
@@ -106,6 +108,41 @@ async def test_folds_turns_pushed_out_of_the_raw_window_and_advances_boundary() 
     assert "鶴間池について知りたい" in prompt
     assert "元滝伏流水も紹介しました" in prompt
     assert "1日目に入れて" not in prompt  # 直近2ターンは畳み込み対象外
+
+
+async def test_fold_text_includes_question_for_ask_user_answer_rows() -> None:
+    """裁定11(2026-08-04レビュー是正): 要約への入力(fold_text)も
+
+    `ask_user` への回答行に質問文を含める(history.py と同じ整形器を使う)。
+    """
+
+    messages = [
+        _message(1, "user", "おすすめは？", {"turn_id": "t1"}),
+        _message(
+            2,
+            "user",
+            "30分程度なら",
+            {"turn_id": "t1", "answer_to": {"reason": "どのくらい歩けますか"}},
+        ),
+        _message(3, "assistant", "ご案内します", {"turn_id": "t1"}),
+        _message(4, "user", "1日目に入れて", {"turn_id": "t2"}),
+        _message(5, "assistant", "入れました", {"turn_id": "t2"}),
+        _message(6, "user", "昼休憩も", {"turn_id": "t3"}),
+        _message(7, "assistant", "昼休憩を入れました", {"turn_id": "t3"}),
+    ]
+    repository = FakeHistorySummaryRepository(
+        HistorySummaryState(
+            history_summary="",
+            summarized_until_message_id=None,
+            messages=messages,
+        )
+    )
+    client = ScriptedClient("要約結果")
+
+    await update_history_summary(_state(), repository=repository, client=client)
+
+    prompt = client.calls[0][1]["content"]
+    assert "[質問: どのくらい歩けますか] → 回答: 30分程度なら" in prompt
 
 
 async def test_nothing_to_fold_skips_the_llm_call() -> None:

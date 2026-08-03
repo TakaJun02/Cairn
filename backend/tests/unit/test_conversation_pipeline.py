@@ -143,11 +143,16 @@ class FakeTools:
         # (§6: search_knowledge SA が内部で ask_user を選んだことを模す)。
         self.invoke_ask_callback_with: dict[str, Any] | None = None
         self.ask_callback_observations: list[str] = []
+        # `recommend` へ渡された RecommendationContext を検査用に記録する
+        # (2026-08-04、レビュー是正・裁定3b: SA の ask_user 回答後に
+        # context が作り直されることを確認するため)。
+        self.recommend_contexts: list[Any] = []
 
     async def recommend(
         self, *, step_id: int, args: Any, context: Any, use_specialist: bool
     ) -> Any:
-        del args, context, use_specialist
+        del args, use_specialist
+        self.recommend_contexts.append(context)
         self.calls.append("recommend")
         if self.sink is not None:
             await emit(
@@ -473,7 +478,13 @@ async def test_cancelled_respond_persists_partial_text_before_propagating() -> N
 
 
 async def test_ask_user_timeout_still_continues_to_done_and_respond() -> None:
-    """§7: タイムアウトでも `answered_by:"timeout"` で続行し respond まで到達する。"""
+    """§7: タイムアウトでも続行し respond まで到達する。
+
+    裁定12(2026-08-04レビュー是正): timeout は「未回答」として扱うため、
+    `qa_answers` へは書かれず、`update_profile` の再実行も起きない
+    (旧実装は timeout も架空のユーザー発話として `qa_answers` に書き、
+    `update_profile` を再実行していた)。
+    """
 
     sink = MemoryEventSink()
     repository = MemoryConversationRepository()
@@ -504,7 +515,8 @@ async def test_ask_user_timeout_still_continues_to_done_and_respond() -> None:
                     ],
                 },
             ),
-            _update_profile_output(),  # 未回答なので profile_delta は空
+            # timeout なので update_profile の再実行は起きない。
+            # (次の main_agent 周は直接 done を選ぶ。)
             _done_json(),
         ],
         response_chunks=["回答が確認できなかったため、仮定して進めます。"],
@@ -519,8 +531,9 @@ async def test_ask_user_timeout_still_continues_to_done_and_respond() -> None:
 
     assert state.responded is True
     assert state.ask_user_count == 1
-    assert state.qa_answers[0]["meta"]["answered_by"] == "timeout"
+    assert state.qa_answers == []
     assert repository.persisted[0].responded is True
+    assert repository.persisted[0].qa_answers == []
     assert [event.event for event in sink.events][-1] == "done"
 
 
@@ -632,6 +645,12 @@ async def test_recommend_subagent_ask_user_round_trip_reaches_done_and_respond()
     assert state.profile.party == "family_kids"
     assert tools.calls.count("recommend") == 1
     assert repository.persisted[0].responded is True
+
+    # 2026-08-04 レビュー是正(High・裁定3b): 実推薦へ渡された
+    # RecommendationContext は、SA の ask_user 回答後に更新されたプロフィール
+    # を反映している(SA 実行前に作った context を使い回さない)。
+    assert len(tools.recommend_contexts) == 1
+    assert tools.recommend_contexts[0].profile.party == "family_kids"
 
 
 async def test_search_knowledge_ask_callback_round_trip_reaches_done_and_respond() -> None:

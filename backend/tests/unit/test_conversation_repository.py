@@ -1,7 +1,9 @@
-"""スレッド永続状態(`_persist_thread`)の段2挙動を DB 行境界で検査する。
+"""スレッド永続状態(`_persist_thread`)・assistant `meta`(§4.4)の層1仕様。
 
-`ask_user` は段2のメインループから呼ばれないため、`pending_ask` は常に
-クリアされ、`asked_slots`/`ask_streak` は素通りする(段5で書き換えが復活する)。
+`ask_user` はメインループ(段5)からもレコメンド SA・知識検索 SA からも呼ばれ
+うる。assistant `meta` は data_model.md §4.4 の契約
+(`mode`/`presented`/`tools`/`itinerary_version`/`degraded`)に沿うことを検査
+する(2026-08-04、レビュー是正・裁定14)。
 """
 
 from typing import cast
@@ -9,8 +11,23 @@ from typing import cast
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db_models import Thread
-from app.domains.conversation.repository import ConversationRepository, _derive_mode
-from app.domains.conversation.state import ProfileState, TurnState
+from app.domains.conversation.repository import (
+    ConversationRepository,
+    _assistant_meta,
+    _derive_mode,
+    _presented_candidates,
+    _result_itinerary,
+)
+from app.domains.conversation.state import (
+    CandidateReference,
+    DegradedState,
+    ItineraryState,
+    ProfileState,
+    SpotFact,
+    TurnState,
+)
+from app.domains.conversation.types import ToolName, ToolResult
+from app.domains.itinerary.types import Itinerary
 
 
 def _thread(*, asked_slots: list[str] | None = None) -> Thread:
@@ -31,14 +48,16 @@ def _thread(*, asked_slots: list[str] | None = None) -> Thread:
     )
 
 
-def _state() -> TurnState:
-    return TurnState(
+def _state(**overrides: object) -> TurnState:
+    base: dict[str, object] = dict(
         turn_id="turn",
         thread_id=1,
         user_id=1,
         utterance="鶴間池",
         profile=ProfileState(),
     )
+    base.update(overrides)
+    return TurnState(**base)
 
 
 def test_persist_thread_always_clears_pending_ask_and_resets_ask_streak() -> None:
@@ -68,11 +87,139 @@ def test_persist_thread_updates_presented_spot_ids_and_last_candidates() -> None
     assert row.presented_spot_ids == ["spot_001", "spot_002"]
 
 
-def test_derive_mode_from_executed_tools() -> None:
-    """messages.meta.mode は intent 由来ではなく実行した Tool 列から導出する。"""
+def _ask_user_result(*, surface: str | None = None, slot: str | None = None) -> ToolResult:
+    data: dict[str, object] = {"answer": "はい", "answered_by": "chip"}
+    if surface is not None:
+        data["surface"] = surface
+    if slot is not None:
+        data["slot"] = slot
+    return ToolResult(step_id=1, tool=ToolName.ASK_USER, data=data)
 
-    assert _derive_mode(["plan_itinerary"]) == "plan"
-    assert _derive_mode(["recommend", "edit_itinerary"]) == "edit"
-    assert _derive_mode(["recommend"]) == "recommend"
-    assert _derive_mode(["search_knowledge"]) == "qa"
-    assert _derive_mode([]) == "chitchat"
+
+def test_derive_mode_maps_plan_and_edit_to_itinerary() -> None:
+    """裁定14: data_model.md §4.4 の契約(plan/edit→itinerary)に合わせる。"""
+
+    state = _state()
+    assert _derive_mode(state, ["plan_itinerary"]) == "itinerary"
+    assert _derive_mode(state, ["recommend", "edit_itinerary"]) == "itinerary"
+    assert _derive_mode(state, ["recommend"]) == "recommend"
+    assert _derive_mode(state, ["search_knowledge"]) == "qa"
+    assert _derive_mode(state, []) == "chitchat"
+
+
+def test_derive_mode_distinguishes_ask_user_and_clarify_by_kind() -> None:
+    preference_state = _state()
+    preference_state.step_results[1] = _ask_user_result(slot="mobility")
+    assert _derive_mode(preference_state, ["ask_user"]) == "ask_user"
+
+    clarify_state = _state()
+    clarify_state.step_results[1] = _ask_user_result(surface="2番目のやつ")
+    assert _derive_mode(clarify_state, ["ask_user"]) == "clarify"
+
+
+def test_derive_mode_is_error_when_main_agent_failed() -> None:
+    state = _state()
+    state.main_agent_failed = True
+    assert _derive_mode(state, []) == "error"
+    assert _derive_mode(state, ["recommend"]) == "error"  # 失敗が最優先
+
+
+def _spots() -> dict[str, SpotFact]:
+    return {
+        "spot_001": SpotFact(spot_id="spot_001", name_ja="鶴間池", kind="poi"),
+        "spot_002": SpotFact(spot_id="spot_002", name_ja="元滝伏流水", kind="poi"),
+    }
+
+
+def test_presented_candidates_empty_unless_recommend_ran_this_turn() -> None:
+    """裁定14: `state.last_candidates` フォールバックを廃止した。
+
+    ロード済みの(過去ターンの)候補が残っていても、今回 `recommend` を
+    実行していなければ `presented` は空にする。
+    """
+
+    stale_state = _state(spot_catalog=_spots())
+    stale_state.last_candidates = [
+        CandidateReference(spot_id="spot_001", name_ja="鶴間池", rank=1)
+    ]
+    assert _presented_candidates(stale_state) == []
+
+    fresh_state = _state(spot_catalog=_spots())
+    fresh_state.last_candidates = [
+        CandidateReference(spot_id="spot_002", name_ja="元滝伏流水", rank=1)
+    ]
+    fresh_state.step_results[1] = ToolResult(
+        step_id=1,
+        tool=ToolName.RECOMMEND,
+        data={
+            "spot_ids": ["spot_002"],
+            "candidates": [],
+            "provisional_spot_ids": [],
+            "rerank_used": True,
+        },
+    )
+    assert _presented_candidates(fresh_state) == fresh_state.last_candidates
+
+
+def test_result_itinerary_none_unless_itinerary_tool_ran_this_turn() -> None:
+    """裁定14: `state.itinerary`(現在旅程)へのフォールバックを廃止した。"""
+
+    itinerary_payload = {
+        "days": [
+            {
+                "date": "2026-08-10",
+                "start_min": 540,
+                "end_min": 1020,
+                "origin": {"kind": "spot", "spot_id": "spot_001"},
+                "destination": {"kind": "spot", "spot_id": "spot_001"},
+                "items": [],
+            }
+        ],
+        "concessions": [],
+        "version": 3,
+    }
+
+    state_with_current_itinerary = _state(
+        itinerary=ItineraryState(
+            itinerary=Itinerary.model_validate(itinerary_payload), constraints=[]
+        )
+    )
+    assert _result_itinerary(state_with_current_itinerary) is None
+
+    state_with_tool_run = _state()
+    state_with_tool_run.step_results[1] = ToolResult(
+        step_id=1,
+        tool=ToolName.PLAN_ITINERARY,
+        data={"itinerary": itinerary_payload},
+    )
+    result = _result_itinerary(state_with_tool_run)
+    assert result is not None
+    assert result.version == 3
+
+
+def test_assistant_meta_matches_data_model_contract() -> None:
+    state = _state(spot_catalog=_spots(), spot_names={"spot_001": "鶴間池"})
+    state.last_candidates = [CandidateReference(spot_id="spot_001", name_ja="鶴間池", rank=1)]
+    state.step_results[1] = ToolResult(
+        step_id=1,
+        tool=ToolName.RECOMMEND,
+        data={
+            "spot_ids": ["spot_001"],
+            "candidates": [],
+            "provisional_spot_ids": [],
+            "rerank_used": True,
+        },
+    )
+    state.degraded = [DegradedState(code="rerank_degraded", stage="recommend", message="縮退")]
+
+    meta = _assistant_meta(state)
+
+    assert meta["mode"] == "recommend"
+    assert meta["tools"] == ["recommend"]
+    assert meta["presented"] == [{"rank": 1, "spot_id": "spot_001", "name_ja": "鶴間池"}]
+    # 旧フィールド名は presented と同期した互換値のまま残す
+    # (フロント chat.js の復元・history.py の機械要約が読む)。
+    assert meta["candidate_spot_ids"] == ["spot_001"]
+    assert meta["candidate_names"] == ["鶴間池"]
+    assert meta["itinerary_version"] is None
+    assert meta["degraded"] == ["rerank_degraded"]

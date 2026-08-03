@@ -73,6 +73,7 @@ async def execute_ask_user(
         resolved_ambiguities=state.resolved_ambiguities,
         allowed_spot_ids=allowed_spot_ids,
         existing_spot_ids=existing_spot_ids,
+        profile=state.profile,
     )
     if not guard.accepted:
         return AskExecutionOutcome(
@@ -96,16 +97,46 @@ async def execute_ask_user(
             },
         )
 
+    # 2026-08-04 レビュー是正(High・裁定14): `ask_user` も `step_results`
+    # へ登録する。以前は登録されず、assistant `meta.tools`/`mode`
+    # (data_model.md §4.4)に `ask_user` が一切反映されなかった。
+    # レコメンド SA・知識検索 SA の内部呼び出しは、同じ `step_id` を使う
+    # 自身の Tool 呼び出し(recommend/search_knowledge)が後で上書きするため
+    # 安全(その手の観測としては recommend/search_knowledge が正)。
+    state.step_results[step_id] = result
+
     answer_text = str(result.data.get("answer", ""))
     answered_by = str(result.data.get("answered_by", "free_text"))
 
+    # R4/A2 のカウンタ・A1(質問済み slot)は「質問を実際に提示した」ことに
+    # 対して回す。timeout でも聞いたこと自体は変わらないので増やす
+    # (増やさないと同じ slot をタイムアウトのたびに聞き直せてしまう)。
     state.ask_user_count += 1
-    resolved_spot_id: str | None = None
     if question.kind == "preference" and question.slot is not None:
         slot_value = question.slot.value
         if slot_value not in state.asked_slots:
             state.asked_slots = [*state.asked_slots, slot_value]
-    elif question.kind == "clarify":
+
+    if answered_by == "timeout":
+        # 2026-08-04 レビュー是正(Medium・裁定12): タイムアウトは「未回答」
+        # であり、架空のユーザー発話ではない。
+        # (a) user 行を書かない(`state.qa_answers` へ追加しない)
+        # (b) `resolved_ambiguities` に登録しない(A5 の将来の聞き直しを
+        #     不当に禁止しない)
+        # (c) `update_profile` を回さない(回答が無いのに再実行しない)
+        # (d) 軌跡には「未回答(タイムアウト)。仮定して進めよ」を返す
+        return AskExecutionOutcome(
+            executed=True,
+            digest=(
+                f"質問「{question.reason}」は未回答でした(タイムアウト)。"
+                "最も確からしい解釈を採り、仮定を明示して進めてください。"
+            ),
+            answer_text=None,
+            answered_by=answered_by,
+        )
+
+    resolved_spot_id: str | None = None
+    if question.kind == "clarify":
         resolved_option = next(
             (
                 option
@@ -130,12 +161,18 @@ async def execute_ask_user(
         }
     )
 
-    if run_update_profile:
+    # 2026-08-04 レビュー是正(High・裁定13): 再実行は
+    # `kind=="preference"` かつ(既に timeout は上で return 済みなので)
+    # 回答が実在するときだけ行う。main の preference も対象。clarify は
+    # 回さない(曖昧参照の選択を恒久的選好と誤認しない)。再実行プロンプト
+    # には質問文 + 回答を渡す(自由記述の dates/origin 等が
+    # `ProfileDelta` に無いフィールドでも失われないように)。
+    if run_update_profile and question.kind == "preference":
         await update_profile(
             state,
             client=client,
             event_sink=event_sink,
-            utterance_override=answer_text,
+            utterance_override=_qa_utterance(question, answer_text),
         )
 
     digest = (
@@ -149,6 +186,12 @@ async def execute_ask_user(
         answered_by=answered_by,
         resolved_spot_id=resolved_spot_id,
     )
+
+
+def _qa_utterance(question: AskUserArgs, answer_text: str) -> str:
+    """`update_profile` の再実行に渡す発話。質問文 + 回答の両方を含める。"""
+
+    return f"(質問: {question.reason}) {answer_text}"
 
 
 __all__ = ["AskExecutionOutcome", "execute_ask_user"]

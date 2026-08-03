@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Annotated, Literal
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from starlette.responses import StreamingResponse
 
-from app.api.auth import get_current_user
+from app.api.auth import get_current_user, get_user_repository
 from app.api.schemas.chat import ChatAnswerRequest, ChatEvent, ChatRequest
 from app.api.sse import (
     ChatEventBuffer,
@@ -24,7 +24,7 @@ from app.core.llm import GenerationClient
 from app.domains.conversation import run_turn
 from app.domains.conversation.ask_registry import AskAnswer, AskUserRegistry
 from app.domains.conversation.state import TurnState
-from app.domains.users import UserData
+from app.domains.users import UserData, UserRepository
 
 ChatTurnRunner = Callable[..., Awaitable[TurnState | None]]
 logger = logging.getLogger("app.api.chat")
@@ -210,17 +210,32 @@ async def chat(
 async def chat_answer(
     body: ChatAnswerRequest,
     current_user: Annotated[UserData, Depends(get_current_user)],
+    repository: Annotated[UserRepository, Depends(get_user_repository)],
     ask_registry: Annotated[AskUserRegistry, Depends(get_ask_registry)],
 ) -> Response:
     """`ask_user` への回答(§1.4)。イベントは元の SSE ストリームに流れる。
 
     `resolves` があればチップ経由(`answered_by:"chip"`)、無ければ自由入力
     (`answered_by:"free_text"`)。回答を待つターンが無ければ 409。
+
+    2026-08-04 レビュー是正(High・裁定5): `resolves` を現在の
+    `pending_ask`(`GET /thread` と同じ表示中の質問)と照合する。表示中の
+    質問と一致しない(古い質問への `resolves`。例: Q1 の遅延回答が Q2 の
+    Future 登録後に届く)場合は 409 で拒否する。一致すれば chip、
+    `resolves` 無しは free_text のまま(自由入力は常に受理する)。
     """
 
     answered_by: Literal["chip", "free_text"] = (
         "chip" if body.resolves is not None else "free_text"
     )
+    if body.resolves is not None:
+        thread = await repository.get_thread(current_user.id)
+        resolves_payload = body.resolves.model_dump()
+        if not _resolves_matches_pending(resolves_payload, thread.pending):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="表示中の質問と一致しないため、この回答は受け付けられません",
+            )
     answer = AskAnswer(
         answer=body.answer,
         answered_by=answered_by,
@@ -232,3 +247,41 @@ async def chat_answer(
             detail="回答を待っているターンがありません",
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _resolves_matches_pending(
+    resolves: Mapping[str, Any], pending: Mapping[str, Any] | None
+) -> bool:
+    """`resolves`(チップ経由の回答)が、いま表示中の質問と一致するか。
+
+    `pending` は `UserRepository.get_thread` が返す公開形
+    (`GET /thread` と同じ。`users/repo.py:_public_pending`)。`kind` は
+    preference→`"ask_user"`、clarify→`"clarify"`。
+    """
+
+    if pending is None:
+        return False
+    if "surface" in resolves:  # ClarificationResolutionRequest{surface,value}
+        if pending.get("kind") != "clarify":
+            return False
+        if resolves.get("surface") != pending.get("surface"):
+            return False
+        options = pending.get("options")
+        if not isinstance(options, list):
+            return False
+        return any(
+            isinstance(option, Mapping) and option.get("value") == resolves.get("value")
+            for option in options
+        )
+    if "slot" in resolves:  # AskUserResolutionRequest{slot,value}
+        if pending.get("kind") != "ask_user":
+            return False
+        if resolves.get("slot") != pending.get("slot"):
+            return False
+        options = pending.get("options")
+        if not isinstance(options, list):
+            return False
+        # `state:ask_user` の options はラベル文字列のみ(§1.2)。フロントは
+        # value にラベルそのものを送る(`lib/askAnswer.js`)。
+        return resolves.get("value") in options
+    return False

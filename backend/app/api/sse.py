@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import suppress
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.api.schemas.chat import ChatEvent, DoneChatEvent, ErrorChatEvent
 from app.domains.conversation.events import ConversationEvent
 
 HEARTBEAT_FRAME = b": keep-alive\n\n"
 _STREAM_END = object()
+logger = logging.getLogger("app.api.sse")
 
 
 def adapt_conversation_event(
@@ -37,6 +39,42 @@ def adapt_conversation_event(
                 if _mapping(raw) is not None
             ]
     return ChatEvent.model_validate({"event": event.event, "data": payload})
+
+
+def _safe_adapt(event: ConversationEvent) -> ChatEvent | None:
+    """`adapt_conversation_event` を検証エラーから守る安全網(2026-08-04、
+
+    レビュー是正: Critical)。`domains.conversation.events.error_event` が
+    `stage` を既に検証しているため通常はここへ到達しないが、想定外の契約
+    違反(将来の実装ミス・テストの穴)でも `ChatEventBuffer.emit` が例外を
+    投げて Tool の結果適用を中断させない、という不変条件をコードで保証する。
+    """
+
+    try:
+        return adapt_conversation_event(event)
+    except ValidationError as exc:
+        logger.warning(
+            "chat_event_validation_failed",
+            extra={"event": event.event, "data": event.data, "error": str(exc)},
+        )
+        if event.event != "error":
+            # state/token/done は代替できないので、契約違反なら丸ごと落として
+            # ターンの完走を優先する(P3: 失敗を正常応答に偽装しないが、
+            # ここでは「イベント 1 件を失う」ことと「ターン全体を落とす」
+            # ことのどちらかを選ぶ場面であり、後者を避ける)。
+            return None
+        message = str(event.data.get("message") or "内部でエラーが発生しました")
+        return ChatEvent.model_validate(
+            {
+                "event": "error",
+                "data": {
+                    "stage": "main_agent",
+                    "code": "internal",
+                    "degraded": True,
+                    "message": message,
+                },
+            }
+        )
 
 
 def frame_sse(event: ChatEvent) -> bytes:
@@ -88,7 +126,14 @@ class ChatEventBuffer:
         self._finished = False
 
     async def emit(self, event: ConversationEvent) -> None:
-        adapted = adapt_conversation_event(event)
+        adapted = _safe_adapt(event)
+        if adapted is None:
+            # 契約違反のイベントは、ターンの完走(persist への到達)を優先して
+            # 落とす(2026-08-04、レビュー是正: Critical。`_safe_adapt` が
+            # 既にログ済み)。`error` イベント自体の変換失敗のみ、安全側の
+            # `stage="main_agent"` イベントへ差し替えて必ずクライアントへ
+            # 届ける(ユーザーには「縮退した」ことだけは伝える)。
+            return
         if adapted.root.event == "state" and adapted.root.data.kind in {
             "step",
             "candidates",
@@ -97,6 +142,15 @@ class ChatEventBuffer:
             "clarify",
         }:
             self.tool_phase_started.set()
+            # 2026-08-04 レビュー是正(Medium・裁定20): `state:step`
+            # (status=finished)で Tool 境界を閉じる。旧実装は最初の Tool
+            # 開始で一度 `set()` したら二度と `clear()` されず、以降の
+            # メイン LLM 呼び出し(次周の判断・`respond` のストリーミング)
+            # まで「Tool 中」として切断キャンセルの対象外になっていた
+            # (chat_sse.md §1.6: 切断時に打ち切るのはメイン LLM 呼び出しだけ、
+            # Tool の実行は完了させる、という区別を表現できていなかった)。
+            if adapted.root.data.kind == "step" and adapted.root.data.status == "finished":
+                self.tool_phase_started.clear()
         if adapted.root.event == "done":
             if self._done is None:
                 self._done = adapted
@@ -232,6 +286,37 @@ def is_done_event(event: ChatEvent) -> bool:
 
 def is_error_event(event: ChatEvent) -> bool:
     return isinstance(event.root, ErrorChatEvent)
+
+
+class ValidatingEventSink:
+    """テスト用シンク: `domains.conversation.events.MemoryEventSink` と同じ
+
+    記録に加え、各イベントを **API Pydantic 契約**(`adapt_conversation_event`)
+    まで通す(2026-08-04、レビュー是正: テストの穴 §3)。
+
+    `MemoryEventSink` は内部 `ConversationEvent` をそのまま保持するだけで
+    API 契約の検証を経由しないため、`stage="act"` のような契約外の値を
+    テストが検出できなかった(層 1 テストの穴)。本シンクは `emit` のたびに
+    `ChatEventBuffer` と同じ変換を通すため、契約違反があれば
+    `pydantic.ValidationError` としてテストが直接失敗する。
+    """
+
+    def __init__(self) -> None:
+        self.events: list[ConversationEvent] = []
+        self.validated: list[ChatEvent] = []
+
+    async def emit(self, event: ConversationEvent) -> None:
+        self.events.append(event.model_copy(deep=True))
+        # `ChatEventBuffer.emit` と異なり、ここでは意図的に例外を握り潰さない
+        # (テストに契約違反を伝播させるのが目的のため)。
+        self.validated.append(adapt_conversation_event(event))
+
+    @property
+    def sequence(self) -> list[str]:
+        return [
+            f"{event.event}:{event.data.get('kind', event.data.get('code', ''))}".rstrip(":")
+            for event in self.events
+        ]
 
 
 def _candidate_payload(

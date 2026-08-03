@@ -35,7 +35,13 @@ def _message(
     )
 
 
-def test_group_turns_starts_a_new_turn_on_every_user_message() -> None:
+def test_group_turns_falls_back_to_a_new_turn_per_user_message_without_turn_id() -> None:
+    """`meta.turn_id` が無い(移行前の)行は旧ヒューリスティックにフォールバック
+
+    する(2026-08-04、レビュー是正・裁定11で `turn_id` ベースへ変更した際の
+    後方互換パス)。
+    """
+
     messages = [
         _message(1, "user", "u1"),
         _message(2, "assistant", "a1"),
@@ -49,6 +55,69 @@ def test_group_turns_starts_a_new_turn_on_every_user_message() -> None:
     assert [turn.index for turn in turns] == [0, 1]
     assert [message.id for message in turns[1].messages] == [3, 4, 5]
     assert turns[1].last_message_id == 5
+
+
+def test_group_turns_keeps_same_turn_id_rows_in_one_turn() -> None:
+    """裁定11(2026-08-04レビュー是正): `ask_user` への回答は同一ターン内で
+
+    複数の user 行として persist される(`repository.py:persist_turn`)。
+    同じ `meta.turn_id` を持つ行はすべて同一ターンにまとまる。
+    """
+
+    messages = [
+        _message(1, "user", "おすすめは？", {"turn_id": "t1"}),
+        _message(2, "user", "30分程度なら", {"turn_id": "t1", "answer_to": {"reason": "歩けますか"}}),
+        _message(3, "assistant", "ご案内します", {"turn_id": "t1"}),
+        _message(4, "user", "1日目に入れて", {"turn_id": "t2"}),
+        _message(5, "assistant", "入れました", {"turn_id": "t2"}),
+    ]
+
+    turns = group_turns(messages)
+
+    assert [turn.index for turn in turns] == [0, 1]
+    assert [message.id for message in turns[0].messages] == [1, 2, 3]
+    assert [message.id for message in turns[1].messages] == [4, 5]
+
+
+def test_group_turns_starts_a_new_turn_when_turn_id_changes_from_legacy_rows() -> None:
+    """移行境界: turn_id 無し行の直後に turn_id 付き行が来たら新ターンにする。"""
+
+    messages = [
+        _message(1, "user", "旧形式の発話"),
+        _message(2, "assistant", "旧形式の応答"),
+        _message(3, "user", "新形式の発話", {"turn_id": "t1"}),
+        _message(4, "assistant", "新形式の応答", {"turn_id": "t1"}),
+    ]
+
+    turns = group_turns(messages)
+
+    assert [turn.index for turn in turns] == [0, 1]
+    assert [message.id for message in turns[0].messages] == [1, 2]
+    assert [message.id for message in turns[1].messages] == [3, 4]
+
+
+def test_raw_layer_includes_the_question_text_for_ask_user_answer_rows() -> None:
+    """裁定11: ④(直近生テキスト)は `ask_user` への回答行に質問文も出す。
+
+    回答単独(例: 「30分程度なら」)では何を聞かれたか分からず、指示語も
+    解けない。
+    """
+
+    messages = [
+        _message(1, "user", "おすすめは？", {"turn_id": "t1"}),
+        _message(
+            2,
+            "user",
+            "30分程度なら",
+            {"turn_id": "t1", "answer_to": {"reason": "どのくらい歩けますか"}},
+        ),
+        _message(3, "assistant", "ご案内します", {"turn_id": "t1"}),
+    ]
+
+    built = build_conversation_history(messages)
+
+    assert "u: [質問: どのくらい歩けますか] → 回答: 30分程度なら" in built.text
+    assert "u: おすすめは？" in built.text
 
 
 def test_first_unfolded_turn_index_skips_turns_already_in_the_summary() -> None:

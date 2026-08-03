@@ -151,7 +151,14 @@ async def update_profile(
 
     delta = None if is_profile_delta_empty(output.profile_delta) else output.profile_delta
     state.profile_delta = delta
-    state.score_adjustments = _valid_score_adjustments(state, output.score_adjustments)
+    # 2026-08-04 レビュー是正(High・裁定13): 置換ではなくマージする。
+    # `ask_user` の回答に対して本ステップをターン内でもう 1 回走らせると
+    # (§2・§7)、以前は毎回まるごと置き換えていたため、ターン冒頭の発話
+    # 由来の score_adjustments(そのターン限りの点数補正)が回答後の再実行で
+    # 消えていた。同じ spot_id は後勝ちで上書きし、それ以外は両方残す。
+    state.score_adjustments = _merge_score_adjustments(
+        state.score_adjustments, _valid_score_adjustments(state, output.score_adjustments)
+    )
 
     if delta is not None:
         state.profile = merge_profile_delta(state.profile, delta)
@@ -160,6 +167,17 @@ async def update_profile(
             state_event("profile", profile=state.profile.model_dump(mode="json")),
         )
     return state
+
+
+def _merge_score_adjustments(
+    existing: list[ScoreAdjustment], new: list[ScoreAdjustment]
+) -> list[ScoreAdjustment]:
+    """同じ `spot_id` は後勝ちで上書きし、それ以外は両方残す(順序は維持)。"""
+
+    merged: dict[str, ScoreAdjustment] = {value.spot_id: value for value in existing}
+    for value in new:
+        merged[value.spot_id] = value
+    return list(merged.values())
 
 
 def _valid_score_adjustments(

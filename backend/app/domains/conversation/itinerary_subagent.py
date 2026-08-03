@@ -25,6 +25,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from pydantic import ValidationError
+
 from app.domains.conversation.guards import (
     normalize_revert_ops,
     validate_and_normalize_constraints,
@@ -130,11 +132,7 @@ async def run_plan_itinerary(
     if isinstance(result, ToolError):
         return result.message_ja, _error_payload(result)
     state.step_results[step_id] = result
-    merged_constraints = [
-        *state.pending_constraints,
-        *[value.model_dump(mode="json", exclude_none=True) for value in constraints],
-    ]
-    _apply_itinerary_result(state, result, constraints=merged_constraints)
+    _apply_itinerary_result(state, result)
 
     # フロー4: 整形。
     digest = _format_itinerary_result_digest(
@@ -152,12 +150,7 @@ async def run_edit_itinerary(
     """`edit_itinerary` Tool。フロー1〜4を固定順で実行する。"""
 
     if state.itinerary is None:
-        error = ToolError(
-            code=ToolErrorCode.PRECONDITION_UNMET,
-            message_ja="編集できる旅程がまだありません。先に plan_itinerary を使ってください。",
-            recoverable=True,
-        )
-        return error.message_ja, _error_payload(error)
+        return _edit_without_itinerary(state, raw_args)
 
     # フロー1: 受付。
     parsed = MainEditItineraryArgs.model_validate(raw_args)
@@ -221,22 +214,62 @@ async def run_edit_itinerary(
     if isinstance(result, ToolError):
         return result.message_ja, _error_payload(result)
     state.step_results[step_id] = result
-    kept = [
-        value
-        for value in state.itinerary.constraints
-        if str(value.get("id")) not in set(valid_remove)
-    ]
-    merged_constraints = [
-        *kept,
-        *[value.model_dump(mode="json", exclude_none=True) for value in constraints],
-    ]
-    _apply_itinerary_result(state, result, constraints=merged_constraints)
+    _apply_itinerary_result(state, result)
 
     # フロー4: 整形。
     digest = _format_itinerary_result_digest(
         state, result, dropped=dropped, ambiguous=ambiguous
     )
     return digest, None
+
+
+def _edit_without_itinerary(
+    state: TurnState, raw_args: dict[str, Any]
+) -> tuple[str, dict[str, Any] | None]:
+    """旅程がまだ無い `edit_itinerary`(§5「旅程が無い状態の edit_itinerary は
+
+    ToolError(precondition_unmet) を結果として返す」)。
+
+    2026-08-04 レビュー是正(High): ReAct 化で `constraints` は常に
+    `plan_itinerary`/`edit_itinerary` の引数として来るため、**この経路が
+    `threads.pending_constraints` へ書き込める新アーキ上で唯一の場所**に
+    なった。`constraints.add` があれば名前解決・検証まで済ませたうえで
+    `state.pending_constraints` へ積む(読出し・消去 = 最初の `plan_itinerary`
+    での移送は既存のまま。data_model.md §4.5.4)。
+    """
+
+    try:
+        parsed = MainEditItineraryArgs.model_validate(raw_args)
+    except ValidationError:
+        parsed = None
+
+    saved = False
+    if parsed is not None and parsed.constraints is not None and parsed.constraints.add:
+        name_context = _name_context(state)
+        used_ids = set(active_constraint_ids(state))
+        drafts, _dropped, _ambiguous = _build_constraint_drafts(
+            name_context,
+            parsed.constraints,
+            spots=state.spot_catalog,
+            created_at_version=1,
+            used_ids=used_ids,
+        )
+        if drafts:
+            state.pending_constraints = [
+                *state.pending_constraints,
+                *[value.model_dump(mode="json", exclude_none=True) for value in drafts],
+            ]
+            saved = True
+
+    message = "編集できる旅程がまだありません。先に plan_itinerary を使ってください。"
+    if saved:
+        message += "指定された条件は保存済みです。旅程作成時に反映します。"
+    error = ToolError(
+        code=ToolErrorCode.PRECONDITION_UNMET,
+        message_ja=message,
+        recoverable=True,
+    )
+    return error.message_ja, _error_payload(error)
 
 
 def active_constraint_ids(state: TurnState) -> list[str]:
@@ -314,6 +347,26 @@ def _resolve_ops(
             if not outcome.resolved:
                 continue
             operation["targets"] = outcome.resolved
+            if op == "add":
+                # 2026-08-04 レビュー是正(High): `after` もスポット名→id
+                # 解決の対象にする。`targets` だけ解決して `after` を素通り
+                # させると、下流の `_add_position`/`_require_item` が
+                # spot_id しか受け付けないため「地点Bを地点Aの後に追加」が
+                # 常に失敗していた。未解決なら `after` だけを落として報告し、
+                # 手全体は実行する(C4)。
+                after_name = operation.get("after")
+                if isinstance(after_name, str) and after_name.strip():
+                    after_match = name_context.resolve_detailed(after_name)
+                    if after_match.status == "resolved":
+                        operation["after"] = after_match.spot_id
+                    else:
+                        if after_match.status == "ambiguous":
+                            ambiguous.append(
+                                f"after: {describe_ambiguous(after_name, after_match)}"
+                            )
+                        else:
+                            dropped.append(f"after: {after_name}")
+                        operation["after"] = None
         elif op in {"move", "set_stay", "set_time"}:
             name = operation.get("target")
             if not isinstance(name, str):
@@ -418,12 +471,22 @@ def _build_constraint_drafts(
 # ---------------------------------------------------------------------------
 
 
-def _apply_itinerary_result(
-    state: TurnState, result: ToolResult, *, constraints: list[dict[str, Any]]
-) -> None:
+def _apply_itinerary_result(state: TurnState, result: ToolResult) -> None:
+    """DB へ保存された制約(Service が返す `constraints`)をそのまま採用する。
+
+    2026-08-04 レビュー是正(High・裁定7): 以前はメインループが渡した制約
+    だけから `state.itinerary.constraints` を再構成しており、Service が
+    plan/edit 時に再採番した id・`must_visit`/`add`/`set_time` 由来の暗黙
+    制約・revert 先の版の制約が欠落しうった。`PlanItineraryResult`/
+    `EditItineraryResult.constraints` を正として使うことで、DB に保存された
+    制約と同一ターンの `state.itinerary.constraints` が常に一致する。
+    """
+
     raw = result.data.get("itinerary")
     if isinstance(raw, dict):
         itinerary = Itinerary.model_validate(raw)
+        raw_constraints = result.data.get("constraints")
+        constraints = raw_constraints if isinstance(raw_constraints, list) else []
         state.itinerary = ItineraryState(
             itinerary=itinerary,
             constraints=constraints,

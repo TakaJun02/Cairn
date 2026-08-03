@@ -81,13 +81,25 @@ async def wait_for_answer(
     *,
     key: int,
     timeout_sec: float = DEFAULT_ASK_TIMEOUT_SEC,
+    future: asyncio.Future[AskAnswer] | None = None,
 ) -> AskAnswer | None:
-    """回答を待つ。タイムアウトで `None` を返す(呼び出し元が timeout 扱いにする)。"""
+    """回答を待つ。タイムアウトで `None` を返す(呼び出し元が timeout 扱いにする)。
 
-    future = registry.begin(key)
+    `future` を渡すと、呼び出し元が既に `registry.begin(key)` 済みの Future
+    をそのまま使う(2026-08-04、レビュー是正・裁定6: SSE 送出や
+    `pending_ask` の DB 書き込みより**前**に waiter 登録を済ませておく設計。
+    §7)。渡さなければ従来どおりここで `begin` する(後方互換)。
+
+    `asyncio.CancelledError` は再送出する(2026-08-04、レビュー是正・裁定10)。
+    以前はタイムアウトと同じ扱いで握り潰しており、呼び出し元(知識検索 SA の
+    外側 `asyncio.timeout`)が期待するキャンセル伝播が起きず、質問はいつも
+    600 秒待ってから初めてキャンセルが効くという壊れた挙動になっていた。
+    """
+
+    resolved_future = future if future is not None else registry.begin(key)
     try:
-        return await asyncio.wait_for(future, timeout=timeout_sec)
-    except (TimeoutError, asyncio.CancelledError):
+        return await asyncio.wait_for(resolved_future, timeout=timeout_sec)
+    except TimeoutError:
         return None
     finally:
         registry.end(key)

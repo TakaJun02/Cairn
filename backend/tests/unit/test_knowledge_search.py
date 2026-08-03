@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Sequence
 from typing import Any
@@ -26,7 +27,7 @@ from app.domains.narration.search.retrieval import (
     centered_snippet,
     rank_lexical_chunks,
 )
-from app.domains.narration.search.types import SearchResult
+from app.domains.narration.search.types import SearchResult, ToolError, ToolErrorCode
 from app.domains.narration.search.web import (
     CircuitBreakerState,
     TavilyWebSearchClient,
@@ -424,6 +425,93 @@ async def test_ask_user_callback_is_invoked_and_answer_returns_as_observation() 
     # 回答が観測として次の decide 周のプロンプトに含まれる(action_log 経由)。
     second_prompt = client.messages[1][1]["content"]
     assert "鶴間池(回答方法: chip)" in second_prompt
+
+
+async def test_ask_user_wait_is_excluded_from_the_search_wallclock_budget() -> None:
+    """裁定10(2026-08-04レビュー是正): `ask_user` の待機時間は検索全体の
+
+    ウォールクロック予算(`timeout_seconds`)から除外される。回答を待つ間に
+    予算を使い切っても、検索全体はタイムアウトしない(待機自体は
+    `ask_registry` 側の 10 分タイマーが管理する。§6)。
+    """
+
+    async def slow_ask_callback(**kwargs: Any) -> str:
+        del kwargs
+        # `timeout_seconds`(0.05秒)より明らかに長く待たせる。
+        await asyncio.sleep(0.15)
+        return "鶴間池"
+
+    repository = MemoryRepository(
+        [_hit(doc_id="faci_spot/spot_001", title="鶴間池", body="静かな池です")]
+    )
+    client = ScriptedDecisionClient(
+        [
+            _ask_decision(),
+            _decision("lexical_search", {"keywords": ["鶴間池"]}),
+            _decision(
+                "answer",
+                {
+                    "answer_ja": "鶴間池は静かな池です。",
+                    "sources": [{"kind": "knowledge", "doc_id": "faci_spot/spot_001"}],
+                    "coverage": "full",
+                },
+            ),
+        ]
+    )
+    agent = KnowledgeSearchAgent(
+        KnowledgeRetrieval(repository, RecordingEmbedding()),
+        NoWebSearch(),
+        decision_client=client,
+        ask_callback=slow_ask_callback,
+        timeout_seconds=0.05,
+    )
+
+    result = await agent.search("池について教えて")
+
+    assert isinstance(result, SearchResult)
+    assert result.coverage == "full"
+
+
+async def test_search_still_times_out_after_ask_user_if_remaining_budget_is_exceeded() -> None:
+    """待機時間は除外されるが、再開後に予算を使い切れば通常どおり打ち切る
+
+    (pause/resume であって、無制限に猶予するわけではないことの確認)。
+    """
+
+    async def instant_ask_callback(**kwargs: Any) -> str:
+        del kwargs
+        return "鶴間池"
+
+    repository = MemoryRepository(
+        [_hit(doc_id="faci_spot/spot_001", title="鶴間池", body="静かな池です")]
+    )
+    client = ScriptedDecisionClient(
+        [
+            _ask_decision(),
+            _decision("lexical_search", {"keywords": ["鶴間池"]}),
+        ]
+    )
+
+    async def slow_generate(messages: list[dict[str, str]], **kwargs: Any) -> str:
+        # 2 回目(lexical_search 後)の decide 呼び出しを遅らせ、
+        # 再開後の残り予算を使い切らせる。
+        if len(client.messages) >= 2:
+            await asyncio.sleep(0.15)
+        return await ScriptedDecisionClient.generate(client, messages, **kwargs)
+
+    client.generate = slow_generate  # type: ignore[method-assign]
+    agent = KnowledgeSearchAgent(
+        KnowledgeRetrieval(repository, RecordingEmbedding()),
+        NoWebSearch(),
+        decision_client=client,
+        ask_callback=instant_ask_callback,
+        timeout_seconds=0.1,
+    )
+
+    result = await agent.search("池について教えて")
+
+    assert isinstance(result, ToolError)
+    assert result.code == ToolErrorCode.UPSTREAM_TIMEOUT
 
 
 def test_guided_schema_includes_ask_user_fields_when_offered() -> None:

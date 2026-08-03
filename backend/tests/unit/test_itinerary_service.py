@@ -155,6 +155,9 @@ async def test_first_plan_moves_pending_constraints_and_returns_two_alternatives
     assert repository.pending == []
     ids = [value["id"] for value in repository.versions[1].constraints]
     assert ids == ["c_001", "c_002"]
+    # 2026-08-04 レビュー是正(裁定7): `result.constraints` は DB へ保存された
+    # ものと一致する(呼び出し元がこれを正として state を組み立てるため)。
+    assert [value.id for value in result.constraints] == ids
 
 
 async def test_edit_copies_constraint_ids_adds_version_and_revert_writes_no_row() -> None:
@@ -190,6 +193,11 @@ async def test_edit_copies_constraint_ids_adds_version_and_revert_writes_no_row(
     assert repository.versions[2].constraints[0]["id"] == original_constraint_id
     assert len(repository.versions[2].constraints) == 2
     assert len(edited.diff.moved) <= 2
+    # 2026-08-04 レビュー是正(裁定7): edit 時の暗黙制約(add op由来の require)
+    # も含め、`result.constraints` が保存内容と一致する。
+    assert [value.id for value in edited.constraints] == [
+        value["id"] for value in repository.versions[2].constraints
+    ]
     append_count = repository.append_count
 
     reverted = await service.edit_itinerary(
@@ -204,6 +212,10 @@ async def test_edit_copies_constraint_ids_adds_version_and_revert_writes_no_row(
     assert reverted.itinerary.version == 1
     assert repository.append_count == append_count
     assert sorted(repository.versions) == [1, 2]
+    # revert 先(v1)の制約がそのまま返る(§5「revert では対象版の制約へ戻す」)。
+    assert [value.id for value in reverted.constraints] == [
+        value["id"] for value in repository.versions[1].constraints
+    ]
 
 
 async def test_edit_without_itinerary_returns_recoverable_precondition_error() -> None:

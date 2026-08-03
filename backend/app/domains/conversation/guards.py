@@ -5,7 +5,7 @@
 - `normalize_revert_ops`: `edit_itinerary.ops` に `revert` が混じったときの
   排他化。メインループが Tool 実行前に使う
 - `validate_response_spot_names`: `respond` のクローズドワールド検査
-- `evaluate_ask_user`(R4・A1〜A5): `ask_user` の HITL 抑制ガード。
+- `evaluate_ask_user`(R4・A1〜A6): `ask_user` の HITL 抑制ガード。
   `ask_execution.execute_ask_user` がメイン・レコメンド SA・知識検索 SA の
   3 経路共通で呼ぶ(§7・§10)
 """
@@ -16,8 +16,8 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from app.domains.conversation.state import SpotFact
-from app.domains.conversation.types import AskUserArgs, ConstraintDraft, UnmodeledItem
+from app.domains.conversation.state import ProfileState, SpotFact
+from app.domains.conversation.types import AskUserArgs, ConstraintDraft, Slot, UnmodeledItem
 from app.domains.itinerary.predicates import normalize_constraints
 
 # R4: `ask_user` は 1 ターン 2 回まで(メイン・SA 合算。§3.5・§10)。
@@ -134,8 +134,9 @@ def evaluate_ask_user(
     resolved_ambiguities: Sequence[object] = (),
     allowed_spot_ids: set[str] | None = None,
     existing_spot_ids: set[str] | None = None,
+    profile: ProfileState | None = None,
 ) -> GuardResult:
-    """`ask_user` の抑制ガード(§10 R4・A1〜A5)。
+    """`ask_user` の抑制ガード(§10 R4・A1〜A6)。
 
     メイン(`main_agent.py`)・レコメンド SA(`recommend_agent.py`)・知識検索 SA
     (`narration/search/agent.py` の ask コールバック経由)の 3 経路すべてが
@@ -146,6 +147,10 @@ def evaluate_ask_user(
     選択肢が実在 spot_id に解決できるか)を検査する。呼び出し元が spot_id
     以外の具体値(レコメンド SA の enum 値・知識検索の文書ラベル等)を使う
     場合は渡さなくてよい(A4 はメインエージェントの clarify 専用の防御)。
+
+    `profile` を渡したときだけ A6(2026-08-04、レビュー是正・裁定17。最小
+    実装)を検査する: `kind=preference` の該当 `slot` が既にプロフィールに
+    値を持つなら「進められるのに念のため確認する」ことになるため聞かない。
     """
 
     if ask_user_count >= MAX_ASK_USER_PER_TURN:
@@ -163,6 +168,17 @@ def evaluate_ask_user(
             False,
             "A1",
             f"slot={question.slot.value} は質問済みです",
+        )
+    if (
+        question.kind == "preference"
+        and question.slot is not None
+        and profile is not None
+        and _preference_slot_already_known(profile, question.slot)
+    ):
+        return GuardResult(
+            False,
+            "A6",
+            f"slot={question.slot.value} は既にプロフィールに値があります",
         )
     if not 2 <= len(question.options) <= 4:
         return GuardResult(False, "A3", "選択肢は 2〜4 個にしてください")
@@ -189,6 +205,24 @@ def evaluate_ask_user(
         }:
             return GuardResult(False, "A5", "同じ曖昧さは既に聞き返しています")
     return GuardResult(True)
+
+
+def _preference_slot_already_known(profile: ProfileState, slot: Slot) -> bool:
+    """A6 の最小実装: `slot` に対応する `ProfileState` の列が既に埋まっているか。
+
+    `dates`/`origin`/`onboarding`(旅程固有の情報で、永続プロフィールには
+    対応する列が無い)は常に `False`(=聞いてよい)を返す。
+    """
+
+    if slot is Slot.PARTY:
+        return profile.party is not None
+    if slot is Slot.MOBILITY:
+        return profile.mobility is not None
+    if slot is Slot.PACE:
+        return profile.pace is not None
+    if slot is Slot.INTERESTS:
+        return bool(profile.interests)
+    return False
 
 
 def _resolved_surfaces(values: Sequence[object]) -> list[str]:

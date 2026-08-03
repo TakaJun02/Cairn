@@ -5,11 +5,17 @@
 (フロー2「構築」)は、メインエージェントが書いたスポット名を次の優先順で
 `spot_id` に解決する:
 
+0. 序数参照(「2番目」「2番目のやつ」等)は `last_candidates` の `rank` から
+   直接解決する(2026-08-04、レビュー是正・裁定9)
 1. 現在の旅程に含まれるスポットの名前
 2. 直近候補(`last_candidates`)の名前
-3. DB(`spot_catalog`)の `name_ja` 完全一致
-4. 別名・表記ゆれ(`aliases_ja` の完全一致 → ひらがな/カタカナ正規化 + 空白除去
-   したうえでの部分一致。43件規模のデータなので正規化 + 部分一致で十分)
+3. DB(`spot_catalog`)の名寄せスコア
+   ―― かな折りたたみ(カタカナ→ひらがな)正規化のうえで
+   **正式名完全一致 > 正式名部分一致 > 別名完全一致 > 別名部分一致**
+   の優先順で照合する(2026-08-04、レビュー是正: 実データ「黄桜温泉ゆらり」が
+   `spot_030`「鳥海温泉 遊楽里」の短い別名「ゆらり」に部分一致して誤解決して
+   いた。正式名の**単語単位**(空白区切り)の部分一致もこのティアに含める
+   ことで、「黄桜温泉」のような複合名の一部にも正しく当たる)
 
 優先度の高いティアで一意に決まればそこで確定する。あるティアで複数の
 `spot_id` に解決してしまう場合は「曖昧」として扱い、そのティアで検索を止める
@@ -36,9 +42,23 @@ _KATAKANA_START = 0x30A1
 _KATAKANA_END = 0x30F6
 _KATAKANA_TO_HIRAGANA_OFFSET = 0x60
 _WHITESPACE_AND_DOT_RE = re.compile(r"[\s・･]")
+_TOKEN_SPLIT_RE = re.compile(r"[\s・･]+")
 # 短すぎる語は部分一致すると無関係な地点まで拾ってしまうため対象外にする。
 _MIN_PARTIAL_MATCH_LENGTH = 2
 _MAX_AMBIGUOUS_CANDIDATES = 5
+# 「2番目」「2番目のやつ」「1つ目」「3個目」等の序数参照(§5 フロー2)。
+# 全角数字は normalize 前の NFKC で半角へ揃えてからマッチする。
+_ORDINAL_RE = re.compile(r"^\s*(\d+)\s*(?:番目|番|つ目|個目)")
+
+
+def _tokenize(value: str) -> list[str]:
+    """空白・中黒区切りの単語へ分ける(正規化前の生文字列に対して行う)。
+
+    「黄桜温泉 湯楽里」のような複合名の構成要素(単語)単位でも部分一致
+    できるようにするための索引作成専用の補助。
+    """
+
+    return [part for part in _TOKEN_SPLIT_RE.split(value.strip()) if part]
 
 
 def normalize_name(value: str) -> str:
@@ -94,9 +114,18 @@ class NameResolutionContext:
     _tier_itinerary: dict[str, set[str]] = field(default_factory=dict, compare=False)
     _tier_candidates: dict[str, set[str]] = field(default_factory=dict, compare=False)
     _tier_name_exact: dict[str, set[str]] = field(default_factory=dict, compare=False)
+    # 正式名の部分一致索引: (キー, spot_id) のペア。キーはフルネームの正規化形と
+    # 単語(空白区切り)単位の正規化形の両方を含む(2026-08-04、レビュー是正)。
+    _name_partial_index: tuple[tuple[str, str], ...] = field(
+        default_factory=tuple, compare=False
+    )
     _tier_alias_exact: dict[str, set[str]] = field(default_factory=dict, compare=False)
-    _partial_index: tuple[tuple[str, str], ...] = field(default_factory=tuple, compare=False)
+    _alias_partial_index: tuple[tuple[str, str], ...] = field(
+        default_factory=tuple, compare=False
+    )
     _display_names: dict[str, str] = field(default_factory=dict, compare=False)
+    # 序数参照(「2番目」等)の解決先。last_candidates の rank → spot_id。
+    _rank_index: dict[int, set[str]] = field(default_factory=dict, compare=False)
 
     def __post_init__(self) -> None:
         display_names = {
@@ -120,29 +149,42 @@ class NameResolutionContext:
         object.__setattr__(self, "_tier_itinerary", tier_itinerary)
 
         tier_candidates: dict[str, set[str]] = {}
+        rank_index: dict[int, set[str]] = {}
         for candidate in self.last_candidates:
             tier_candidates.setdefault(normalize_name(candidate.name_ja), set()).add(
                 candidate.spot_id
             )
+            rank_index.setdefault(candidate.rank, set()).add(candidate.spot_id)
         object.__setattr__(self, "_tier_candidates", tier_candidates)
+        object.__setattr__(self, "_rank_index", rank_index)
 
         tier_name_exact: dict[str, set[str]] = {}
         tier_alias_exact: dict[str, set[str]] = {}
-        partial_index: list[tuple[str, str]] = []
+        name_partial_index: list[tuple[str, str]] = []
+        alias_partial_index: list[tuple[str, str]] = []
         for spot_id, spot in self.spot_catalog.items():
             name_key = normalize_name(spot.name_ja)
             if name_key:
                 tier_name_exact.setdefault(name_key, set()).add(spot_id)
-                partial_index.append((name_key, spot_id))
+                name_partial_index.append((name_key, spot_id))
+                for token in _tokenize(spot.name_ja):
+                    token_key = normalize_name(token)
+                    if token_key and token_key != name_key:
+                        name_partial_index.append((token_key, spot_id))
             for alias in spot.aliases_ja:
                 alias_key = normalize_name(alias)
                 if not alias_key:
                     continue
                 tier_alias_exact.setdefault(alias_key, set()).add(spot_id)
-                partial_index.append((alias_key, spot_id))
+                alias_partial_index.append((alias_key, spot_id))
+                for token in _tokenize(alias):
+                    token_key = normalize_name(token)
+                    if token_key and token_key != alias_key:
+                        alias_partial_index.append((token_key, spot_id))
         object.__setattr__(self, "_tier_name_exact", tier_name_exact)
         object.__setattr__(self, "_tier_alias_exact", tier_alias_exact)
-        object.__setattr__(self, "_partial_index", tuple(partial_index))
+        object.__setattr__(self, "_name_partial_index", tuple(name_partial_index))
+        object.__setattr__(self, "_alias_partial_index", tuple(alias_partial_index))
 
     def resolve(self, name: str) -> str | None:
         """後方互換の単純 API。曖昧・未解決はどちらも `None`。"""
@@ -151,10 +193,21 @@ class NameResolutionContext:
         return match.spot_id if match.status == "resolved" else None
 
     def resolve_detailed(self, name: str) -> NameMatch:
-        """優先度つきティアを順に見て、最初にヒットしたティアで確定する。"""
+        """優先度つきティアを順に見て、最初にヒットしたティアで確定する。
+
+        0. 序数参照(「2番目」等)は `last_candidates` の `rank` から直接解決
+           する(2026-08-04、レビュー是正・裁定9)。
+        1. 現在の旅程内の名前(完全一致)
+        2. 直近候補の名前(完全一致)
+        3. 正式名完全一致 > 正式名部分一致 > 別名完全一致 > 別名部分一致
+           (かな折りたたみ正規化のうえで。実データの誤名寄せ対策)
+        """
 
         if not name or not name.strip():
             return NameMatch(status="unresolved")
+        ordinal_match = self._resolve_ordinal(name)
+        if ordinal_match is not None:
+            return ordinal_match
         query = normalize_name(name)
         if not query:
             return NameMatch(status="unresolved")
@@ -162,20 +215,47 @@ class NameResolutionContext:
             self._tier_itinerary,
             self._tier_candidates,
             self._tier_name_exact,
-            self._tier_alias_exact,
         ):
             hit = tier.get(query)
             if hit:
                 return self._outcome(hit)
         if len(query) >= _MIN_PARTIAL_MATCH_LENGTH:
-            partial_hits = {
-                spot_id
-                for key, spot_id in self._partial_index
-                if len(key) >= _MIN_PARTIAL_MATCH_LENGTH and (key in query or query in key)
-            }
-            if partial_hits:
-                return self._outcome(partial_hits)
+            name_partial_hits = self._partial_hits(self._name_partial_index, query)
+            if name_partial_hits:
+                return self._outcome(name_partial_hits)
+        alias_exact_hit = self._tier_alias_exact.get(query)
+        if alias_exact_hit:
+            return self._outcome(alias_exact_hit)
+        if len(query) >= _MIN_PARTIAL_MATCH_LENGTH:
+            alias_partial_hits = self._partial_hits(self._alias_partial_index, query)
+            if alias_partial_hits:
+                return self._outcome(alias_partial_hits)
         return NameMatch(status="unresolved")
+
+    def _resolve_ordinal(self, name: str) -> NameMatch | None:
+        """「2番目」等を `last_candidates` の rank から解決する。
+
+        序数表現ではない、または該当 rank の候補が無ければ `None` を返し、
+        呼び出し元は通常の名前ティアへフォールバックする。
+        """
+
+        normalized = unicodedata.normalize("NFKC", name.strip())
+        match = _ORDINAL_RE.match(normalized)
+        if match is None:
+            return None
+        rank = int(match.group(1))
+        hit = self._rank_index.get(rank)
+        if not hit:
+            return NameMatch(status="unresolved")
+        return self._outcome(hit)
+
+    @staticmethod
+    def _partial_hits(index: tuple[tuple[str, str], ...], query: str) -> set[str]:
+        return {
+            spot_id
+            for key, spot_id in index
+            if len(key) >= _MIN_PARTIAL_MATCH_LENGTH and (key in query or query in key)
+        }
 
     def _outcome(self, spot_ids: set[str]) -> NameMatch:
         if len(spot_ids) == 1:
