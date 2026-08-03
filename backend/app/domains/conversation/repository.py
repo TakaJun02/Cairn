@@ -18,6 +18,7 @@ from app.db_models import (
     Thread,
     User,
 )
+from app.domains.conversation.history_summary import HistorySummaryState
 from app.domains.conversation.state import (
     CandidateReference,
     ContextSnapshot,
@@ -120,7 +121,45 @@ class ConversationRepository:
             },
             spots=spots,
             tag_vocabulary=tag_vocabulary,
+            history_summary=thread.history_summary,
+            summarized_until_message_id=thread.summarized_until_message_id,
         )
+
+    async def load_history_summary_state(self, thread_id: int) -> HistorySummaryState:
+        """要約更新（history_summary.py）が読む、永続化済みの現在状態。"""
+
+        thread = await self.session.scalar(select(Thread).where(Thread.id == thread_id))
+        if thread is None:
+            raise ConversationStateError(f"thread が見つかりません: {thread_id}")
+        message_rows = (
+            await self.session.scalars(
+                select(Message).where(Message.thread_id == thread_id).order_by(Message.seq)
+            )
+        ).all()
+        return HistorySummaryState(
+            history_summary=thread.history_summary,
+            summarized_until_message_id=thread.summarized_until_message_id,
+            messages=[_message_state(value) for value in message_rows],
+        )
+
+    async def commit_history_summary(
+        self,
+        thread_id: int,
+        *,
+        summary: str,
+        summarized_until_message_id: int,
+    ) -> None:
+        """本体トランザクションとは別に、要約列だけを更新する。"""
+
+        await self.session.execute(
+            update(Thread)
+            .where(Thread.id == thread_id)
+            .values(
+                history_summary=summary,
+                summarized_until_message_id=summarized_until_message_id,
+            )
+        )
+        await self.session.commit()
 
     async def persist_turn(self, state: TurnState) -> int | None:
         """全 Tool の未コミット変更とメッセージを 1 回だけ commit する。"""

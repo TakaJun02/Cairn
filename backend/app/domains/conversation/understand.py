@@ -186,10 +186,8 @@ def _retry_messages(
 def _copy_output(state: TurnState, output: UnderstandOutput) -> None:
     state.intent = output.intent
     state.plan = output.plan
-    state.profile_delta = output.profile_delta
     state.constraints = output.constraints
     state.constraints_remove = output.constraints_remove
-    state.score_adjustments = output.score_adjustments
     state.selection_hints = output.selection_hints
     state.unmodeled = output.unmodeled
     state.references = output.references
@@ -211,10 +209,6 @@ def _deduplicate_output(output: UnderstandOutput) -> UnderstandOutput:
         ),
     )
     constraints_remove = list(dict.fromkeys(output.constraints_remove))
-    score_adjustments = _unique_by(
-        output.score_adjustments,
-        lambda value: value.spot_id,
-    )
     selection_hints = _unique_by(output.selection_hints, lambda value: value.text)
     unmodeled = _unique_by(output.unmodeled, lambda value: value.text)
     return output.model_copy(
@@ -222,7 +216,6 @@ def _deduplicate_output(output: UnderstandOutput) -> UnderstandOutput:
             "references": references,
             "constraints": constraints,
             "constraints_remove": constraints_remove,
-            "score_adjustments": score_adjustments,
             "selection_hints": selection_hints,
             "unmodeled": unmodeled,
         },
@@ -254,19 +247,6 @@ def _postvalidate_extractions(state: TurnState) -> None:
             )
     state.references = valid_references
 
-    valid_adjustments = []
-    for adjustment in state.score_adjustments:
-        if adjustment.spot_id in allowed and adjustment.spot_id in existing:
-            valid_adjustments.append(adjustment)
-        else:
-            state.unmodeled.append(
-                UnmodeledItem(
-                    text=adjustment.why or adjustment.spot_id,
-                    reason=f"参照できない spot_id です: {adjustment.spot_id}",
-                )
-            )
-    state.score_adjustments = valid_adjustments
-
     active_ids = {
         str(value.get("id"))
         for value in (
@@ -297,17 +277,15 @@ def _postvalidate_extractions(state: TurnState) -> None:
     state.constraints = list(constraint_result.constraints)
     state.unmodeled.extend(constraint_result.unmodeled)
 
-    # handling Literal と数え上げを組み合わせ、4 経路外を許さない。
+    # handling Literal と数え上げを組み合わせ、3 経路外を許さない。
     count = (
         len(state.constraints)
-        + len(state.score_adjustments)
         + len(state.selection_hints)
         + len(state.unmodeled)
     )
     completeness = validate_classification_completeness(
         extracted_count=count,
         constraints=state.constraints,
-        score_adjustments=state.score_adjustments,
         selection_hints=state.selection_hints,
         unmodeled=state.unmodeled,
     )

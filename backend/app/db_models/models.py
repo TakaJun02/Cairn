@@ -253,6 +253,13 @@ class Thread(Base):
     pending_constraints: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=_EMPTY_LIST
     )
+
+    # ── 会話履歴の要約（agent_react_architecture.md §8。2026-08-04 追加）──
+    history_summary: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("''")
+    )
+    summarized_until_message_id: Mapped[int | None] = mapped_column(BigInteger)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=_NOW
     )

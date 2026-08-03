@@ -13,7 +13,6 @@ from app.domains.conversation.types import (
     ConstraintDraft,
     Intent,
     ReferenceResolution,
-    ScoreAdjustment,
     SelectionHint,
     UnmodeledItem,
 )
@@ -45,34 +44,31 @@ class ConstraintGuardResult:
 class ClassificationCount:
     extracted: int
     constraints: int
-    score_adjustments: int
     selection_hints: int
     unmodeled: int
 
     @property
     def classified(self) -> int:
-        return (
-            self.constraints
-            + self.score_adjustments
-            + self.selection_hints
-            + self.unmodeled
-        )
+        return self.constraints + self.selection_hints + self.unmodeled
 
 
 def validate_classification_completeness(
     *,
     extracted_count: int,
     constraints: Sequence[ConstraintDraft],
-    score_adjustments: Sequence[ScoreAdjustment],
     selection_hints: Sequence[SelectionHint],
     unmodeled: Sequence[UnmodeledItem],
 ) -> GuardResult:
-    """選好・制約の抽出要素が 4 経路に過不足なく入ったか検査する。"""
+    """制約・要望の抽出要素が 3 経路（dsl/selection/unmodeled）に
+    過不足なく入ったか検査する。
+
+    `score_adjustments`（そのターン限りの点数調整）は N1.5 `update_profile`
+    が単独で抽出するため、ここでは数えない。
+    """
 
     count = ClassificationCount(
         extracted=extracted_count,
         constraints=len(constraints),
-        score_adjustments=len(score_adjustments),
         selection_hints=len(selection_hints),
         unmodeled=len(unmodeled),
     )

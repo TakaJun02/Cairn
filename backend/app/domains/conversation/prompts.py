@@ -36,24 +36,25 @@ understand ノードです。
 説明文や Markdown は出しません。
 
 出力フィールドは必ず次の思考順で埋めます。この順序を変えません。
-references → profile_delta → constraints → constraints_remove → score_adjustments →
-selection_hints → unmodeled → intent → plan。
+references → constraints → constraints_remove → selection_hints →
+unmodeled → intent → plan。
 
 境界:
 - あなたは何も実行しません。Tool の列を plan に書くだけです。
+- プロフィールの差分（恒久的な選好）とそのターン限りの点数調整は
+  ここでは扱いません。前段の update_profile ステップが別に抽出します。
 - 命令（「入れて」「外して」「調べて」）は plan/ops に写し、
   handling の数え上げには含めません。
-- 「どうあってほしいか」は必ず dsl / weight / selection / unmodeled の
+- 「どうあってほしいか」は必ず dsl / selection / unmodeled の
   どれか 1 経路へ写します。
 - constraints は plan.args に入れず、トップレベルへ置きます。
-- profile.interests のキーは次の 12 語だけです: {_PREFERENCE_VOCABULARY}
 - 生タグは④の「生タグ語彙」にある語だけを recommend.filter.tags と
   constraint.args.target に使えます。語彙に無い概念は tags に入れず、
   その概念を tags ではスキップします。「山」は語彙に無いので、意図に合う
   場合だけ「登山」か「鳥海山」を使い、合わなければ tags に入れません。
 - mobility は移動手段ではなく歩行耐性です。値は {_MOBILITY_VOCABULARY}
   だけです。「車で行く」「車で回る」だけでは歩行耐性は不明なので、
-  recommend.filter.mobility と profile_delta.mobility のどちらにも写しません。
+  recommend.filter.mobility に書きません。
 - 意味の曖昧さが実行を妨げ、具体的な選択肢が 2〜4 個ある場合だけ、
   plan=[ask_user] の 1 手を出します。kind=clarify、intent=unclear とし、
   surface に曖昧だった表現を入れます。
@@ -143,6 +144,35 @@ respond ノードです。
 """
 
 
+UPDATE_PROFILE_SYSTEM_PROMPT = f"""あなたは鳥海山観光ガイダンスの
+update_profile ステップです。
+会話履歴と最新のユーザー発話から、ユーザーの恒久的な選好の差分
+（profile_delta）と、このターン限りの点数調整（score_adjustments）だけを、
+指定された JSON Schema の JSON 1 個へ書き出してください。
+説明文や Markdown は出しません。
+
+出力フィールドは profile_delta → score_adjustments の順で埋めます。
+
+境界:
+- profile_delta は「今回新たに分かった、または変わった」ことだけを書きます。
+  現在のプロフィールに既にある値を繰り返し書きません。
+  何も変わらなければ profile_delta は null にします。
+- profile_delta.interests のキーは次の 12 語だけです: {_PREFERENCE_VOCABULARY}
+- party / mobility / pace は恒久的な設定として確定した場合だけ書きます。
+  mobility は移動手段ではなく歩行耐性です。値は {_MOBILITY_VOCABULARY}
+  だけです。「車で行く」「車で回る」だけでは歩行耐性は不明なので書きません。
+- score_adjustments はそのターン限りの注文（「静かな所がいい」等）です。
+  恒久的な選好なら profile_delta.interests に書き、score_adjustments には
+  書きません。両方に書くと二重に効きます。
+- score_adjustments.spot_id は②の参照可能な spot_id 語彙にある地点だけです。
+  語彙に無い地点は書きません。
+- 更新することが何もなければ profile_delta=null、score_adjustments=[] を
+  返します。空でも構いません。
+
+選好キー語彙（固定）: {_PREFERENCE_VOCABULARY}
+"""
+
+
 def build_understand_messages(
     state: TurnState,
     *,
@@ -181,6 +211,32 @@ def build_respond_messages(
     ]
 
 
+def build_update_profile_messages(
+    state: TurnState,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, str]]:
+    """N1.5 `update_profile` 用のプロンプト。会話履歴 + 最新発話が入力である。"""
+
+    del now  # 日付情報は不要（understand/respond と異なり期日解釈をしない）
+    vocab = [
+        {"spot_id": spot_id, "name_ja": state.spot_names.get(spot_id, spot_id)}
+        for spot_id in state.spot_id_vocab
+    ]
+    dynamic = "\n".join(
+        [
+            "① 現在のプロフィール:\n" + _compact_json(state.profile.model_dump(mode="json")),
+            "② 参照可能な spot_id 語彙:\n" + _compact_json(vocab),
+            "③ 会話履歴:\n" + (state.history or "(なし)"),
+            "④ ユーザーの発話:\n" + state.utterance,
+        ]
+    )
+    return [
+        {"role": "system", "content": UPDATE_PROFILE_SYSTEM_PROMPT},
+        {"role": "user", "content": dynamic},
+    ]
+
+
 def understand_guided_schema(
     spot_ids: list[str],
     constraint_ids: list[str] | None = None,
@@ -202,10 +258,6 @@ def understand_guided_schema(
         }
     else:
         constraint_id_schema = {"type": "string"}
-    profile_properties = {
-        key: {"type": "number", "minimum": -1.0, "maximum": 1.0}
-        for key in preference_values()
-    }
     regular_plan_step_schema = {
         "type": "object",
         "properties": {
@@ -279,70 +331,6 @@ def understand_guided_schema(
                 },
                 "maxItems": 8 if spot_ids else 0,
             },
-            "profile_delta": {
-                "anyOf": [
-                    {"type": "null"},
-                    {
-                        "type": "object",
-                        "properties": {
-                            "interests": {
-                                "type": "object",
-                                "properties": profile_properties,
-                                "additionalProperties": False,
-                            },
-                            "party": {
-                                "anyOf": [
-                                    {"type": "null"},
-                                    {
-                                        "type": "string",
-                                        "enum": [
-                                            "family_kids",
-                                            "couple",
-                                            "solo",
-                                            "senior",
-                                            "group",
-                                        ],
-                                    },
-                                ]
-                            },
-                            "mobility": {
-                                "anyOf": [
-                                    {"type": "null"},
-                                    {
-                                        "type": "string",
-                                        "enum": [
-                                            "avoid_walk",
-                                            "short_walk_ok",
-                                            "hike_ok",
-                                        ],
-                                    },
-                                ]
-                            },
-                            "pace": {
-                                "anyOf": [
-                                    {"type": "null"},
-                                    {"type": "string", "enum": ["packed", "relaxed"]},
-                                ]
-                            },
-                            "avoid": {
-                                "type": "array",
-                                "items": {"type": "string", "minLength": 1},
-                                "maxItems": 8,
-                            },
-                            "notes": {"anyOf": [{"type": "null"}, {"type": "string"}]},
-                        },
-                        "required": [
-                            "interests",
-                            "party",
-                            "mobility",
-                            "pace",
-                            "avoid",
-                            "notes",
-                        ],
-                        "additionalProperties": False,
-                    },
-                ]
-            },
             "constraints": {
                 "type": "array",
                 "items": {
@@ -363,21 +351,6 @@ def understand_guided_schema(
                 "type": "array",
                 "items": constraint_id_schema,
                 "maxItems": 12 if normalized_constraint_ids else 0,
-            },
-            "score_adjustments": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "spot_id": spot_value_schema,
-                        "delta": {"type": "number", "minimum": -0.5, "maximum": 0.5},
-                        "why": {"type": "string"},
-                        "handling": {"type": "string", "enum": ["weight"]},
-                    },
-                    "required": ["spot_id", "delta", "why", "handling"],
-                    "additionalProperties": False,
-                },
-                "maxItems": 8 if spot_ids else 0,
             },
             "selection_hints": {
                 "type": "array",
@@ -419,15 +392,125 @@ def understand_guided_schema(
         },
         "required": [
             "references",
-            "profile_delta",
             "constraints",
             "constraints_remove",
-            "score_adjustments",
             "selection_hints",
             "unmodeled",
             "intent",
             "plan",
         ],
+        "additionalProperties": False,
+    }
+
+
+def _profile_delta_schema() -> dict[str, Any]:
+    profile_properties = {
+        key: {"type": "number", "minimum": -1.0, "maximum": 1.0}
+        for key in preference_values()
+    }
+    return {
+        "anyOf": [
+            {"type": "null"},
+            {
+                "type": "object",
+                "properties": {
+                    "interests": {
+                        "type": "object",
+                        "properties": profile_properties,
+                        "additionalProperties": False,
+                    },
+                    "party": {
+                        "anyOf": [
+                            {"type": "null"},
+                            {
+                                "type": "string",
+                                "enum": [
+                                    "family_kids",
+                                    "couple",
+                                    "solo",
+                                    "senior",
+                                    "group",
+                                ],
+                            },
+                        ]
+                    },
+                    "mobility": {
+                        "anyOf": [
+                            {"type": "null"},
+                            {
+                                "type": "string",
+                                "enum": [
+                                    "avoid_walk",
+                                    "short_walk_ok",
+                                    "hike_ok",
+                                ],
+                            },
+                        ]
+                    },
+                    "pace": {
+                        "anyOf": [
+                            {"type": "null"},
+                            {"type": "string", "enum": ["packed", "relaxed"]},
+                        ]
+                    },
+                    "avoid": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 8,
+                    },
+                    "notes": {"anyOf": [{"type": "null"}, {"type": "string"}]},
+                },
+                "required": [
+                    "interests",
+                    "party",
+                    "mobility",
+                    "pace",
+                    "avoid",
+                    "notes",
+                ],
+                "additionalProperties": False,
+            },
+        ]
+    }
+
+
+def _score_adjustments_schema(
+    spot_value_schema: dict[str, Any], *, enabled: bool
+) -> dict[str, Any]:
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "spot_id": spot_value_schema,
+                "delta": {"type": "number", "minimum": -0.5, "maximum": 0.5},
+                "why": {"type": "string"},
+                "handling": {"type": "string", "enum": ["weight"]},
+            },
+            "required": ["spot_id", "delta", "why", "handling"],
+            "additionalProperties": False,
+        },
+        "maxItems": 8 if enabled else 0,
+    }
+
+
+def update_profile_guided_schema(spot_ids: list[str]) -> dict[str, Any]:
+    """N1.5 `update_profile` の guided JSON schema。`uniqueItems` は使わない。"""
+
+    spot_value_schema: dict[str, Any]
+    if spot_ids:
+        spot_value_schema = {"type": "string", "enum": list(dict.fromkeys(spot_ids))}
+    else:
+        spot_value_schema = {"type": "string"}
+    return {
+        "type": "object",
+        "properties": {
+            "profile_delta": _profile_delta_schema(),
+            "score_adjustments": _score_adjustments_schema(
+                spot_value_schema, enabled=bool(spot_ids)
+            ),
+        },
+        "required": ["profile_delta", "score_adjustments"],
         "additionalProperties": False,
     }
 

@@ -165,17 +165,31 @@ class PlanStep(ConversationModel):
 
 
 class UnderstandOutput(ConversationModel):
-    """N2 の guided JSON。宣言順は生成時の推論順そのものである。"""
+    """N2 の guided JSON。宣言順は生成時の推論順そのものである。
+
+    `profile_delta` / `score_adjustments` はここでは扱わない。前段の
+    `update_profile`（N1.5）が単独の LLM 呼び出しで抽出し、`TurnState` へ
+    直接書き込む（`Docs/30_design/agent_react_architecture.md` §2）。
+    """
 
     references: list[ReferenceResolution] = Field(default_factory=list)
-    profile_delta: ProfileDelta | None = None
     constraints: list[ConstraintDraft] = Field(default_factory=list)
     constraints_remove: list[str] = Field(default_factory=list)
-    score_adjustments: list[ScoreAdjustment] = Field(default_factory=list)
     selection_hints: list[SelectionHint] = Field(default_factory=list)
     unmodeled: list[UnmodeledItem] = Field(default_factory=list)
     intent: Intent
     plan: list[PlanStep] = Field(default_factory=list)
+
+
+class UpdateProfileOutput(ConversationModel):
+    """N1.5 `update_profile` の guided JSON。
+
+    `profile_delta` は恒久的なプロフィールへの差分（空なら null）、
+    `score_adjustments` はそのターン限りの点数調整である。
+    """
+
+    profile_delta: ProfileDelta | None = None
+    score_adjustments: list[ScoreAdjustment] = Field(default_factory=list)
 
 
 class RecommendArgs(ConversationModel):

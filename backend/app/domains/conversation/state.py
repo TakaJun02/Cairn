@@ -106,6 +106,8 @@ class ContextSnapshot(StateModel):
     realtime: dict[str, dict[str, int | None]]
     spots: dict[str, SpotFact]
     tag_vocabulary: list[str] = Field(default_factory=list)
+    history_summary: str = ""
+    summarized_until_message_id: int | None = None
 
 
 class TurnState(StateModel):

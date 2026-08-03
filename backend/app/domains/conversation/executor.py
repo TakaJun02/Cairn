@@ -6,7 +6,7 @@ import time
 from datetime import date
 from typing import Any
 
-from app.domains.conversation.events import EventSinkLike, emit, error_event, state_event
+from app.domains.conversation.events import EventSinkLike, emit, error_event
 from app.domains.conversation.planner import ReferenceResolutionError, resolve_step_references
 from app.domains.conversation.state import (
     CandidateReference,
@@ -134,38 +134,6 @@ async def act(
         value.model_dump(mode="json") for value in state.skipped_steps
     ]
     state.log_fields["aborted_at"] = state.aborted_at
-    return state
-
-
-async def apply_profile_update(
-    state: TurnState,
-    *,
-    event_sink: EventSinkLike = None,
-) -> TurnState:
-    """N2 の差分を in-memory 状態へ一度だけマージし、state を送出する。"""
-
-    if state.profile_delta is None:
-        return state
-    delta = state.profile_delta
-    interests = dict(state.profile.interests)
-    interests.update({key.value: value for key, value in delta.interests.items()})
-    state.profile = state.profile.model_copy(
-        update={
-            "interests": interests,
-            "party": delta.party.value if delta.party is not None else state.profile.party,
-            "mobility": (
-                delta.mobility.value if delta.mobility is not None else state.profile.mobility
-            ),
-            "pace": delta.pace.value if delta.pace is not None else state.profile.pace,
-            "avoid": list(dict.fromkeys([*state.profile.avoid, *delta.avoid])),
-            "notes": delta.notes if delta.notes is not None else state.profile.notes,
-        },
-        deep=True,
-    )
-    await emit(
-        event_sink,
-        state_event("profile", profile=state.profile.model_dump(mode="json")),
-    )
     return state
 
 

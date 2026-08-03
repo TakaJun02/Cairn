@@ -36,10 +36,8 @@ def _understand_output(plan: list[dict[str, Any]]) -> str:
     return json.dumps(
         {
             "references": [],
-            "profile_delta": None,
             "constraints": [],
             "constraints_remove": [],
-            "score_adjustments": [],
             "selection_hints": [],
             "unmodeled": [],
             "intent": "recommend",
@@ -49,21 +47,39 @@ def _understand_output(plan: list[dict[str, Any]]) -> str:
     )
 
 
+def _update_profile_output(
+    *,
+    profile_delta: dict[str, Any] | None = None,
+    score_adjustments: list[dict[str, Any]] | None = None,
+) -> str:
+    """N1.5 update_profile 用の guided JSON レスポンス。既定は差分なし。"""
+
+    return json.dumps(
+        {
+            "profile_delta": profile_delta,
+            "score_adjustments": score_adjustments or [],
+        },
+        ensure_ascii=False,
+    )
+
+
 class TurnClient:
+    """update_profile → understand の順で消費される generate() 応答キュー。"""
+
     def __init__(
         self,
-        understand_responses: list[str | BaseException],
+        generate_responses: list[str | BaseException],
         *,
         response_chunks: list[str] | None = None,
         response_error: BaseException | None = None,
     ) -> None:
-        self.understand_responses = list(understand_responses)
+        self.generate_responses = list(generate_responses)
         self.response_chunks = response_chunks or []
         self.response_error = response_error
 
     async def generate(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
         del messages, kwargs
-        response = self.understand_responses.pop(0)
+        response = self.generate_responses.pop(0)
         if isinstance(response, BaseException):
             raise response
         return response
@@ -326,14 +342,11 @@ async def test_pipeline_event_order_and_persist() -> None:
     sink = MemoryEventSink()
     repository = MemoryConversationRepository()
     tools = FakeTools(sink=sink)
-    output = json.loads(
-        _understand_output(
-            [{"id": 1, "tool": "recommend", "args": {"k": 1}}]
-        )
-    )
-    output["profile_delta"] = {"party": "family_kids"}
     client = TurnClient(
-        [json.dumps(output, ensure_ascii=False)],
+        [
+            _update_profile_output(profile_delta={"party": "family_kids"}),
+            _understand_output([{"id": 1, "tool": "recommend", "args": {"k": 1}}]),
+        ],
         response_chunks=[
             "鶴間池をご案内します。",
             "今回考慮した条件: なし。",
@@ -357,12 +370,13 @@ async def test_pipeline_event_order_and_persist() -> None:
         "token",
         "done",
     ]
-    assert [event.data.get("kind") for event in sink.events[:3]] == [
+    # update_profile（N1.5）が最初に走るため、profile イベントが先頭に来る。
+    assert sink.events[0].data["kind"] == "profile"
+    assert [event.data.get("kind") for event in sink.events[1:4]] == [
         "plan",
         "candidates",
         "candidates",
     ]
-    assert sink.events[3].data["kind"] == "profile"
     assert sink.events[-1].data["message_id"] == 88
 
 
@@ -400,7 +414,7 @@ async def test_ask_user_suspends_resumes_and_pending_expires_after_one_turn() ->
         repository,
         event_sink=sink,
         llm_client=TurnClient(
-            [json.dumps(ask_output, ensure_ascii=False)],
+            [_update_profile_output(), json.dumps(ask_output, ensure_ascii=False)],
             response_chunks=["「2番目」はどちらでしょうか。"],
         ),
         tools=FakeTools(sink=sink),
@@ -425,7 +439,7 @@ async def test_ask_user_suspends_resumes_and_pending_expires_after_one_turn() ->
     second = await ConversationPipeline(
         repository,
         llm_client=TurnClient(
-            [_understand_output([])],
+            [_update_profile_output(), _understand_output([])],
             response_chunks=["鶴間池として承りました。"],
         ),
         tools=FakeTools(),
@@ -448,7 +462,7 @@ async def test_respond_failure_still_persists_failed_assistant_and_done() -> Non
     sink = MemoryEventSink()
     repository = MemoryConversationRepository()
     client = TurnClient(
-        [_understand_output([])],
+        [_update_profile_output(), _understand_output([])],
         response_error=RuntimeError("stream down"),
     )
 
@@ -468,7 +482,7 @@ async def test_respond_failure_still_persists_failed_assistant_and_done() -> Non
 async def test_understand_fatal_persists_user_only_path_and_done() -> None:
     sink = MemoryEventSink()
     repository = MemoryConversationRepository()
-    client = TurnClient(["bad", "bad again"])
+    client = TurnClient([_update_profile_output(), "bad", "bad again"])
 
     state = await ConversationPipeline(
         repository,
@@ -512,7 +526,7 @@ async def test_cancelled_respond_persists_partial_text_before_propagating() -> N
     sink = MemoryEventSink()
     repository = MemoryConversationRepository()
     client = TurnClient(
-        [_understand_output([])],
+        [_update_profile_output(), _understand_output([])],
         response_chunks=["生成途中"],
         response_error=asyncio.CancelledError(),
     )
@@ -532,6 +546,27 @@ async def test_cancelled_respond_persists_partial_text_before_propagating() -> N
 
 
 async def test_cancelled_understand_persists_user_only_before_propagating() -> None:
+    sink = MemoryEventSink()
+    repository = MemoryConversationRepository()
+
+    with pytest.raises(asyncio.CancelledError):
+        await ConversationPipeline(
+            repository,
+            event_sink=sink,
+            llm_client=TurnClient(
+                [_update_profile_output(), asyncio.CancelledError()]
+            ),
+            tools=FakeTools(),
+        ).run(user_id=1, utterance="途中で停止")
+
+    assert len(repository.persisted) == 1
+    assert repository.persisted[0].understand_failed is True
+    assert sink.events[-1].event == "done"
+
+
+async def test_cancelled_update_profile_persists_user_only_before_propagating() -> None:
+    """N1.5 update_profile 自体がキャンセルされても persist に必ず到達する（§13）。"""
+
     sink = MemoryEventSink()
     repository = MemoryConversationRepository()
 

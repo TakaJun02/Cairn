@@ -32,7 +32,11 @@ async def load_context(
     """DB 由来の全状態を読み、履歴と参照可能語彙を 1 回だけ作る。"""
 
     snapshot = await repository.load_snapshot(user_id)
-    history = build_conversation_history(snapshot.messages)
+    history = build_conversation_history(
+        snapshot.messages,
+        history_summary=snapshot.history_summary,
+        summarized_until_message_id=snapshot.summarized_until_message_id,
+    )
     resumed_tool_result = _resume_pending_ask(
         snapshot.pending_ask,
         utterance=utterance,
@@ -73,8 +77,9 @@ async def load_context(
         log_fields={
             "history_tokens": history.estimated_tokens,
             "history_raw_turns": history.raw_turns,
-            "history_compressed_turns": history.compressed_turns,
-            "history_dropped_turns": history.dropped_turns,
+            "history_summarized_turns": history.summarized_turns,
+            "history_candidate_lists": history.candidate_lists,
+            "history_dropped_sections": history.dropped_sections,
             "initial_itinerary_version": initial_version,
             "resumed_from_ask": resumed_tool_result is not None,
         },

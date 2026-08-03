@@ -57,10 +57,8 @@ def _state() -> TurnState:
 def _output(**overrides: Any) -> str:
     value: dict[str, Any] = {
         "references": [],
-        "profile_delta": None,
         "constraints": [],
         "constraints_remove": [],
-        "score_adjustments": [],
         "selection_hints": [],
         "unmodeled": [],
         "intent": "recommend",
@@ -105,27 +103,13 @@ async def test_duplicate_values_are_removed_in_code_without_unique_items() -> No
             {"surface": "そこ", "spot_id": "spot_001"},
         ],
         constraints_remove=["c_001", "c_001"],
-        score_adjustments=[
-            {
-                "spot_id": "spot_001",
-                "delta": 0.2,
-                "why": "静か",
-                "handling": "weight",
-            },
-            {
-                "spot_id": "spot_001",
-                "delta": 0.2,
-                "why": "静か",
-                "handling": "weight",
-            },
-        ],
     )
     state = _state()
 
     await understand(state, client=ScriptedClient([duplicated]))
 
     assert len(state.references) == 1
-    assert len(state.score_adjustments) == 1
+    assert state.constraints_remove == []
 
 
 async def test_unknown_predicate_and_out_of_world_reference_are_not_silent() -> None:

@@ -1,4 +1,17 @@
-"""`understand` と `respond` が共有する会話履歴の 3 層ビルダー。"""
+"""understand / respond が共有する会話履歴の 4 層ビルダー。
+
+`Docs/30_design/agent_react_architecture.md` §8・`Docs/30_design/data_model.md` §6
+が正である構成:
+
+    会話履歴 =
+      ① threads.history_summary        … summarized_until_message_id までの LLM 要約
+      ② 機械要約の列（あれば）          … ①より後〜直近2ターンより前の未畳み込みターン
+      ③ 候補提示リストの機械要約        … 直近3リストまで。序数照応の担保
+      ④ 直近2ターンの生テキスト        … user も assistant も content そのまま
+
+予算超過時は②③の古い方から落とす（①は生成時に上限を持つため、④は指示語解決に
+必須なため、どちらもここでは落とさない）。
+"""
 
 from __future__ import annotations
 
@@ -7,8 +20,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+DEFAULT_HISTORY_BUDGET_TOKENS = 1_700
+DEFAULT_RAW_TURN_COUNT = 2
+DEFAULT_CANDIDATE_LIST_LIMIT = 3
+
 
 class HistoryMessage(Protocol):
+    id: int
     role: str
     content: str
     meta: Mapping[str, Any]
@@ -22,14 +40,20 @@ class HistoryBuildResult:
     text: str
     estimated_tokens: int
     raw_turns: int
-    compressed_turns: int
-    dropped_turns: int
+    summarized_turns: int
+    candidate_lists: int
+    dropped_sections: int
     mentioned_spot_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class _Turn:
+class Turn:
+    index: int
     messages: tuple[HistoryMessage, ...]
+
+    @property
+    def last_message_id(self) -> int:
+        return self.messages[-1].id
 
 
 def estimate_tokens(text: str) -> int:
@@ -45,59 +69,62 @@ def estimate_tokens(text: str) -> int:
 def build_conversation_history(
     messages: Sequence[HistoryMessage],
     *,
-    max_tokens: int = 4_000,
-    raw_turn_count: int = 3,
+    history_summary: str = "",
+    summarized_until_message_id: int | None = None,
+    max_tokens: int = DEFAULT_HISTORY_BUDGET_TOKENS,
+    raw_turn_count: int = DEFAULT_RAW_TURN_COUNT,
+    candidate_list_limit: int = DEFAULT_CANDIDATE_LIST_LIMIT,
     token_counter: TokenCounter = estimate_tokens,
 ) -> HistoryBuildResult:
-    """直近 3 ターンは生、それ以前は assistant だけイベント要約にする。
+    """① 要約 + ② 機械要約 + ③ 候補リスト + ④ 直近生テキストを組み立てる。
 
-    予算超過時は圧縮層の古いターンから落とす。生層だけで超過する
-    極端なケースでは、最古の生メッセージの先頭を省略して末尾を残す。
+    ①(`history_summary`)と④(直近 `raw_turn_count` ターン)は常に残す。
+    予算超過時は②③をまとめて古いターンから落とす。
     """
 
-    turns = _group_turns(messages)
+    turns = group_turns(messages)
     raw_start = max(0, len(turns) - raw_turn_count)
-    rendered: list[tuple[int, str, tuple[str, ...]]] = []
-    for index, turn in enumerate(turns):
-        is_raw = index >= raw_start
-        lines: list[str] = []
-        ids: list[str] = []
-        for message in turn.messages:
-            ids.extend(_spot_ids_from_meta(message.meta))
-            prefix = "u" if message.role == "user" else "a"
-            if message.role == "assistant" and not is_raw:
-                body = summarize_assistant_event(message.meta)
-            else:
-                body = message.content.strip()
-            if body:
-                lines.append(f"{prefix}: {body}")
-        if lines:
-            rendered.append((index, "\n".join(lines), tuple(dict.fromkeys(ids))))
+    fold_start = first_unfolded_turn_index(turns, summarized_until_message_id)
+
+    layer2_items = [
+        (turn.index, line)
+        for turn in turns[fold_start:raw_start]
+        if (line := _turn_summary_line(turn))
+    ]
+    candidate_items = _collect_candidate_lines(turns)[-candidate_list_limit:]
+    raw_lines = [line for turn in turns[raw_start:] for line in _raw_lines(turn)]
 
     dropped = 0
-    while rendered and _rendered_tokens(rendered, token_counter) > max_tokens:
-        compressed_position = next(
-            (position for position, item in enumerate(rendered) if item[0] < raw_start),
-            None,
-        )
-        if compressed_position is None:
-            break
-        rendered.pop(compressed_position)
+    while (layer2_items or candidate_items) and token_counter(
+        _assemble(history_summary, layer2_items, candidate_items, raw_lines)
+    ) > max_tokens:
+        oldest_layer2 = layer2_items[0][0] if layer2_items else None
+        oldest_candidate = candidate_items[0][0] if candidate_items else None
+        if oldest_candidate is None or (
+            oldest_layer2 is not None and oldest_layer2 <= oldest_candidate
+        ):
+            layer2_items.pop(0)
+        else:
+            candidate_items.pop(0)
         dropped += 1
 
-    if rendered and _rendered_tokens(rendered, token_counter) > max_tokens:
-        rendered = _truncate_raw_history(rendered, max_tokens, token_counter)
-
-    text = "\n".join(item[1] for item in rendered)
+    text = _assemble(history_summary, layer2_items, candidate_items, raw_lines)
     mentioned = tuple(
-        dict.fromkeys(spot_id for item in rendered for spot_id in item[2])
+        dict.fromkeys(
+            [
+                *_meta_spot_ids_for_turns(turns, (turn.index for turn in turns[raw_start:])),
+                *_meta_spot_ids_for_turns(turns, (index for index, _ in layer2_items)),
+                *_meta_spot_ids_for_turns(turns, (index for index, _ in candidate_items)),
+            ]
+        )
     )
     return HistoryBuildResult(
         text=text,
         estimated_tokens=token_counter(text),
-        raw_turns=sum(item[0] >= raw_start for item in rendered),
-        compressed_turns=sum(item[0] < raw_start for item in rendered),
-        dropped_turns=dropped,
+        raw_turns=len(turns) - raw_start if turns else 0,
+        summarized_turns=len(layer2_items),
+        candidate_lists=len(candidate_items),
+        dropped_sections=dropped,
         mentioned_spot_ids=mentioned,
     )
 
@@ -106,11 +133,9 @@ def summarize_assistant_event(meta: Mapping[str, Any]) -> str:
     """`messages.meta` だけから古い assistant 行を機械的に 1 行化する。"""
 
     summaries: list[str] = []
-    candidate_names = _string_list(meta.get("candidate_names"))
-    candidate_ids = _string_list(meta.get("candidate_spot_ids"))
-    candidates = candidate_names or candidate_ids
-    if candidates:
-        summaries.append(f"[推薦{len(candidates)}件: {' / '.join(candidates)}]")
+    candidate_line = _candidate_line(meta)
+    if candidate_line:
+        summaries.append(candidate_line)
 
     qa_name = meta.get("qa_spot_name") or meta.get("qa_spot_id")
     if isinstance(qa_name, str) and qa_name:
@@ -139,50 +164,110 @@ def summarize_assistant_event(meta: Mapping[str, Any]) -> str:
     return "[応答]"
 
 
-def _group_turns(messages: Sequence[HistoryMessage]) -> list[_Turn]:
+def group_turns(messages: Sequence[HistoryMessage]) -> list[Turn]:
+    """user 発話を境に会話をターンへまとめる（history_summary.py とも共有）。"""
+
     turns: list[list[HistoryMessage]] = []
     for message in messages:
         if message.role == "user" or not turns:
             turns.append([message])
         else:
             turns[-1].append(message)
-    return [_Turn(messages=tuple(turn)) for turn in turns]
+    return [Turn(index=index, messages=tuple(turn)) for index, turn in enumerate(turns)]
 
 
-def _rendered_tokens(
-    rendered: Sequence[tuple[int, str, tuple[str, ...]]],
-    token_counter: TokenCounter,
+def first_unfolded_turn_index(
+    turns: Sequence[Turn], summarized_until_message_id: int | None
 ) -> int:
-    return token_counter("\n".join(item[1] for item in rendered))
+    """`summarized_until_message_id` より後、まだ①に畳み込まれていない最初のターン。"""
+
+    if summarized_until_message_id is None:
+        return 0
+    for turn in turns:
+        if turn.last_message_id > summarized_until_message_id:
+            return turn.index
+    return len(turns)
 
 
-def _truncate_raw_history(
-    rendered: list[tuple[int, str, tuple[str, ...]]],
-    max_tokens: int,
-    token_counter: TokenCounter,
-) -> list[tuple[int, str, tuple[str, ...]]]:
-    result = list(rendered)
-    while len(result) > 1 and _rendered_tokens(result, token_counter) > max_tokens:
-        result.pop(0)
-    if not result:
-        return result
-    index, body, ids = result[0]
-    if _rendered_tokens(result, token_counter) <= max_tokens:
-        return result
-    # tokenizer 非依存で二分探索し、最古行の末尾を可能な限り残す。
-    low, high = 0, len(body)
-    best = ""
-    while low <= high:
-        midpoint = (low + high) // 2
-        candidate = "…" + body[len(body) - midpoint :]
-        trial = [(index, candidate, ids), *result[1:]]
-        if _rendered_tokens(trial, token_counter) <= max_tokens:
-            best = candidate
-            low = midpoint + 1
-        else:
-            high = midpoint - 1
-    result[0] = (index, best, ids)
-    return result
+def _turn_summary_line(turn: Turn) -> str:
+    lines: list[str] = []
+    for message in turn.messages:
+        prefix = "u" if message.role == "user" else "a"
+        body = (
+            summarize_assistant_event(message.meta)
+            if message.role == "assistant"
+            else message.content.strip()
+        )
+        if body:
+            lines.append(f"{prefix}: {body}")
+    return "\n".join(lines)
+
+
+def _raw_lines(turn: Turn) -> list[str]:
+    lines: list[str] = []
+    for message in turn.messages:
+        prefix = "u" if message.role == "user" else "a"
+        body = message.content.strip()
+        if body:
+            lines.append(f"{prefix}: {body}")
+    return lines
+
+
+def _collect_candidate_lines(turns: Sequence[Turn]) -> list[tuple[int, str]]:
+    items: list[tuple[int, str]] = []
+    for turn in turns:
+        for message in turn.messages:
+            if message.role != "assistant":
+                continue
+            line = _candidate_line(message.meta)
+            if line:
+                items.append((turn.index, line))
+    return items
+
+
+def _candidate_line(meta: Mapping[str, Any]) -> str | None:
+    candidate_names = _string_list(meta.get("candidate_names"))
+    candidate_ids = _string_list(meta.get("candidate_spot_ids"))
+    candidates = candidate_names or candidate_ids
+    if not candidates:
+        return None
+    return f"[推薦{len(candidates)}件: {' / '.join(candidates)}]"
+
+
+def _assemble(
+    history_summary: str,
+    layer2_items: Sequence[tuple[int, str]],
+    candidate_items: Sequence[tuple[int, str]],
+    raw_lines: Sequence[str],
+) -> str:
+    sections: list[str] = []
+    if history_summary and history_summary.strip():
+        sections.append("これまでの要約:\n" + history_summary.strip())
+    if layer2_items:
+        sections.append(
+            "その後の出来事（要約未反映）:\n"
+            + "\n".join(line for _, line in layer2_items)
+        )
+    if candidate_items:
+        sections.append(
+            "これまでに提示した候補:\n" + "\n".join(line for _, line in candidate_items)
+        )
+    if raw_lines:
+        sections.append("直近のやり取り:\n" + "\n".join(raw_lines))
+    return "\n\n".join(sections)
+
+
+def _meta_spot_ids_for_turns(turns: Sequence[Turn], indices: Any) -> list[str]:
+    index_set = set(indices)
+    if not index_set:
+        return []
+    values: list[str] = []
+    for turn in turns:
+        if turn.index not in index_set:
+            continue
+        for message in turn.messages:
+            values.extend(_spot_ids_from_meta(message.meta))
+    return values
 
 
 def _spot_ids_from_meta(meta: Mapping[str, Any]) -> list[str]:

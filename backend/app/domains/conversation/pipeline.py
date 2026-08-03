@@ -18,7 +18,7 @@ from app.domains.conversation.events import (
     emit,
     error_event,
 )
-from app.domains.conversation.executor import act, apply_profile_update
+from app.domains.conversation.executor import act
 from app.domains.conversation.persist import PersistRepositoryPort, persist
 from app.domains.conversation.planner import validate_plan
 from app.domains.conversation.respond import RespondGenerationError, respond
@@ -29,6 +29,7 @@ from app.domains.conversation.understand import (
     UnderstandFatalError,
     understand,
 )
+from app.domains.conversation.update_profile import update_profile
 
 logger = logging.getLogger("app.conversation.turn")
 
@@ -68,6 +69,18 @@ class ConversationPipeline:
             turn_id=turn_id,
         )
         try:
+            # N1.5 update_profile（load_context の後・understand の前。§2）
+            await update_profile(
+                state,
+                client=self.llm_client,  # type: ignore[arg-type]
+                event_sink=self.event_sink,
+            )
+        except asyncio.CancelledError:
+            state.understand_failed = True
+            await self._persist_or_finish(state)
+            self._log_turn(state)
+            raise
+        try:
             # N2
             await understand(
                 state,
@@ -103,9 +116,6 @@ class ConversationPipeline:
         if state.accepted_steps:
             tools = self.tools or self._default_tools(state)
             await act(state, tools=tools, event_sink=self.event_sink)
-
-        # §16.7 の順序: Tool state の後、profile、token。
-        await apply_profile_update(state, event_sink=self.event_sink)
 
         # N5 + N6 (finally 相当)
         await self._respond_then_persist(state)
@@ -149,6 +159,7 @@ class ConversationPipeline:
                 state,
                 repository=self.repository,  # type: ignore[arg-type]
                 event_sink=self.event_sink,
+                history_client=self.llm_client,  # type: ignore[arg-type]
             )
         except Exception:
             logger.exception("conversation_persist_failed")

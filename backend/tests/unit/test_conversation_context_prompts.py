@@ -10,7 +10,6 @@ from app.domains.conversation.executor import (
     _merged_constraints,
     build_recommendation_context,
 )
-from app.domains.conversation.history import build_conversation_history
 from app.domains.conversation.prompts import (
     UNDERSTAND_SYSTEM_PROMPT,
     build_respond_messages,
@@ -82,93 +81,6 @@ def _contains_key(value: Any, key: str) -> bool:
     return False
 
 
-def test_history_keeps_last_three_turns_raw_and_compresses_older_assistant() -> None:
-    messages = [
-        _message(1, "user", "家族で行きたい"),
-        _message(
-            2,
-            "assistant",
-            "長い推薦説明",
-            {
-                "candidate_spot_ids": ["spot_001", "spot_002"],
-                "candidate_names": ["鶴間池", "元滝伏流水"],
-            },
-        ),
-        _message(3, "user", "2番目を詳しく"),
-        _message(4, "assistant", "元滝の長い説明"),
-        _message(5, "user", "1日目に入れて"),
-        _message(6, "assistant", "旅程へ入れました"),
-        _message(7, "user", "昼休憩も"),
-        _message(8, "assistant", "昼休憩を入れました"),
-    ]
-
-    built = build_conversation_history(messages)
-
-    assert "a: [推薦2件: 鶴間池 / 元滝伏流水]" in built.text
-    assert "長い推薦説明" not in built.text
-    assert "a: 元滝の長い説明" in built.text
-    assert "a: 旅程へ入れました" in built.text
-    assert "a: 昼休憩を入れました" in built.text
-    assert built.raw_turns == 3
-    assert built.compressed_turns == 1
-    assert "spot_001" in built.mentioned_spot_ids
-
-
-def test_history_drops_oldest_compressed_turn_before_raw_turns() -> None:
-    messages = [
-        item
-        for turn in range(8)
-        for item in (
-            _message(turn * 2 + 1, "user", f"古い発話{turn}" * 20),
-            _message(
-                turn * 2 + 2,
-                "assistant",
-                f"応答{turn}" * 20,
-                {"tools": ["recommend"]},
-            ),
-        )
-    ]
-
-    built = build_conversation_history(
-        messages,
-        max_tokens=150,
-        token_counter=len,
-    )
-
-    assert built.dropped_turns > 0
-    assert "古い発話7" in built.text
-    assert "応答7" in built.text
-
-
-def test_compressed_history_keeps_multiple_events_from_one_turn() -> None:
-    messages = [
-        _message(1, "user", "滝を旅程に入れて"),
-        _message(
-            2,
-            "assistant",
-            "推薦して旅程を更新しました",
-            {
-                "candidate_names": ["元滝伏流水", "奈曽の白滝"],
-                "itinerary_version": 3,
-                "itinerary_spot_names": ["元滝伏流水"],
-            },
-        ),
-        *[
-            item
-            for turn in range(3)
-            for item in (
-                _message(3 + turn * 2, "user", f"後の発話{turn}"),
-                _message(4 + turn * 2, "assistant", f"後の応答{turn}"),
-            )
-        ],
-    ]
-
-    built = build_conversation_history(messages)
-
-    assert "[推薦2件: 元滝伏流水 / 奈曽の白滝]" in built.text
-    assert "[旅程更新 v3: 元滝伏流水]" in built.text
-
-
 def test_understand_and_respond_receive_the_same_history_and_utterance_is_last() -> None:
     state = _state("u: 前の発話\na: 前の応答")
     # UTC では前日でも、基準日は JST の 2026-08-02 になる。
@@ -228,7 +140,7 @@ def test_understand_prompt_contains_all_raw_tags_and_validated_tool_values() -> 
         assert f'"{mobility.value}"' in system
     assert "mobility は移動手段ではなく歩行耐性" in system
     assert "「車で行く」「車で回る」だけでは歩行耐性は不明" in system
-    assert "recommend.filter.mobility と profile_delta.mobility" in system
+    assert "recommend.filter.mobility に書きません" in system
     assert "weather_fit?:true|false" in system
     assert "weather_fit は boolean" in system
     assert "area?:非空文字列" in system
@@ -299,10 +211,8 @@ def test_understand_schema_order_enums_and_no_unique_items() -> None:
 
     assert list(schema["properties"]) == [
         "references",
-        "profile_delta",
         "constraints",
         "constraints_remove",
-        "score_adjustments",
         "selection_hints",
         "unmodeled",
         "intent",
@@ -310,8 +220,6 @@ def test_understand_schema_order_enums_and_no_unique_items() -> None:
     ]
     assert not _contains_key(schema, "uniqueItems")
     assert schema["properties"]["plan"]["maxItems"] == 3
-    profile = schema["properties"]["profile_delta"]["anyOf"][1]
-    assert len(profile["properties"]["interests"]["properties"]) == 12
     reference_enum = schema["properties"]["references"]["items"]["properties"]["spot_id"]["enum"]
     assert reference_enum == ["spot_001", "spot_002"]
     assert schema["properties"]["constraints_remove"]["items"]["enum"] == [
@@ -321,7 +229,6 @@ def test_understand_schema_order_enums_and_no_unique_items() -> None:
 
     empty_vocab = understand_guided_schema([])
     assert empty_vocab["properties"]["references"]["maxItems"] == 0
-    assert empty_vocab["properties"]["score_adjustments"]["maxItems"] == 0
     assert empty_vocab["properties"]["constraints_remove"]["maxItems"] == 0
     assert not _contains_key(empty_vocab, "pattern")
 

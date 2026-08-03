@@ -23,7 +23,6 @@ from app.domains.conversation.types import (
     ConstraintDraft,
     Intent,
     PlanStep,
-    ScoreAdjustment,
     SelectionHint,
     UnmodeledItem,
 )
@@ -451,16 +450,17 @@ def test_g3_g6_g7_and_g9_apply_to_unified_ask_user() -> None:
     ).rule == "G9"
 
 
-def test_classification_completeness_counts_all_four_routes() -> None:
+def test_classification_completeness_counts_all_three_routes() -> None:
+    """score_adjustments は update_profile（N1.5）が担うため、ここでは数えない。"""
+
     values = {
         "constraints": [ConstraintDraft(pred="require", args={"target": "spot_001"})],
-        "score_adjustments": [ScoreAdjustment(spot_id="spot_001", delta=0.2)],
         "selection_hints": [SelectionHint(text="のんびり")],
         "unmodeled": [UnmodeledItem(text="屋台")],
     }
 
-    accepted = validate_classification_completeness(extracted_count=4, **values)
-    rejected = validate_classification_completeness(extracted_count=5, **values)
+    accepted = validate_classification_completeness(extracted_count=3, **values)
+    rejected = validate_classification_completeness(extracted_count=4, **values)
 
     assert accepted.accepted is True
     assert rejected.accepted is False
