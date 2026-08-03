@@ -8,17 +8,25 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.domains.conversation.types import (
-    ConstraintDraft,
-    Intent,
-    PlanStep,
     ProfileDelta,
-    ReferenceResolution,
     ScoreAdjustment,
-    SelectionHint,
     ToolResult,
-    UnmodeledItem,
+    TrajectoryStep,
 )
 from app.domains.itinerary.types import Itinerary
+
+__all__ = [
+    "CandidateReference",
+    "ContextSnapshot",
+    "ConversationStateError",
+    "DegradedState",
+    "ItineraryState",
+    "MessageState",
+    "ProfileState",
+    "SpotFact",
+    "StateModel",
+    "TurnState",
+]
 
 
 class StateModel(BaseModel):
@@ -70,21 +78,6 @@ class SpotFact(StateModel):
     tags_ja: list[str] = Field(default_factory=list)
 
 
-class RejectedStep(StateModel):
-    step_id: int | None
-    tool: str | None
-    rule: str
-    reason: str
-    step: dict[str, Any] = Field(default_factory=dict)
-
-
-class SkippedStep(StateModel):
-    step_id: int
-    tool: str
-    code: str
-    reason: str
-
-
 class DegradedState(StateModel):
     code: str
     stage: str
@@ -111,9 +104,14 @@ class ContextSnapshot(StateModel):
 
 
 class TurnState(StateModel):
-    """§15.7 の欄をノード順に並べた、ターン内だけの状態。"""
+    """ReAct 構成(段2)のターン内だけの状態。
 
-    # N1 load_context
+    `Docs/30_design/agent_react_architecture.md` の新パイプライン
+    `load_context → update_profile → main_agent(ReAct ループ) → respond → persist`
+    に沿ってノード順に並べている。
+    """
+
+    # ① load_context(決定的)
     turn_id: str
     thread_id: int
     user_id: int
@@ -124,9 +122,12 @@ class TurnState(StateModel):
     history_tokens: int = 0
     last_candidates: list[CandidateReference] = Field(default_factory=list)
     presented_spot_ids: list[str] = Field(default_factory=list)
+    # 段5 (`ask_user` の HITL 化) で使う。段2では読み書きするだけで、
+    # メインループからは更新されない(常に読み込み時の値のまま持ち回る)。
     asked_slots: list[str] = Field(default_factory=list)
     ask_streak: int = 0
     resolved_ambiguities: list[Any] = Field(default_factory=list)
+    pending_ask: dict[str, Any] | None = None
     pending_constraints: list[dict[str, Any]] = Field(default_factory=list)
     realtime: dict[str, dict[str, int | None]] = Field(default_factory=dict)
     spot_id_vocab: list[str] = Field(default_factory=list)
@@ -134,37 +135,22 @@ class TurnState(StateModel):
     spot_catalog: dict[str, SpotFact] = Field(default_factory=dict)
     tag_vocabulary: list[str] = Field(default_factory=list)
     default_origin_spot_id: str | None = None
-    tool_results: list[dict[str, Any]] = Field(default_factory=list)
 
-    # N2 understand
-    intent: Intent | None = None
-    plan: list[PlanStep] = Field(default_factory=list)
+    # ② update_profile(LLM 1 回)
     profile_delta: ProfileDelta | None = None
-    constraints: list[ConstraintDraft] = Field(default_factory=list)
-    constraints_remove: list[str] = Field(default_factory=list)
     score_adjustments: list[ScoreAdjustment] = Field(default_factory=list)
-    selection_hints: list[SelectionHint] = Field(default_factory=list)
-    unmodeled: list[UnmodeledItem] = Field(default_factory=list)
-    references: list[ReferenceResolution] = Field(default_factory=list)
-    understand_attempts: int = 0
-    understand_failed: bool = False
-    understand_failures: list[str] = Field(default_factory=list)
 
-    # N3 validate_plan
-    accepted_steps: list[PlanStep] = Field(default_factory=list)
-    rejected_steps: list[RejectedStep] = Field(default_factory=list)
-    llm_budget_step: int | None = None
-    assumptions: list[str] = Field(default_factory=list)
-
-    # N4 act
+    # ③ メインエージェント(ReAct ループ)
+    trajectory: list[TrajectoryStep] = Field(default_factory=list)
     step_results: dict[int, ToolResult] = Field(default_factory=dict)
-    skipped_steps: list[SkippedStep] = Field(default_factory=list)
-    aborted_at: int | None = None
-    should_end_turn: bool = False
-    pending_ask: dict[str, Any] | None = None
+    executed_tool_count: int = 0
+    main_agent_turns: int = 0
+    main_agent_failed: bool = False
+    main_agent_failures: list[str] = Field(default_factory=list)
     degraded: list[DegradedState] = Field(default_factory=list)
 
-    # N5 respond
+    # ④ respond
+    responded: bool = False
     assistant_text: str = ""
     respond_status: Literal["complete", "partial", "failed"] = "complete"
 

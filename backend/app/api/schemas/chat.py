@@ -33,20 +33,22 @@ class ChatRequest(ApiModel):
         return value.strip() if isinstance(value, str) else value
 
 
-class PlanStep(ApiModel):
-    id: int = Field(ge=1)
+class StepState(ApiModel):
+    """`state:step`(ADR-0019)。メインエージェントが手を実行する前後の実況。
+
+    知識検索サブエージェントの内部実況(旧 `searching`)もここに統合される
+    (`status="progress"`)。
+    """
+
+    kind: Literal["step"]
     tool: Literal[
         "recommend",
         "plan_itinerary",
         "edit_itinerary",
         "search_knowledge",
-        "ask_user",
     ]
-
-
-class PlanState(ApiModel):
-    kind: Literal["plan"]
-    steps: list[PlanStep]
+    status: Literal["started", "progress", "finished"]
+    label_ja: str = Field(min_length=1)
 
 
 class CandidateItem(ApiModel):
@@ -109,19 +111,13 @@ class ProfileState(ApiModel):
     profile: dict[str, Any]
 
 
-class SearchingState(ApiModel):
-    kind: Literal["searching"]
-    text: str = Field(min_length=1)
-
-
 ChatState = Annotated[
-    PlanState
+    StepState
     | CandidatesState
     | ItineraryState
     | AskUserState
     | ClarifyState
-    | ProfileState
-    | SearchingState,
+    | ProfileState,
     Field(discriminator="kind"),
 ]
 
@@ -131,15 +127,21 @@ class TokenData(ApiModel):
 
 
 class ErrorStage(StrEnum):
-    UNDERSTAND = "understand"
-    VALIDATE_PLAN = "validate_plan"
-    ACT = "act"
+    LOAD_CONTEXT = "load_context"
+    UPDATE_PROFILE = "update_profile"
+    MAIN_AGENT = "main_agent"
+    RECOMMEND = "recommend"
+    PLAN_ITINERARY = "plan_itinerary"
+    EDIT_ITINERARY = "edit_itinerary"
+    SEARCH_KNOWLEDGE = "search_knowledge"
     RESPOND = "respond"
     PERSIST = "persist"
 
 
 class ErrorCode(StrEnum):
-    UNDERSTAND_FAILED = "understand_failed"
+    MAIN_AGENT_FAILED = "main_agent_failed"
+    MAIN_AGENT_DEGRADED = "main_agent_degraded"
+    CONTEXT_BUDGET_HARD = "context_budget_hard"
     PRECONDITION_UNMET = "precondition_unmet"
     REFERENCE_UNRESOLVED = "reference_unresolved"
     EMPTY_RESULT = "empty_result"

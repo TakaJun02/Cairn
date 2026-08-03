@@ -1,4 +1,12 @@
-"""N5 `respond`: 共通テンプレート 1 本による日本語ストリーミング。"""
+"""④ `respond`: 共通テンプレート 1 本による日本語ストリーミング。
+
+`Docs/30_design/agent_react_architecture.md` §3.4 が仕様。入力はこのターンの
+軌跡(手と結果)+ 譲歩・縮退 + 会話履歴。`done` はループの終了宣言であり
+応答文を持たないため、ユーザー向け本文はここで別呼び出しとして書く。
+
+旧 respond の「モード」分岐(`QUESTION` = ask_user 用)は、メインループが
+段2で `ask_user` を持たなくなったため不要になった(段5で復活しうる)。
+"""
 
 from __future__ import annotations
 
@@ -9,15 +17,10 @@ from typing import Any, Protocol, runtime_checkable
 
 from app.core.llm import GenerationClient
 from app.domains.conversation.events import EventSinkLike, emit, error_event, token_event
-from app.domains.conversation.guards import validate_response_spot_names
+from app.domains.conversation.guards import has_repeated_ngram, validate_response_spot_names
 from app.domains.conversation.prompts import build_respond_messages
 from app.domains.conversation.state import DegradedState, TurnState
-from app.domains.conversation.types import (
-    Intent,
-    ResponseMode,
-    ToolName,
-)
-from app.domains.conversation.understand import has_repeated_ngram
+from app.domains.conversation.types import ResponseMode
 
 RESPOND_EXPECTED_TOKENS = 600
 RESPOND_MAX_TOKENS = int(RESPOND_EXPECTED_TOKENS * 1.5)
@@ -48,7 +51,7 @@ class GenerateOnlyPort(Protocol):
 
 
 class RespondGenerationError(RuntimeError):
-    """N5 が完全な本文を生成できなかった。"""
+    """respond が完全な本文を生成できなかった。"""
 
 
 async def respond(
@@ -114,23 +117,7 @@ async def respond(
 
 
 def response_mode(state: TurnState) -> ResponseMode:
-    if state.should_end_turn:
-        return ResponseMode.QUESTION
-    if state.understand_failed:
-        return ResponseMode.FAILURE
-    if state.aborted_at is not None and not state.step_results:
-        return ResponseMode.FAILURE
-    if state.accepted_steps and not state.step_results and state.skipped_steps:
-        return ResponseMode.FAILURE
-    if state.plan and not state.accepted_steps and state.rejected_steps:
-        return ResponseMode.FAILURE
-    if (
-        state.intent in {Intent.RECOMMEND, Intent.PLAN, Intent.EDIT, Intent.QA}
-        and not state.accepted_steps
-        and not state.step_results
-    ):
-        return ResponseMode.FAILURE
-    if state.intent is Intent.UNCLEAR and not state.step_results:
+    if state.main_agent_failed:
         return ResponseMode.FAILURE
     return ResponseMode.EXPLANATION
 
@@ -157,8 +144,7 @@ async def _stream_or_generate(
 
 
 def _allowed_spot_ids(state: TurnState) -> set[str]:
-    values: set[str] = {reference.spot_id for reference in state.references}
-    values.update(candidate.spot_id for candidate in state.last_candidates)
+    values: set[str] = {candidate.spot_id for candidate in state.last_candidates}
     for result in state.step_results.values():
         raw_ids = result.data.get("spot_ids")
         if isinstance(raw_ids, list):
@@ -200,18 +186,12 @@ def _allowed_spot_ids(state: TurnState) -> set[str]:
                         for item in day.get("items", [])
                         if isinstance(item, dict) and isinstance(item.get("spot_id"), str)
                     )
-    # QA 以外でも現在旅程の説明は入力事実なので許可する。
+    # 現在旅程の説明は入力事実なので常に許可する。
     if state.itinerary is not None:
         for day in state.itinerary.itinerary.days:
             values.add(day.origin.spot_id)
             values.update(item.spot_id for item in day.items)
             values.add(day.destination.spot_id)
-    # ask_user は地点を扱わないが、Tool 型の比較を明示する。
-    values.update(
-        result.data.get("spot_id")
-        for result in state.step_results.values()
-        if result.tool is ToolName.SEARCH_KNOWLEDGE and isinstance(result.data.get("spot_id"), str)
-    )
     return values
 
 

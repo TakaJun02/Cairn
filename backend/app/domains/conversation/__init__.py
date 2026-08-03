@@ -1,4 +1,4 @@
-"""鳥海山観光の 1 ターンを司会する conversation ドメイン。"""
+"""鳥海山観光の 1 ターンを司会する conversation ドメイン(段2: ReAct 構成)。"""
 
 from __future__ import annotations
 
@@ -6,25 +6,21 @@ from typing import Any
 
 from app.domains.conversation.events import ConversationEvent, MemoryEventSink
 from app.domains.conversation.types import (
-    Intent,
     ResponseMode,
     ToolError,
     ToolErrorCode,
     ToolName,
-    UnderstandOutput,
 )
 
 __all__ = [
     "ConversationEvent",
     "ConversationPipeline",
-    "Intent",
     "MemoryEventSink",
     "ResponseMode",
     "ToolError",
     "ToolErrorCode",
     "ToolName",
     "TurnState",
-    "UnderstandOutput",
     "run_turn",
 ]
 

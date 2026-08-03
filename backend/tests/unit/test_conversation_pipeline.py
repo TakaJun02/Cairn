@@ -1,50 +1,40 @@
-"""失敗の三段階、イベント順、N6 finally をモックで検査する。"""
+"""load_context → update_profile → main_agent → respond → persist を
+
+end-to-end でモック LLM ・モック Tool を使って検査する(段2)。
+
+受け入れ条件: 単純推薦(recommend → done)と QA(search_knowledge → done)の
+ターンが新しい ReAct ループで完走すること。実 LLM(127.0.0.1:8000)は
+一切叩かない。
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
-from copy import deepcopy
 from typing import Any
 
 import pytest
 
 from app.domains.conversation.events import MemoryEventSink, emit, state_event
-from app.domains.conversation.executor import act
 from app.domains.conversation.pipeline import ConversationPipeline
-from app.domains.conversation.respond import response_mode
 from app.domains.conversation.state import (
-    CandidateReference,
     ContextSnapshot,
     ProfileState,
-    SkippedStep,
     SpotFact,
     TurnState,
 )
-from app.domains.conversation.types import (
-    Intent,
-    PlanStep,
-    ResponseMode,
-    ToolError,
-    ToolErrorCode,
-    ToolName,
-    ToolResult,
-)
+from app.domains.conversation.types import ToolError, ToolErrorCode, ToolName, ToolResult
 
 
-def _understand_output(plan: list[dict[str, Any]]) -> str:
+def _turn_json(tool: str, args: dict[str, Any], *, thought: str = "考える") -> str:
     return json.dumps(
-        {
-            "references": [],
-            "constraints": [],
-            "constraints_remove": [],
-            "selection_hints": [],
-            "unmodeled": [],
-            "intent": "recommend",
-            "plan": plan,
-        },
+        {"thought": thought, "action": {"tool": tool, "args": args}},
         ensure_ascii=False,
     )
+
+
+def _done_json() -> str:
+    return _turn_json("done", {})
 
 
 def _update_profile_output(
@@ -52,19 +42,14 @@ def _update_profile_output(
     profile_delta: dict[str, Any] | None = None,
     score_adjustments: list[dict[str, Any]] | None = None,
 ) -> str:
-    """N1.5 update_profile 用の guided JSON レスポンス。既定は差分なし。"""
-
     return json.dumps(
-        {
-            "profile_delta": profile_delta,
-            "score_adjustments": score_adjustments or [],
-        },
+        {"profile_delta": profile_delta, "score_adjustments": score_adjustments or []},
         ensure_ascii=False,
     )
 
 
 class TurnClient:
-    """update_profile → understand の順で消費される generate() 応答キュー。"""
+    """update_profile → main_agent(複数回)の順で消費される generate() 応答キュー。"""
 
     def __init__(
         self,
@@ -76,16 +61,19 @@ class TurnClient:
         self.generate_responses = list(generate_responses)
         self.response_chunks = response_chunks or []
         self.response_error = response_error
+        self.generate_calls: list[list[dict[str, str]]] = []
 
     async def generate(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
-        del messages, kwargs
+        del kwargs
+        self.generate_calls.append(messages)
         response = self.generate_responses.pop(0)
         if isinstance(response, BaseException):
             raise response
         return response
 
     async def stream(self, messages: list[dict[str, str]], **kwargs: Any):
-        del messages, kwargs
+        del kwargs
+        self.generate_calls.append(messages)
         for value in self.response_chunks:
             yield value
         if self.response_error is not None:
@@ -122,31 +110,25 @@ class MemoryConversationRepository:
         assert user_id == 1
         return self.snapshot.model_copy(deep=True)
 
-    async def persist_turn(self, state: TurnState) -> int:
+    async def persist_turn(self, state: TurnState) -> int | None:
         self.persisted.append(state.model_copy(deep=True))
-        self.snapshot.pending_ask = deepcopy(state.pending_ask)
-        self.snapshot.ask_streak = (
-            state.ask_streak + 1 if state.pending_ask is not None else 0
-        )
-        return 88
+        return 88 if state.responded else None
 
 
 class FakeTools:
-    def __init__(
-        self,
-        *,
-        sink: MemoryEventSink | None = None,
-        scripted: dict[int, ToolResult | ToolError | Exception] | None = None,
-    ) -> None:
+    def __init__(self, *, sink: MemoryEventSink | None = None) -> None:
         self.sink = sink
-        self.scripted = scripted or {}
-        self.called: list[int] = []
+        self.recommend_queue: list[Any] = []
+        self.plan_queue: list[Any] = []
+        self.edit_queue: list[Any] = []
+        self.search_queue: list[Any] = []
+        self.calls: list[str] = []
 
-    async def recommend(self, *, step_id: int, **kwargs: Any):
-        del kwargs
-        self.called.append(step_id)
-        if step_id in self.scripted:
-            return self.scripted[step_id]
+    async def recommend(
+        self, *, step_id: int, args: Any, context: Any, use_specialist: bool
+    ) -> Any:
+        del args, context, use_specialist
+        self.calls.append("recommend")
         if self.sink is not None:
             await emit(
                 self.sink,
@@ -164,193 +146,57 @@ class FakeTools:
                     items=[{"spot_id": "spot_001", "name_ja": "鶴間池"}],
                 ),
             )
+        if self.recommend_queue:
+            return self.recommend_queue.pop(0)
         return ToolResult(
             step_id=step_id,
             tool=ToolName.RECOMMEND,
             data={
                 "spot_ids": ["spot_001"],
-                "candidates": [{"spot_id": "spot_001", "rank": 1}],
+                "candidates": [{"spot_id": "spot_001", "rank": 1, "reason_materials": {}}],
                 "provisional_spot_ids": ["spot_001"],
                 "rerank_used": False,
             },
         )
 
-    async def plan_itinerary(self, *, step_id: int, **kwargs: Any):
-        del kwargs
-        self.called.append(step_id)
-        return self.scripted[step_id]
+    async def plan_itinerary(self, *, step_id: int, user_id: int, args: Any, **kwargs: Any) -> Any:
+        del user_id, args, kwargs
+        self.calls.append("plan_itinerary")
+        return self.plan_queue.pop(0)
 
-    async def edit_itinerary(self, *, step_id: int, **kwargs: Any):
-        del kwargs
-        self.called.append(step_id)
-        return self.scripted[step_id]
+    async def edit_itinerary(self, *, step_id: int, user_id: int, args: Any, **kwargs: Any) -> Any:
+        del user_id, args, kwargs
+        self.calls.append("edit_itinerary")
+        return self.edit_queue.pop(0)
 
-    async def search_knowledge(self, *, step_id: int, **kwargs: Any):
-        del kwargs
-        self.called.append(step_id)
-        scripted = self.scripted.get(step_id)
-        if isinstance(scripted, Exception):
-            raise scripted
-        if scripted is not None:
-            return scripted
+    async def search_knowledge(self, *, step_id: int, args: Any) -> Any:
+        del args
+        self.calls.append("search_knowledge")
+        if self.search_queue:
+            return self.search_queue.pop(0)
         return ToolResult(
             step_id=step_id,
             tool=ToolName.SEARCH_KNOWLEDGE,
-            data={
-                "answer_ja": "資料の回答",
-                "sources": [],
-                "coverage": "none",
-                "spot_id": None,
-            },
+            data={"answer_ja": "資料の回答", "sources": [], "coverage": "none", "spot_id": None},
         )
 
-    async def ask_user(self, *, step_id: int, **kwargs: Any):
-        self.called.append(step_id)
-        if step_id in self.scripted:
-            return self.scripted[step_id]
-        args = kwargs["args"]
-        payload = args.model_dump(mode="json", exclude_none=True)
-        if self.sink is not None:
-            if args.kind == "preference":
-                await emit(
-                    self.sink,
-                    state_event(
-                        "ask_user",
-                        slot=args.slot.value,
-                        options=[option.label for option in args.options],
-                    ),
-                )
-            else:
-                await emit(
-                    self.sink,
-                    state_event(
-                        "clarify",
-                        surface=args.surface,
-                        options=[
-                            {"label": option.label, "value": option.value}
-                            for option in args.options
-                        ],
-                    ),
-                )
-        return ToolResult(
-            step_id=step_id,
-            tool=ToolName.ASK_USER,
-            data=payload,
-        )
+    async def ask_user(self, *, step_id: int, args: Any) -> Any:  # pragma: no cover
+        raise AssertionError("段2では ask_user を呼びません")
 
 
-def _state(steps: list[PlanStep]) -> TurnState:
-    spot = SpotFact(
-        spot_id="spot_001",
-        name_ja="鶴間池",
-        kind="facility",
-        tags_ja=["自然"],
-    )
-    return TurnState(
-        turn_id="turn",
-        thread_id=1,
-        user_id=1,
-        utterance="test",
-        profile=ProfileState(),
-        spot_id_vocab=[spot.spot_id],
-        spot_names={spot.spot_id: spot.name_ja},
-        spot_catalog={spot.spot_id: spot},
-        accepted_steps=steps,
-    )
+async def test_simple_recommend_turn_completes_end_to_end() -> None:
+    """受け入れ条件: recommend → done の単純推薦が新ループで完走する。"""
 
-
-async def test_act_has_skip_skip_abort_three_levels_and_keeps_prior_result() -> None:
-    fatal = ToolError(
-        code=ToolErrorCode.INTERNAL,
-        message_ja="Tool が失敗しました",
-        recoverable=False,
-    )
-    tools = FakeTools(
-        scripted={
-            1: ToolResult(
-                step_id=1,
-                tool=ToolName.SEARCH_KNOWLEDGE,
-                data={"answer_ja": "ok", "sources": [], "coverage": "none"},
-            ),
-            2: fatal,
-        }
-    )
-    state = _state(
-        [
-            PlanStep(id=1, tool="search_knowledge", args={"request": "one"}),
-            PlanStep(id=2, tool="search_knowledge", args={"request": "two"}),
-            PlanStep(id=3, tool="search_knowledge", args={"request": "three"}),
-        ]
-    )
-
-    await act(state, tools=tools)
-
-    assert list(state.step_results) == [1]
-    assert state.aborted_at == 2
-    assert tools.called == [1, 2]
-
-    unresolved = _state(
-        [
-            PlanStep(
-                id=4,
-                tool="edit_itinerary",
-                args={"ops": [{"op": "add", "targets": "$99.spot_ids"}]},
-            )
-        ]
-    )
-    await act(unresolved, tools=tools)
-    assert unresolved.skipped_steps[0].code == "reference_unresolved"
-
-    precondition = _state(
-        [PlanStep(id=5, tool="edit_itinerary", args={"ops": []})]
-    )
-    await act(precondition, tools=tools)
-    assert precondition.skipped_steps[0].code == "precondition_unmet"
-
-
-async def test_act_converts_leaked_tool_exception_to_abort_and_can_continue_recoverable() -> None:
-    recoverable = ToolError(
-        code=ToolErrorCode.EMPTY_RESULT,
-        message_ja="候補がありません",
-        recoverable=True,
-    )
-    tools = FakeTools(
-        scripted={
-            1: recoverable,
-            2: RuntimeError("adapter leak"),
-        }
-    )
-    state = _state(
-        [
-            PlanStep(id=1, tool="search_knowledge", args={"request": "one"}),
-            PlanStep(id=2, tool="search_knowledge", args={"request": "two"}),
-            PlanStep(id=3, tool="search_knowledge", args={"request": "three"}),
-        ]
-    )
-
-    await act(state, tools=tools)
-
-    assert tools.called == [1, 2]
-    assert [value.code for value in state.skipped_steps] == [
-        "empty_result",
-        "internal",
-    ]
-    assert state.aborted_at == 2
-
-
-async def test_pipeline_event_order_and_persist() -> None:
     sink = MemoryEventSink()
     repository = MemoryConversationRepository()
     tools = FakeTools(sink=sink)
     client = TurnClient(
         [
-            _update_profile_output(profile_delta={"party": "family_kids"}),
-            _understand_output([{"id": 1, "tool": "recommend", "args": {"k": 1}}]),
+            _update_profile_output(),
+            _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _done_json(),
         ],
-        response_chunks=[
-            "鶴間池をご案内します。",
-            "今回考慮した条件: なし。",
-        ],
+        response_chunks=["鶴間池をご案内します。", "今回考慮した条件: なし。"],
     )
 
     state = await ConversationPipeline(
@@ -360,7 +206,9 @@ async def test_pipeline_event_order_and_persist() -> None:
         tools=tools,
     ).run(user_id=1, utterance="おすすめは？")
 
+    assert tools.calls == ["recommend"]
     assert repository.persisted[0].assistant_text == state.assistant_text
+    assert repository.persisted[0].responded is True
     assert [event.event for event in sink.events] == [
         "state",
         "state",
@@ -370,99 +218,111 @@ async def test_pipeline_event_order_and_persist() -> None:
         "token",
         "done",
     ]
-    # update_profile（N1.5）が最初に走るため、profile イベントが先頭に来る。
-    assert sink.events[0].data["kind"] == "profile"
-    assert [event.data.get("kind") for event in sink.events[1:4]] == [
-        "plan",
-        "candidates",
-        "candidates",
-    ]
+    kinds = [event.data.get("kind") for event in sink.events if event.event == "state"]
+    assert kinds == ["step", "candidates", "candidates", "step"]
+    assert sink.events[0].data == {
+        "kind": "step",
+        "tool": "recommend",
+        "status": "started",
+        "label_ja": "おすすめを探しています",
+    }
     assert sink.events[-1].data["message_id"] == 88
 
 
-async def test_ask_user_suspends_resumes_and_pending_expires_after_one_turn() -> None:
+async def test_qa_turn_completes_end_to_end() -> None:
+    """受け入れ条件: search_knowledge → done の QA が新ループで完走する。"""
+
     sink = MemoryEventSink()
     repository = MemoryConversationRepository()
-    repository.snapshot.last_candidates = [
-        CandidateReference(spot_id="spot_001", name_ja="鶴間池", rank=1)
-    ]
-    ask_output = json.loads(
-        _understand_output(
-            [
-                {
-                    "id": 1,
-                    "tool": "ask_user",
-                    "args": {
-                        "kind": "clarify",
-                        "surface": "2番目",
-                        "reason": "候補が複数あります",
-                        "options": [
-                            {"label": "鶴間池", "value": "spot_001"},
-                            {
-                                "label": "直近候補全体",
-                                "value": "last_candidates",
-                            },
-                        ],
-                    },
-                }
-            ]
-        )
+    tools = FakeTools(sink=sink)
+    client = TurnClient(
+        [
+            _update_profile_output(),
+            _turn_json("search_knowledge", {"request": "由来を教えて", "spot_name": None}),
+            _done_json(),
+        ],
+        response_chunks=["由来をご説明します。"],
     )
-    ask_output["intent"] = "unclear"
 
-    first = await ConversationPipeline(
+    state = await ConversationPipeline(
         repository,
         event_sink=sink,
-        llm_client=TurnClient(
-            [_update_profile_output(), json.dumps(ask_output, ensure_ascii=False)],
-            response_chunks=["「2番目」はどちらでしょうか。"],
-        ),
-        tools=FakeTools(sink=sink),
-    ).run(user_id=1, utterance="2番目を外して")
+        llm_client=client,
+        tools=tools,
+    ).run(user_id=1, utterance="鶴間池の由来は？")
 
-    assert first.should_end_turn is True
-    assert first.pending_ask == {
-        "kind": "clarify",
-        "surface": "2番目",
-        "reason": "候補が複数あります",
-        "options": [
-            {"label": "鶴間池", "value": "spot_001"},
-            {"label": "直近候補全体", "value": "last_candidates"},
-        ],
-    }
-    assert repository.snapshot.pending_ask == first.pending_ask
-    assert [event.data.get("kind") for event in sink.events if event.event == "state"] == [
-        "plan",
-        "clarify",
+    assert tools.calls == ["search_knowledge"]
+    assert state.respond_status == "complete"
+    kinds_and_status = [
+        (event.data.get("kind"), event.data.get("status"))
+        for event in sink.events
+        if event.event == "state"
     ]
+    assert kinds_and_status == [("step", "started"), ("step", "finished")]
 
-    second = await ConversationPipeline(
-        repository,
-        llm_client=TurnClient(
-            [_update_profile_output(), _understand_output([])],
-            response_chunks=["鶴間池として承りました。"],
-        ),
-        tools=FakeTools(),
-    ).run(
-        user_id=1,
-        utterance="鶴間池",
-        resolves={"surface": "2番目", "value": "spot_001"},
+
+async def test_respond_input_includes_this_turns_trajectory() -> None:
+    sink = MemoryEventSink()
+    repository = MemoryConversationRepository()
+    tools = FakeTools(sink=sink)
+    client = TurnClient(
+        [
+            _update_profile_output(),
+            _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _done_json(),
+        ],
+        response_chunks=["鶴間池をご案内します。"],
     )
 
-    assert second.tool_results[0]["output"] == {
-        "answer": "spot_001",
-        "answered_by": "chip",
-        "surface": "2番目",
-    }
-    assert second.log_fields["resumed_from_ask"] is True
-    assert repository.snapshot.pending_ask is None
+    await ConversationPipeline(
+        repository,
+        event_sink=sink,
+        llm_client=client,
+        tools=tools,
+    ).run(user_id=1, utterance="おすすめは？")
+
+    # generate_calls: [update_profile, main_agent#1, main_agent#2] → stream() は
+    # 別カウントなので最後の呼び出しが respond のメッセージになる。
+    respond_messages = client.generate_calls[-1]
+    respond_dynamic = respond_messages[1]["content"]
+    assert "tool=recommend" in respond_dynamic
+
+
+async def test_non_recoverable_tool_error_still_reaches_persist_and_done() -> None:
+    sink = MemoryEventSink()
+    repository = MemoryConversationRepository()
+    tools = FakeTools(sink=sink)
+    tools.recommend_queue = [
+        ToolError(
+            code=ToolErrorCode.INTERNAL,
+            message_ja="処理中に予期しない問題が発生しました。",
+            recoverable=False,
+        )
+    ]
+    client = TurnClient(
+        [_update_profile_output(), _turn_json("recommend", {"instruction": "滝が見たい"})],
+        response_chunks=["申し訳ありません、処理できませんでした。"],
+    )
+
+    state = await ConversationPipeline(
+        repository,
+        event_sink=sink,
+        llm_client=client,
+        tools=tools,
+    ).run(user_id=1, utterance="おすすめは？")
+
+    assert len(repository.persisted) == 1
+    assert repository.persisted[0].responded is True
+    assert [event.event for event in sink.events][-1] == "done"
+    assert any(event.event == "error" for event in sink.events)
+    assert state.degraded
 
 
 async def test_respond_failure_still_persists_failed_assistant_and_done() -> None:
     sink = MemoryEventSink()
     repository = MemoryConversationRepository()
     client = TurnClient(
-        [_update_profile_output(), _understand_output([])],
+        [_update_profile_output(), _done_json()],
         response_error=RuntimeError("stream down"),
     )
 
@@ -476,13 +336,19 @@ async def test_respond_failure_still_persists_failed_assistant_and_done() -> Non
     assert state.respond_status == "failed"
     assert len(repository.persisted) == 1
     assert repository.persisted[0].respond_status == "failed"
+    assert repository.persisted[0].responded is True
     assert [event.event for event in sink.events][-2:] == ["error", "done"]
 
 
-async def test_understand_fatal_persists_user_only_path_and_done() -> None:
+async def test_main_agent_total_failure_still_responds_in_failure_mode() -> None:
+    """guided JSON が確定できなくても respond まで到達し、assistant 行を残す。"""
+
     sink = MemoryEventSink()
     repository = MemoryConversationRepository()
-    client = TurnClient([_update_profile_output(), "bad", "bad again"])
+    client = TurnClient(
+        [_update_profile_output(), "bad json", "bad json again"],
+        response_chunks=["うまく処理できませんでした。"],
+    )
 
     state = await ConversationPipeline(
         repository,
@@ -491,42 +357,55 @@ async def test_understand_fatal_persists_user_only_path_and_done() -> None:
         tools=FakeTools(),
     ).run(user_id=1, utterance="理解不能")
 
-    assert state.understand_failed is True
+    assert state.main_agent_failed is True
+    assert state.responded is True
     assert len(repository.persisted) == 1
-    assert repository.persisted[0].understand_failed is True
-    assert [event.event for event in sink.events] == ["error", "done"]
+    assert repository.persisted[0].responded is True
+    assert any(event.event == "error" for event in sink.events)
+    assert [event.event for event in sink.events][-1] == "done"
 
 
-def test_response_mode_marks_empty_actionable_turn_and_all_skips_as_failure() -> None:
-    empty = _state([])
-    empty.intent = Intent.RECOMMEND
+async def test_cancelled_main_agent_persists_user_only_before_propagating() -> None:
+    """respond に到達していないので assistant 行は書かない(§13: persist には必ず到達)。"""
 
-    skipped = _state(
-        [PlanStep(id=1, tool="search_knowledge", args={"request": "由来"})]
-    )
-    skipped.intent = Intent.QA
-    skipped.skipped_steps = [
-        SkippedStep(
-            step_id=1,
-            tool="search_knowledge",
-            code="reference_unresolved",
-            reason="照応を解決できません",
-        )
-    ]
+    sink = MemoryEventSink()
+    repository = MemoryConversationRepository()
 
-    chitchat = _state([])
-    chitchat.intent = Intent.CHITCHAT
+    with pytest.raises(asyncio.CancelledError):
+        await ConversationPipeline(
+            repository,
+            event_sink=sink,
+            llm_client=TurnClient([_update_profile_output(), asyncio.CancelledError()]),
+            tools=FakeTools(),
+        ).run(user_id=1, utterance="途中で停止")
 
-    assert response_mode(empty) is ResponseMode.FAILURE
-    assert response_mode(skipped) is ResponseMode.FAILURE
-    assert response_mode(chitchat) is ResponseMode.EXPLANATION
+    assert len(repository.persisted) == 1
+    assert repository.persisted[0].responded is False
+    assert sink.events[-1].event == "done"
+
+
+async def test_cancelled_update_profile_persists_user_only_before_propagating() -> None:
+    sink = MemoryEventSink()
+    repository = MemoryConversationRepository()
+
+    with pytest.raises(asyncio.CancelledError):
+        await ConversationPipeline(
+            repository,
+            event_sink=sink,
+            llm_client=TurnClient([asyncio.CancelledError()]),
+            tools=FakeTools(),
+        ).run(user_id=1, utterance="途中で停止")
+
+    assert len(repository.persisted) == 1
+    assert repository.persisted[0].responded is False
+    assert sink.events[-1].event == "done"
 
 
 async def test_cancelled_respond_persists_partial_text_before_propagating() -> None:
     sink = MemoryEventSink()
     repository = MemoryConversationRepository()
     client = TurnClient(
-        [_update_profile_output(), _understand_output([])],
+        [_update_profile_output(), _done_json()],
         response_chunks=["生成途中"],
         response_error=asyncio.CancelledError(),
     )
@@ -542,42 +421,5 @@ async def test_cancelled_respond_persists_partial_text_before_propagating() -> N
     assert len(repository.persisted) == 1
     assert repository.persisted[0].assistant_text == "生成途中"
     assert repository.persisted[0].respond_status == "partial"
-    assert sink.events[-1].event == "done"
-
-
-async def test_cancelled_understand_persists_user_only_before_propagating() -> None:
-    sink = MemoryEventSink()
-    repository = MemoryConversationRepository()
-
-    with pytest.raises(asyncio.CancelledError):
-        await ConversationPipeline(
-            repository,
-            event_sink=sink,
-            llm_client=TurnClient(
-                [_update_profile_output(), asyncio.CancelledError()]
-            ),
-            tools=FakeTools(),
-        ).run(user_id=1, utterance="途中で停止")
-
-    assert len(repository.persisted) == 1
-    assert repository.persisted[0].understand_failed is True
-    assert sink.events[-1].event == "done"
-
-
-async def test_cancelled_update_profile_persists_user_only_before_propagating() -> None:
-    """N1.5 update_profile 自体がキャンセルされても persist に必ず到達する（§13）。"""
-
-    sink = MemoryEventSink()
-    repository = MemoryConversationRepository()
-
-    with pytest.raises(asyncio.CancelledError):
-        await ConversationPipeline(
-            repository,
-            event_sink=sink,
-            llm_client=TurnClient([asyncio.CancelledError()]),
-            tools=FakeTools(),
-        ).run(user_id=1, utterance="途中で停止")
-
-    assert len(repository.persisted) == 1
-    assert repository.persisted[0].understand_failed is True
+    assert repository.persisted[0].responded is True
     assert sink.events[-1].event == "done"

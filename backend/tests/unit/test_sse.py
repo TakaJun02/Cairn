@@ -114,6 +114,46 @@ async def test_ask_user_and_clarify_sse_include_reason_without_changing_options(
     }
 
 
+async def test_search_knowledge_progress_is_translated_to_state_step() -> None:
+    """旧 `searching` は `state:step`(status=progress)へ統合する(ADR-0019)。
+
+    narration ドメイン内部(`SearchStateEvent`)は変えず、変換は conversation
+    側(`ToolAdapters.search_knowledge`)で行う。
+    """
+
+    from app.core.config import get_settings
+    from app.domains.narration.search.types import SearchResult, SearchStateEvent
+
+    sink = MemoryEventSink()
+    adapter = object.__new__(ToolAdapters)
+    adapter.event_sink = sink
+    adapter.settings = get_settings()
+
+    async def fake_search_runner(request: str, spot_id: str | None, **kwargs: Any) -> Any:
+        del request, spot_id
+        event_sink = kwargs["event_sink"]
+        await event_sink(SearchStateEvent(text="鶴間池の資料を読んでいます"))
+        return SearchResult(answer_ja="回答", sources=[], coverage="none")
+
+    adapter.search_runner = fake_search_runner
+
+    from app.domains.conversation.types import SearchKnowledgeArgs
+
+    await adapter.search_knowledge(
+        step_id=1,
+        args=SearchKnowledgeArgs(request="由来を教えて"),
+    )
+
+    assert len(sink.events) == 1
+    payload = adapt_conversation_event(sink.events[0]).root.data.model_dump(mode="json")
+    assert payload == {
+        "kind": "step",
+        "tool": "search_knowledge",
+        "status": "progress",
+        "label_ja": "鶴間池の資料を読んでいます",
+    }
+
+
 def test_sse_frame_has_event_data_and_terminal_blank_line() -> None:
     event = ChatEvent.model_validate(
         {"event": "token", "data": {"text": "鳥海山です"}}

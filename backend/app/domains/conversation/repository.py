@@ -196,7 +196,7 @@ class ConversationRepository:
             await self.session.flush()
 
             assistant_message: Message | None = None
-            if not state.understand_failed:
+            if state.responded:
                 assistant_message = Message(
                     thread_id=state.thread_id,
                     seq=next_seq + 1,
@@ -237,43 +237,24 @@ class ConversationRepository:
         *,
         asked_at_message_id: int | None = None,
     ) -> None:
+        del asked_at_message_id  # 段5で `ask_user` の pending_ask 記録に使う。
         thread.presented_spot_ids = list(dict.fromkeys(state.presented_spot_ids))
         thread.last_candidates = [
             value.model_dump(mode="json") for value in state.last_candidates
         ]
-        if state.should_end_turn and state.pending_ask is not None:
-            slot = state.pending_ask.get("slot")
-            if state.pending_ask.get("kind") == "preference" and isinstance(slot, str):
-                thread.asked_slots = list(dict.fromkeys([*state.asked_slots, slot]))
-            else:
-                thread.asked_slots = list(state.asked_slots)
-            thread.ask_streak = state.ask_streak + 1
-        else:
-            thread.asked_slots = list(state.asked_slots)
-            thread.ask_streak = 0
-
-        if state.pending_ask is not None:
-            thread.pending_ask = {
-                **deepcopy(state.pending_ask),
-                "original_utterance": state.utterance,
-                "asked_at_message_id": asked_at_message_id,
-            }
-        else:
-            # 前ターンの pending は、別の話題が来た場合もここで必ず消す。
-            thread.pending_ask = None
-        _record_resolved_asks(thread, state)
-
-        initial_version = state.log_fields.get("initial_itinerary_version", 0)
-        successful_plan = any(
-            result.tool.value == "plan_itinerary" for result in state.step_results.values()
-        )
-        if initial_version == 0 and state.constraints and not successful_plan:
-            existing = deepcopy(list(thread.pending_constraints))
-            existing.extend(
-                value.model_dump(mode="json", exclude_none=True)
-                for value in state.constraints
-            )
-            thread.pending_constraints = _deduplicate_constraints(existing)
+        # 段2は `ask_user` を呼ばないため、質問中の状態(pending_ask)は
+        # 常に持たない。asked_slots/ask_streak/resolved_ambiguities は
+        # 段5で使うユーティリティなので、読み込んだ値をそのまま素通りする
+        # (このターンでは書き換えない)。
+        thread.asked_slots = list(state.asked_slots)
+        thread.ask_streak = 0
+        thread.pending_ask = None
+        # `pending_constraints`(旅程がまだ無いターンの制約の一時保持)は、
+        # ReAct 化により constraints が常に plan_itinerary/edit_itinerary の
+        # 引数として Tool 呼び出しと一緒に来るようになったため、
+        # 会話状態側で明示的に積む経路が無くなった。`plan_itinerary` 成功時に
+        # Tool 側(`ItineraryService.clear_pending_constraints`)が同一
+        # session 内で既に消し込み済みなので、ここでは触らない。
 
 
 def _message_state(value: Message) -> MessageState:
@@ -341,10 +322,14 @@ def _assistant_meta(state: TurnState) -> dict[str, Any]:
     itinerary = _result_itinerary(state)
     itinerary_ids = _itinerary_ids(itinerary) if itinerary is not None else []
     qa_spot_id = _qa_spot_id(state)
+    tools = [result.tool.value for result in state.step_results.values()]
     return {
         "turn_id": state.turn_id,
-        "intent": state.intent.value if state.intent is not None else None,
-        "tools": [result.tool.value for result in state.step_results.values()],
+        # 旧 `intent` は understand の分類結果だったが、ReAct 化で
+        # 単一の意図分類ステップが無くなったため、実行した Tool 列から
+        # 機械的に導出する(§参照: Docs/30_design/agent_react_architecture.md)。
+        "mode": _derive_mode(tools),
+        "tools": tools,
         "candidate_spot_ids": candidate_ids,
         "candidate_names": candidate_names,
         "itinerary_version": itinerary.version if itinerary is not None else None,
@@ -354,6 +339,7 @@ def _assistant_meta(state: TurnState) -> dict[str, Any]:
         ],
         "qa_spot_id": qa_spot_id,
         "qa_spot_name": state.spot_names.get(qa_spot_id or "") if qa_spot_id else None,
+        # 段5で `ask_user` を再導入するまで、常に None。
         "ask_slot": (
             state.pending_ask.get("slot")
             if state.pending_ask is not None
@@ -367,6 +353,20 @@ def _assistant_meta(state: TurnState) -> dict[str, Any]:
             else None
         ),
     }
+
+
+def _derive_mode(tools: list[str]) -> str:
+    """実行した Tool 列から履歴要約向けの大まかな分類を機械的に導出する。"""
+
+    if "plan_itinerary" in tools:
+        return "plan"
+    if "edit_itinerary" in tools:
+        return "edit"
+    if "recommend" in tools:
+        return "recommend"
+    if "search_knowledge" in tools:
+        return "qa"
+    return "chitchat"
 
 
 def _result_itinerary(state: TurnState) -> Itinerary | None:
@@ -390,43 +390,3 @@ def _qa_spot_id(state: TurnState) -> str | None:
     return None
 
 
-def _record_resolved_asks(thread: Thread, state: TurnState) -> None:
-    existing = deepcopy(list(thread.resolved_ambiguities))
-    known_surfaces = {
-        str(value.get("surface"))
-        for value in existing
-        if isinstance(value, dict) and isinstance(value.get("surface"), str)
-    }
-    for result in state.tool_results:
-        tool_input = result.get("input")
-        output = result.get("output")
-        if not isinstance(tool_input, dict) or not isinstance(output, dict):
-            continue
-        surface = tool_input.get("surface")
-        answer = output.get("answer")
-        if (
-            tool_input.get("kind") != "clarify"
-            or not isinstance(surface, str)
-            or not surface
-            or not isinstance(answer, str)
-            or surface in known_surfaces
-        ):
-            continue
-        existing.append({"surface": surface, "resolved_to": answer})
-        known_surfaces.add(surface)
-    thread.resolved_ambiguities = existing
-
-
-def _deduplicate_constraints(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for value in values:
-        key = (
-            str(value.get("pred", "")),
-            repr(value.get("args", {})),
-            str(value.get("source_text", "")),
-        )
-        if key not in seen:
-            seen.add(key)
-            result.append(value)
-    return result

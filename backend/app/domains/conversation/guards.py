@@ -1,30 +1,59 @@
-"""P1〜P8・G1〜G9 と横断不変条件を集めた純粋ガード群。"""
+"""コードが強制するガード群(`Docs/30_design/agent_react_architecture.md` §10)。
+
+段2(ReAct 化)で、旧 P1〜P8(一括プラン検証)・G1〜G9 のうち `$N` 参照解決・
+3経路分類完全性チェックは不要になった(メインエージェントは毎周 1 手だけを
+書き、前段結果への参照は行わない。名前解決は `name_resolution.py` が担う)。
+
+残すもの:
+- `validate_and_normalize_constraints`: メインエージェントが直接書く制約
+  (述語 DSL 17 種)の検証。`plan_itinerary`/`edit_itinerary` アダプタが使う
+- `normalize_revert_ops`: `edit_itinerary.ops` に `revert` が混じったときの
+  排他化。メインループが Tool 実行前に使う
+- `validate_response_spot_names`: `respond` のクローズドワールド検査
+- `validate_ask_user`(G1〜G9)と `asked_slots`/`ask_streak`/
+  `resolved_ambiguities` を使うユーティリティ: 段5 (`ask_user` の HITL 化)で
+  使うため、今回は呼び出し元がなくても残す
+"""
 
 from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
 
 from app.domains.conversation.state import ProfileState, SpotFact
-from app.domains.conversation.types import (
-    AskUserArgs,
-    ConstraintDraft,
-    Intent,
-    ReferenceResolution,
-    SelectionHint,
-    UnmodeledItem,
-)
+from app.domains.conversation.types import AskUserArgs, ConstraintDraft, UnmodeledItem
 from app.domains.itinerary.predicates import normalize_constraints
 
 _ALLOWED_INTERPRETATIONS = frozenset(
     {"all_matches", "single_match", "current_itinerary", "last_candidates"}
 )
-_REFERENCE_PATTERN = re.compile(
-    r"^\$(?P<step>[1-9]\d*)\.(?P<field>spot_ids|itinerary)"
-    r"(?:\[:(?P<limit>[1-8])\])?$"
-)
+
+
+def has_repeated_ngram(
+    text: str,
+    *,
+    ngram_size: int = 8,
+    repeat_threshold: int = 6,
+) -> bool:
+    """連続する同一 token n-gram と文字列ブロックの双方を検知する。
+
+    `update_profile`/`main_agent`/`respond` の guided/ストリーミング生成で
+    共通に使う暴走検知(vLLM が稀に同一断片を無限反復するケースへの安全弁)。
+    """
+
+    tokens = re.findall(r"[\w一-龥ぁ-んァ-ヶー]+|[^\w\s]", text)
+    if len(tokens) >= ngram_size * repeat_threshold:
+        for start in range(len(tokens) - ngram_size * repeat_threshold + 1):
+            block = tokens[start : start + ngram_size]
+            if all(
+                tokens[start + offset * ngram_size : start + (offset + 1) * ngram_size]
+                == block
+                for offset in range(1, repeat_threshold)
+            ):
+                return True
+    # 空白のない日本語や JSON 断片も拾う。短い `{}` 等は誤検知しない。
+    return re.search(r"(.{8,128}?)\1{5,}", text, flags=re.DOTALL) is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,50 +69,6 @@ class ConstraintGuardResult:
     unmodeled: tuple[UnmodeledItem, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class ClassificationCount:
-    extracted: int
-    constraints: int
-    selection_hints: int
-    unmodeled: int
-
-    @property
-    def classified(self) -> int:
-        return self.constraints + self.selection_hints + self.unmodeled
-
-
-def validate_classification_completeness(
-    *,
-    extracted_count: int,
-    constraints: Sequence[ConstraintDraft],
-    selection_hints: Sequence[SelectionHint],
-    unmodeled: Sequence[UnmodeledItem],
-) -> GuardResult:
-    """制約・要望の抽出要素が 3 経路（dsl/selection/unmodeled）に
-    過不足なく入ったか検査する。
-
-    `score_adjustments`（そのターン限りの点数調整）は N1.5 `update_profile`
-    が単独で抽出するため、ここでは数えない。
-    """
-
-    count = ClassificationCount(
-        extracted=extracted_count,
-        constraints=len(constraints),
-        selection_hints=len(selection_hints),
-        unmodeled=len(unmodeled),
-    )
-    if count.extracted != count.classified:
-        return GuardResult(
-            False,
-            "classification_completeness",
-            (
-                f"抽出数 {count.extracted} と分類済み数 "
-                f"{count.classified} が一致しません"
-            ),
-        )
-    return GuardResult(True)
-
-
 def validate_and_normalize_constraints(
     values: Sequence[ConstraintDraft],
     spots: Mapping[str, SpotFact],
@@ -91,7 +76,7 @@ def validate_and_normalize_constraints(
     created_at_version: int,
     used_ids: Iterable[str] = (),
 ) -> ConstraintGuardResult:
-    """17 述語と実在引数を検査し、無効値は経路 4 へ移す。"""
+    """17 述語と実在引数を検査し、無効値は `unmodeled` へ移す(C4)。"""
 
     normalized = normalize_constraints(
         [value.model_dump(mode="python", exclude_none=True) for value in values],
@@ -113,23 +98,33 @@ def validate_and_normalize_constraints(
     return ConstraintGuardResult(constraints=constraints, unmodeled=unmodeled)
 
 
-def validate_reference_closed_world(
-    reference: ReferenceResolution,
+def normalize_revert_ops(ops: Sequence[dict[str, object]]) -> tuple[list[dict[str, object]], bool]:
+    """`revert` が混在したら、それ以外を捨てる。"""
+
+    reverts = [value for value in ops if value.get("op") == "revert"]
+    if not reverts:
+        return [dict(value) for value in ops], False
+    return [dict(reverts[0])], len(ops) != 1 or len(reverts) != 1
+
+
+def validate_response_spot_names(
+    text: str,
     *,
+    all_spot_names: Mapping[str, str],
     allowed_spot_ids: set[str],
-    existing_spot_ids: set[str],
 ) -> GuardResult:
-    if reference.spot_id not in existing_spot_ids:
+    """DB 上の未提示 POI 名を `respond` が追加していないか照合する。"""
+
+    unauthorized = sorted(
+        name
+        for spot_id, name in all_spot_names.items()
+        if spot_id not in allowed_spot_ids and name and name in text
+    )
+    if unauthorized:
         return GuardResult(
             False,
-            "closed_world",
-            f"実在しない spot_id です: {reference.spot_id}",
-        )
-    if reference.spot_id not in allowed_spot_ids:
-        return GuardResult(
-            False,
-            "reference_scope",
-            f"現在の文脈から参照できない spot_id です: {reference.spot_id}",
+            "closed_world_response",
+            f"未提示の POI 名が応答に含まれます: {unauthorized}",
         )
     return GuardResult(True)
 
@@ -139,16 +134,20 @@ def validate_ask_user(
     *,
     asked_slots: Sequence[str],
     ask_streak: int,
-    intent: Intent | None,
+    intent: str | None,
     profile: ProfileState,
     has_non_question_step: bool,
     question_count: int = 1,
     allowed_spot_ids: set[str] | None = None,
     existing_spot_ids: set[str] | None = None,
-    resolved_ambiguities: Sequence[Any] = (),
+    resolved_ambiguities: Sequence[object] = (),
     has_viable_plan: bool = False,
 ) -> GuardResult:
-    """ADR-0018 の統合済み G1〜G7・G9 を順に適用する。"""
+    """段5で使う `ask_user` 抑制ガード(G1〜G9)。段2からの呼び出しはない。
+
+    `intent` は旧 `Intent` enum(段2で廃止)の代わりに文字列で受ける。
+    段5でメインループの「意図」概念を再設計する際に見直すこと。
+    """
 
     if question_count > 1:
         return GuardResult(False, "G1", "1 ターンに聞ける質問は 1 問です")
@@ -172,7 +171,7 @@ def validate_ask_user(
     if (
         question.kind == "preference"
         and question.slot is not None
-        and intent is Intent.RECOMMEND
+        and intent == "recommend"
         and not has_non_question_step
         and not (major_slots_empty and question.slot.value == "onboarding")
     ):
@@ -214,49 +213,7 @@ def validate_ask_user(
     return GuardResult(True)
 
 
-def normalize_revert_ops(ops: Sequence[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
-    """`revert` が混在したら、それ以外を捨てる。"""
-
-    reverts = [value for value in ops if value.get("op") == "revert"]
-    if not reverts:
-        return [dict(value) for value in ops], False
-    return [dict(reverts[0])], len(ops) != 1 or len(reverts) != 1
-
-
-def parse_step_reference(value: str) -> tuple[int, str, int | None] | None:
-    match = _REFERENCE_PATTERN.fullmatch(value)
-    if match is None:
-        return None
-    field = match.group("field")
-    limit_text = match.group("limit")
-    if field == "itinerary" and limit_text is not None:
-        return None
-    return int(match.group("step")), field, int(limit_text) if limit_text else None
-
-
-def validate_response_spot_names(
-    text: str,
-    *,
-    all_spot_names: Mapping[str, str],
-    allowed_spot_ids: set[str],
-) -> GuardResult:
-    """DB 上の未提示 POI 名を respond が追加していないか照合する。"""
-
-    unauthorized = sorted(
-        name
-        for spot_id, name in all_spot_names.items()
-        if spot_id not in allowed_spot_ids and name and name in text
-    )
-    if unauthorized:
-        return GuardResult(
-            False,
-            "closed_world_response",
-            f"未提示の POI 名が応答に含まれます: {unauthorized}",
-        )
-    return GuardResult(True)
-
-
-def _resolved_surfaces(values: Sequence[Any]) -> list[str]:
+def _resolved_surfaces(values: Sequence[object]) -> list[str]:
     result: list[str] = []
     for value in values:
         if isinstance(value, str):

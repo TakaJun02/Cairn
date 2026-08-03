@@ -44,13 +44,19 @@ from app.domains.itinerary.service import (
 )
 from app.domains.itinerary.types import (
     Diff as ItineraryDiff,
+)
+from app.domains.itinerary.types import (
     Itinerary,
+)
+from app.domains.itinerary.types import (
     ToolError as ItineraryToolError,
 )
 from app.domains.narration.search import search_knowledge
 from app.domains.narration.search.types import (
     SearchResult,
     SearchStateEvent,
+)
+from app.domains.narration.search.types import (
     ToolError as SearchToolError,
 )
 from app.domains.recommendation.repo import RecommendationRepository
@@ -291,7 +297,17 @@ class ToolAdapters:
         args: SearchKnowledgeArgs,
     ) -> ToolResult | ToolError:
         async def searching_sink(value: SearchStateEvent) -> None:
-            await emit(self.event_sink, state_event("searching", text=value.text))
+            # 旧 searching は state:step に統合する(§11)。narration ドメイン
+            # 内部(callback の型)は変えず、ここで変換だけ行う。
+            await emit(
+                self.event_sink,
+                state_event(
+                    "step",
+                    tool="search_knowledge",
+                    status="progress",
+                    label_ja=value.text,
+                ),
+            )
 
         try:
             result = await self.search_runner(

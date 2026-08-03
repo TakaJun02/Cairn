@@ -63,9 +63,22 @@ def token_event(text: str) -> ConversationEvent:
     return ConversationEvent(event="token", data={"text": text})
 
 
+ErrorStage = Literal[
+    "load_context",
+    "update_profile",
+    "main_agent",
+    "recommend",
+    "plan_itinerary",
+    "edit_itinerary",
+    "search_knowledge",
+    "respond",
+    "persist",
+]
+
+
 def error_event(
     *,
-    stage: Literal["understand", "validate_plan", "act", "respond", "persist"],
+    stage: ErrorStage,
     code: str,
     degraded: bool,
     message: str,

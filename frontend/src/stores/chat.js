@@ -132,6 +132,12 @@ export const useChatStore = defineStore('chat', () => {
       case 'searching':
         message.statusText = state.text
         break
+      case 'step':
+        // ADR-0019: state:step(started/progress/finished)。段2では
+        // 実況テキストの表示だけを最小限に追加する(既存の searching と
+        // 同じ statusText 経路を再利用)。
+        message.statusText = state.status === 'finished' ? '' : (state.label_ja || '')
+        break
       default:
         console.warn('[ChatStore] Unknown state kind:', state.kind)
     }

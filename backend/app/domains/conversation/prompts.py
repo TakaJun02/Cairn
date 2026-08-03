@@ -1,18 +1,32 @@
-"""固定プレフィックスを保つ understand/respond プロンプト。"""
+"""固定プレフィックスを保つ update_profile/main_agent/respond プロンプト。
+
+`Docs/30_design/agent_react_architecture.md` §3.1 の順序(①システムプロンプト+
+Tool 定義+出力スキーマ → ②プロフィール → ③現在の旅程+有効な制約 →
+④会話履歴 → ⑤このターンの軌跡 → ⑥ユーザーの発話)を、
+`build_main_agent_messages`/`build_respond_messages` がこの順で組み立てる。
+
+① (システムメッセージ)はターン間で byte 同一に保つ(可変情報を混ぜない。
+prefix caching のため)。R1/R2 のガードレールが発動したときだけ、例外的に
+縮小スキーマ(`main_agent_done_only_schema`)へ切り替える(これは
+`Docs/30_design/agent_react_architecture.md` §10 が明示的に許した縮退である)。
+"""
 
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from app.domains.conversation.itinerary_digest import (
+    format_active_constraints,
+    format_itinerary_digest,
+)
 from app.domains.conversation.state import TurnState
 from app.domains.conversation.types import (
-    Intent,
     ResponseMode,
-    Slot,
-    ToolName,
+    TrajectoryStep,
     pred_values,
     preference_values,
 )
@@ -20,134 +34,21 @@ from app.domains.recommendation.types import Mobility
 
 _PREFERENCE_VOCABULARY = " | ".join(preference_values())
 _MOBILITY_VOCABULARY = " | ".join(f'"{value.value}"' for value in Mobility)
-_SLOT_VOCABULARY = " | ".join(f'"{value.value}"' for value in Slot)
-_INTERPRETATION_VOCABULARY = (
-    "all_matches | single_match | current_itinerary | last_candidates"
-)
-_INTENT_VALUES = [value.value for value in Intent]
-_TOOL_VALUES = [value.value for value in ToolName]
+_PRED_VOCABULARY = " | ".join(pred_values())
 _JAPAN_TZ = ZoneInfo("Asia/Tokyo")
 _WEEKDAYS_JA = ("月", "火", "水", "木", "金", "土", "日")
 
-
-UNDERSTAND_SYSTEM_PROMPT = f"""あなたは鳥海山観光ガイダンスの
-understand ノードです。
-ユーザー発話を、指定された JSON Schema の JSON 1 個へ翻訳してください。
-説明文や Markdown は出しません。
-
-出力フィールドは必ず次の思考順で埋めます。この順序を変えません。
-references → constraints → constraints_remove → selection_hints →
-unmodeled → intent → plan。
-
-境界:
-- あなたは何も実行しません。Tool の列を plan に書くだけです。
-- プロフィールの差分（恒久的な選好）とそのターン限りの点数調整は
-  ここでは扱いません。前段の update_profile ステップが別に抽出します。
-- 命令（「入れて」「外して」「調べて」）は plan/ops に写し、
-  handling の数え上げには含めません。
-- 「どうあってほしいか」は必ず dsl / selection / unmodeled の
-  どれか 1 経路へ写します。
-- constraints は plan.args に入れず、トップレベルへ置きます。
-- 生タグは④の「生タグ語彙」にある語だけを recommend.filter.tags と
-  constraint.args.target に使えます。語彙に無い概念は tags に入れず、
-  その概念を tags ではスキップします。「山」は語彙に無いので、意図に合う
-  場合だけ「登山」か「鳥海山」を使い、合わなければ tags に入れません。
-- mobility は移動手段ではなく歩行耐性です。値は {_MOBILITY_VOCABULARY}
-  だけです。「車で行く」「車で回る」だけでは歩行耐性は不明なので、
-  recommend.filter.mobility に書きません。
-- 意味の曖昧さが実行を妨げ、具体的な選択肢が 2〜4 個ある場合だけ、
-  plan=[ask_user] の 1 手を出します。kind=clarify、intent=unclear とし、
-  surface に曖昧だった表現を入れます。
-- 日付・時刻が無い旅程要求や、選好が薄い推薦要求では聞き返さず、
-  仮定して進めます。
-- ask_user は選好を聞く kind=preference と、意味を聞き返す kind=clarify の
-  1 つの Tool です。plan の末尾だけに置き、plan 全体で 1 手までです。
-- 広い初回要求で party/mobility/interests がすべて空なら、
-  kind=preference、slot=onboarding の ask_user を使えます。
-- plan は最大 3 手。Tool は recommend / plan_itinerary / edit_itinerary /
-  search_knowledge / ask_user のみです。
-- 後段は前段結果を $N.spot_ids、$N.spot_ids[:k]、$N.itinerary だけで
-  参照できます。
-- search_knowledge の引数名は request です（query ではありません）。
-- edit_itinerary の自然言語 undo は ops=[{{"op":"revert"}}] です。
-  他の op と混ぜません。
-- plan_itinerary/edit_itinerary の制約はトップレベル constraints に置きます。
-- 前ターンの tool_results があれば、ask_user が何を聞き、ユーザーが
-  何と答えたかを元の要求と一緒に解釈して plan を組みます。
-
-Tool 引数の要点:
-recommend: {{filter: {{tags?:[④の生タグ],
-  mobility?:{_MOBILITY_VOCABULARY},
-  weather_fit?:true|false, area?:非空文字列, day?:1以上の整数}},
-  k:1..8, exclude?:[spot_id]}}
-  weather_fit は boolean です。雨天適性を考慮する要求なら true にします。
-  day は現在の旅程があるときだけ指定します。
-plan_itinerary: {{days: [{{date:"YYYY-MM-DD", start:"HH:MM", end:"HH:MM",
-  origin:{{kind:"spot"|"facility"|"coord", id?:spot_id, lat?:数値, lon?:数値}},
-  destination?:{{kind, id?, lat?, lon?}}}}], must_visit?:[spot_id]}}
-  例: 起点が道の駅象潟なら
-  origin={{"kind":"facility","id":"spot_011"}}（文字列だけにしない）。
-edit_itinerary: {{ops:[
-  {{op:"add", targets:[spot_id] または "$N.spot_ids" または
-    "$N.spot_ids[:k]", day?:1以上整数, after?:spot_id}},
-  {{op:"remove", targets:[spot_id]}},
-  {{op:"move", target:spot_id, day?:1以上整数, position?:1以上整数}},
-  {{op:"replace", target:spot_id, with:spot_id または "$N.spot_ids[:1]"}},
-  {{op:"lock", targets:[spot_id], locked:true|false}},
-  {{op:"set_stay", target:spot_id, min:1以上整数}},
-  {{op:"set_time", target:spot_id, arrive?:"HH:MM", depart?:"HH:MM"}},
-  {{op:"revert", to_version?:1以上整数}}
-]}}
-  各 op では ? の無い引数が必須です。set_time は arrive/depart の少なくとも
-  一方が必須です。
-search_knowledge: {{request:非空文字列, spot_id?:spot_id}}
-ask_user: {{kind:"preference"|"clarify",
-  slot?:{_SLOT_VOCABULARY},
-  surface?:非空文字列, reason:非空文字列,
-  options:[{{label:非空文字列, value:非空文字列}}]（2〜4件）}}
-  kind=preference は slot が必須で surface は不可、kind=clarify は surface が
-  必須で slot は不可です。clarify の options.value は参照可能な spot_id または
-  {_INTERPRETATION_VOCABULARY} のどれかだけです。
-
-例:
-- 「明日は滝を2つ入れて、昼を取れるようにして」なら recommend の後に
-  edit_itinerary(add targets=$1.spot_ids) を置き、lunch_break は
-  トップレベル constraints に置きます。
-- 「さっきのに戻して」なら edit_itinerary(revert) の 1 手です。
-
-選好キー語彙（固定）: {_PREFERENCE_VOCABULARY}
-"""
-
-
-RESPOND_SYSTEM_PROMPT = f"""あなたは鳥海山観光ガイダンスの
-respond ノードです。
-入力 JSON の mode に従い、自然で簡潔な日本語を
-1 回だけ生成してください。
-この 1 本のテンプレートを explanation / question / failure の
-全モードで使います。
-
-必須規則:
-- 入力にある spot_id と DB 表示名、事実、数値だけを使います。
-  POI 名、距離、所要時間、時刻を作りません。
-- score_breakdown の内部スコアはそのまま読み上げず、
-  matched_keys / matched_tags などの根拠素材としてだけ使います。
-- 候補や旅程を組み替えません。確定済み結果を説明するだけです。
-- explanation では「今回考慮した条件」を列挙します。
-- unmodeled、破棄・スキップ・失敗、譲歩があれば必ず明示します。
-- question は質問 1 つと選択肢だけを書きます。ask_user.kind=preference なら
-  聞きたいことを、kind=clarify なら何が曖昧だったかを述べます。
-- failure は分からなかったことと、ユーザーが次にできることを
-  短く伝えます。
-- 検索結果の coverage=none なら推測で補いません。
-
-選好キー語彙（固定）: {_PREFERENCE_VOCABULARY}
-"""
+MAIN_AGENT_MAX_DAYS = 5
+MAIN_AGENT_MAX_MUST_VISIT = 8
+MAIN_AGENT_MAX_OPS = 8
+MAIN_AGENT_MAX_CONSTRAINTS_ADD = 8
+MAIN_AGENT_MAX_CONSTRAINTS_REMOVE = 8
 
 
 UPDATE_PROFILE_SYSTEM_PROMPT = f"""あなたは鳥海山観光ガイダンスの
 update_profile ステップです。
 会話履歴と最新のユーザー発話から、ユーザーの恒久的な選好の差分
-（profile_delta）と、このターン限りの点数調整（score_adjustments）だけを、
+(profile_delta)と、このターン限りの点数調整(score_adjustments)だけを、
 指定された JSON Schema の JSON 1 個へ書き出してください。
 説明文や Markdown は出しません。
 
@@ -161,7 +62,7 @@ update_profile ステップです。
 - party / mobility / pace は恒久的な設定として確定した場合だけ書きます。
   mobility は移動手段ではなく歩行耐性です。値は {_MOBILITY_VOCABULARY}
   だけです。「車で行く」「車で回る」だけでは歩行耐性は不明なので書きません。
-- score_adjustments はそのターン限りの注文（「静かな所がいい」等）です。
+- score_adjustments はそのターン限りの注文(「静かな所がいい」等)です。
   恒久的な選好なら profile_delta.interests に書き、score_adjustments には
   書きません。両方に書くと二重に効きます。
 - score_adjustments.spot_id は②の参照可能な spot_id 語彙にある地点だけです。
@@ -169,46 +70,78 @@ update_profile ステップです。
 - 更新することが何もなければ profile_delta=null、score_adjustments=[] を
   返します。空でも構いません。
 
-選好キー語彙（固定）: {_PREFERENCE_VOCABULARY}
+選好キー語彙(固定): {_PREFERENCE_VOCABULARY}
 """
 
 
-def build_understand_messages(
-    state: TurnState,
-    *,
-    now: datetime | None = None,
-) -> list[dict[str, str]]:
-    """固定 ①② と可変 ③④⑤⑥を、必ずこの順で連結する。"""
+MAIN_AGENT_SYSTEM_PROMPT = f"""あなたは鳥海山観光ガイダンスの
+ReAct メインエージェントです。
+1 周ごとに「考えて、一手打つ」を繰り返します。指定された JSON Schema の
+JSON 1 個(thought + action)だけを出力してください。説明文や Markdown は
+出しません。
 
-    dynamic = _ordered_dynamic_context(
-        state,
-        include_turn_results=False,
-        include_tag_vocabulary=True,
-        now=now,
-    )
-    return [
-        {"role": "system", "content": UNDERSTAND_SYSTEM_PROMPT},
-        {"role": "user", "content": dynamic},
-    ]
+出力フィールドは thought → action の順で埋めます。thought は結論を出す前の
+1〜2 文の日本語です。
+
+Tool(action.tool)は次の 5 つです。1 周につき 1 つだけ選びます。
+- recommend: おすすめのスポットを探す。args = {{"instruction": 自然文}}。
+  件数(k=5)はコードが固定するので書きません。
+- plan_itinerary: 旅程がまだ無いときに新規作成する。
+  args = {{"days":[{{"date":"YYYY-MM-DD","start":"HH:MM","end":"HH:MM",
+  "origin_name":スポット名 または null,"destination_name":スポット名 または null}}],
+  "must_visit":[スポット名,...],
+  "constraints":{{"add":[{{"pred":述語,"args":object,"weight":数値,
+  "source_text":根拠になった発話}}],"remove":[制約id,...]}} または null,
+  "notes":文字列 または null}}
+- edit_itinerary: 既にある旅程を書き換える。
+  args = {{"ops":[...(下記)],"constraints":plan_itinerary と同じ形 または null,
+  "notes":文字列 または null}}
+- search_knowledge: 由来・歴史・注意事項などを調べる。
+  args = {{"request":自然文,"spot_name":スポット名 または null}}
+- done: このターンで打つ手を終える。args = {{}}。
+  done を選んだ後、あなた自身は応答文を書きません(respond が別に書きます)。
+
+境界(必ず守ること):
+- あなたはスポットを常に**名前**で扱います。spot_id を見ることも書くこともあり
+  ません。旅程・候補・履歴に出てくる地点はすべて名前で書かれています。
+- 1 ターンに recommend / plan_itinerary / edit_itinerary / search_knowledge を
+  複数回選べます。旅程の書き換えも 1 ターンに複数回行えます。
+- 直前までの軌跡(⑤)を見て、既に得た情報を無駄にせず次の一手を決めます。
+  同じ Tool を同じ引数でもう一度選ばないでください(実行されません)。
+- 質問して確認する手段は今はありません。日付・時刻・起点などが不明なときは
+  最も妥当な仮定を置いて進めてください(置いた仮定は Tool の結果に現れ、
+  最後の応答で必ず説明されます)。
+- constraints はあなたが直接書きます。述語(pred)は次の 17 種のどれかです:
+  {_PRED_VOCABULARY}
+  args の中身は述語ごとに異なります(例: require/exclude/first/last は
+  {{"target":スポット名または生タグ}}、time_window は
+  {{"target":...,"from":"HH:MM","to":"HH:MM"}} 等)。
+  不正な述語・引数は個別に無効化され、結果で報告されます。
+- edit_itinerary.ops の op は次の 8 種です(targets/target/with はスポット名):
+  add(targets, day?, after?) / remove(targets) / move(target, day?, position?) /
+  replace(target, with) / lock(targets, locked) / set_stay(target, min) /
+  set_time(target, arrive?, depart?) / revert(to_version?)。
+  自然言語の「元に戻して」は ops=[{{"op":"revert"}}] の 1 手にします
+  (他の op と混ぜません)。
+- 十分な情報が揃ったら done を選んでターンを終えてください。
+"""
 
 
-def build_respond_messages(
-    state: TurnState,
-    *,
-    mode: ResponseMode,
-    now: datetime | None = None,
-) -> list[dict[str, str]]:
-    dynamic = _ordered_dynamic_context(
-        state,
-        include_turn_results=True,
-        include_tag_vocabulary=False,
-        mode=mode,
-        now=now,
-    )
-    return [
-        {"role": "system", "content": RESPOND_SYSTEM_PROMPT},
-        {"role": "user", "content": dynamic},
-    ]
+RESPOND_SYSTEM_PROMPT = """あなたは鳥海山観光ガイダンスの respond ステップです。
+入力 JSON の軌跡(このターンで実行した手と結果)・譲歩・会話履歴をもとに、
+ユーザー向けの自然で簡潔な日本語を 1 回だけ生成してください。
+
+必須規則:
+- 軌跡・現在の旅程・会話履歴にある事実(スポット名、時刻、件数)だけを
+  使います。無い事実を作りません。
+- 候補や旅程を組み替えません。実行済みの結果を説明するだけです。
+- 今回考慮した条件・置いた仮定・譲歩を必ず列挙します(何が効いているかが
+  見えないと、ユーザーは「もう不要」と言えません)。
+- 反映できなかった要望・解決できなかった項目・エラーがあれば必ず言及します
+  (無言で捨てません)。
+- mode が failure のときは、うまく処理できなかったことと、次にユーザーが
+  できること(言い換え・条件を絞る等)を短く伝えます。
+"""
 
 
 def build_update_profile_messages(
@@ -218,7 +151,7 @@ def build_update_profile_messages(
 ) -> list[dict[str, str]]:
     """N1.5 `update_profile` 用のプロンプト。会話履歴 + 最新発話が入力である。"""
 
-    del now  # 日付情報は不要（understand/respond と異なり期日解釈をしない）
+    del now  # 日付情報は不要(understand/respond と異なり期日解釈をしない)
     vocab = [
         {"spot_id": spot_id, "name_ja": state.spot_names.get(spot_id, spot_id)}
         for spot_id in state.spot_id_vocab
@@ -237,168 +170,352 @@ def build_update_profile_messages(
     ]
 
 
-def understand_guided_schema(
-    spot_ids: list[str],
-    constraint_ids: list[str] | None = None,
-) -> dict[str, Any]:
-    """xgrammar 互換の schema。`uniqueItems` は意図的に一切使わない。"""
+def update_profile_guided_schema(spot_ids: list[str]) -> dict[str, Any]:
+    """N1.5 `update_profile` の guided JSON schema。`uniqueItems` は使わない。"""
 
     spot_value_schema: dict[str, Any]
     if spot_ids:
         spot_value_schema = {"type": "string", "enum": list(dict.fromkeys(spot_ids))}
     else:
-        # 空 enum や pattern を grammar compiler へ渡さず、親配列を空に縛る。
         spot_value_schema = {"type": "string"}
-    normalized_constraint_ids = list(dict.fromkeys(constraint_ids or []))
-    constraint_id_schema: dict[str, Any]
-    if normalized_constraint_ids:
-        constraint_id_schema = {
-            "type": "string",
-            "enum": normalized_constraint_ids,
-        }
-    else:
-        constraint_id_schema = {"type": "string"}
-    regular_plan_step_schema = {
-        "type": "object",
-        "properties": {
-            "id": {"type": "integer", "minimum": 1},
-            "tool": {
-                "type": "string",
-                "enum": [
-                    value
-                    for value in _TOOL_VALUES
-                    if value != ToolName.ASK_USER.value
-                ],
-            },
-            "args": {"type": "object", "additionalProperties": True},
-        },
-        "required": ["id", "tool", "args"],
-        "additionalProperties": False,
-    }
-    ask_user_plan_step_schema = {
-        "type": "object",
-        "properties": {
-            "id": {"type": "integer", "minimum": 1},
-            "tool": {"type": "string", "enum": [ToolName.ASK_USER.value]},
-            "args": {
-                "type": "object",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": ["preference", "clarify"],
-                    },
-                    "slot": {
-                        "type": "string",
-                        "enum": [value.value for value in Slot],
-                    },
-                    "surface": {"type": "string", "minLength": 1},
-                    "reason": {"type": "string", "minLength": 1},
-                    "options": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "label": {"type": "string", "minLength": 1},
-                                "value": {"type": "string", "minLength": 1},
-                            },
-                            "required": ["label", "value"],
-                            "additionalProperties": False,
-                        },
-                        "minItems": 2,
-                        "maxItems": 4,
-                    },
-                },
-                "required": ["kind", "reason", "options"],
-                "additionalProperties": False,
-            },
-        },
-        "required": ["id", "tool", "args"],
-        "additionalProperties": False,
-    }
     return {
         "type": "object",
         "properties": {
-            "references": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "surface": {"type": "string", "minLength": 1},
-                        "spot_id": spot_value_schema,
-                    },
-                    "required": ["surface", "spot_id"],
-                    "additionalProperties": False,
-                },
-                "maxItems": 8 if spot_ids else 0,
-            },
-            "constraints": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "pred": {"type": "string", "enum": pred_values()},
-                        "args": {"type": "object", "additionalProperties": True},
-                        "weight": {"type": "number", "minimum": 0.0},
-                        "source_text": {"type": "string"},
-                        "handling": {"type": "string", "enum": ["dsl"]},
-                    },
-                    "required": ["pred", "args", "weight", "source_text", "handling"],
-                    "additionalProperties": False,
-                },
-                "maxItems": 12,
-            },
-            "constraints_remove": {
-                "type": "array",
-                "items": constraint_id_schema,
-                "maxItems": 12 if normalized_constraint_ids else 0,
-            },
-            "selection_hints": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string", "minLength": 1},
-                        "handling": {"type": "string", "enum": ["selection"]},
-                    },
-                    "required": ["text", "handling"],
-                    "additionalProperties": False,
-                },
-                "maxItems": 8,
-            },
-            "unmodeled": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string", "minLength": 1},
-                        "handling": {"type": "string", "enum": ["unmodeled"]},
-                    },
-                    "required": ["text", "handling"],
-                    "additionalProperties": False,
-                },
-                "maxItems": 8,
-            },
-            "intent": {"type": "string", "enum": _INTENT_VALUES},
-            "plan": {
-                "type": "array",
-                "items": {
-                    "anyOf": [
-                        regular_plan_step_schema,
-                        ask_user_plan_step_schema,
-                    ]
-                },
-                "maxItems": 3,
+            "profile_delta": _profile_delta_schema(),
+            "score_adjustments": _score_adjustments_schema(
+                spot_value_schema, enabled=bool(spot_ids)
+            ),
+        },
+        "required": ["profile_delta", "score_adjustments"],
+        "additionalProperties": False,
+    }
+
+
+def build_main_agent_messages(
+    state: TurnState,
+    *,
+    reduced: bool,
+    system_note: str | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, str]]:
+    """①〜⑥を §3.1 の順で組み立てる。①(system)はターン間で byte 同一。"""
+
+    active_constraints = (
+        state.itinerary.constraints if state.itinerary is not None else state.pending_constraints
+    )
+    itinerary_digest = format_itinerary_digest(
+        state.itinerary.itinerary if state.itinerary is not None else None,
+        spot_names=state.spot_names,
+    )
+    constraints_digest = format_active_constraints(
+        active_constraints, spot_names=state.spot_names
+    )
+    sections = [
+        "② プロフィール:\n" + _compact_json(state.profile.model_dump(mode="json")),
+        "③ 今日の日付(JST)・現在の旅程・有効な制約:\n"
+        + _date_context(now)
+        + "\n"
+        + itinerary_digest
+        + "\n有効な制約:\n"
+        + _compact_json(constraints_digest),
+        "④ 会話履歴:\n" + (state.history or "(なし)"),
+        "⑤ このターンの軌跡:\n" + _trajectory_text(state.trajectory),
+    ]
+    if reduced:
+        sections.append(
+            "【システム指示】手数またはコンテキスト予算の上限に達しました。"
+            "まとめに入ってください。次の一手は done のみ選べます。"
+        )
+    if system_note:
+        sections.append(f"【補足】{system_note}")
+    # ⑥の発話より後ろには一切追加しない。
+    sections.append("⑥ ユーザーの発話:\n" + state.utterance)
+    return [
+        {"role": "system", "content": MAIN_AGENT_SYSTEM_PROMPT},
+        {"role": "user", "content": "\n\n".join(sections)},
+    ]
+
+
+def build_respond_messages(
+    state: TurnState,
+    *,
+    mode: ResponseMode,
+) -> list[dict[str, str]]:
+    degraded_json = _compact_json(
+        [value.model_dump(mode="json") for value in state.degraded]
+    )
+    dynamic = "\n\n".join(
+        [
+            f"mode: {mode.value}",
+            "① このターンの軌跡:\n" + _trajectory_text(state.trajectory),
+            "② 譲歩・縮退:\n" + degraded_json,
+            "③ 会話履歴:\n" + (state.history or "(なし)"),
+            "④ ユーザーの発話:\n" + state.utterance,
+        ]
+    )
+    return [
+        {"role": "system", "content": RESPOND_SYSTEM_PROMPT},
+        {"role": "user", "content": dynamic},
+    ]
+
+
+def main_agent_guided_schema(constraint_ids: list[str] | None = None) -> dict[str, Any]:
+    """xgrammar 互換の schema。分岐ごとに `tool` の enum を排他にする。
+
+    `uniqueItems` は意図的に一切使わない(xgrammar 未実装のため)。
+    """
+
+    return {
+        "type": "object",
+        "properties": {
+            "thought": {"type": "string", "minLength": 1},
+            "action": {
+                "anyOf": [
+                    _tool_action_schema("recommend", _recommend_args_schema()),
+                    _tool_action_schema(
+                        "plan_itinerary", _plan_itinerary_args_schema(constraint_ids)
+                    ),
+                    _tool_action_schema(
+                        "edit_itinerary", _edit_itinerary_args_schema(constraint_ids)
+                    ),
+                    _tool_action_schema("search_knowledge", _search_knowledge_args_schema()),
+                    _tool_action_schema("done", _empty_args_schema()),
+                ]
             },
         },
-        "required": [
-            "references",
-            "constraints",
-            "constraints_remove",
-            "selection_hints",
-            "unmodeled",
-            "intent",
-            "plan",
-        ],
+        "required": ["thought", "action"],
+        "additionalProperties": False,
+    }
+
+
+def main_agent_done_only_schema() -> dict[str, Any]:
+    """R1/R2 到達時に切り替える縮小スキーマ(`done` のみ)。"""
+
+    return {
+        "type": "object",
+        "properties": {
+            "thought": {"type": "string", "minLength": 1},
+            "action": _tool_action_schema("done", _empty_args_schema()),
+        },
+        "required": ["thought", "action"],
+        "additionalProperties": False,
+    }
+
+
+def _tool_action_schema(tool: str, args_schema: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "tool": {"type": "string", "enum": [tool]},
+            "args": args_schema,
+        },
+        "required": ["tool", "args"],
+        "additionalProperties": False,
+    }
+
+
+def _empty_args_schema() -> dict[str, Any]:
+    return {"type": "object", "properties": {}, "additionalProperties": False}
+
+
+def _nullable_string(*, min_length: int = 0) -> dict[str, Any]:
+    string_schema: dict[str, Any] = {"type": "string"}
+    if min_length:
+        string_schema["minLength"] = min_length
+    return {"anyOf": [{"type": "null"}, string_schema]}
+
+
+def _recommend_args_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {"instruction": {"type": "string", "minLength": 1}},
+        "required": ["instruction"],
+        "additionalProperties": False,
+    }
+
+
+def _search_knowledge_args_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "request": {"type": "string", "minLength": 1},
+            "spot_name": _nullable_string(min_length=1),
+        },
+        "required": ["request", "spot_name"],
+        "additionalProperties": False,
+    }
+
+
+def _constraint_add_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "pred": {"type": "string", "enum": pred_values()},
+            "args": {"type": "object", "additionalProperties": True},
+            "weight": {"type": "number", "minimum": 0.0},
+            "source_text": {"type": "string"},
+        },
+        "required": ["pred", "args", "weight", "source_text"],
+        "additionalProperties": False,
+    }
+
+
+def _constraint_ops_schema(constraint_ids: list[str] | None) -> dict[str, Any]:
+    normalized_ids = list(dict.fromkeys(constraint_ids or []))
+    remove_item_schema: dict[str, Any]
+    if normalized_ids:
+        remove_item_schema = {"type": "string", "enum": normalized_ids}
+    else:
+        remove_item_schema = {"type": "string"}
+    return {
+        "type": "object",
+        "properties": {
+            "add": {
+                "type": "array",
+                "items": _constraint_add_schema(),
+                "maxItems": MAIN_AGENT_MAX_CONSTRAINTS_ADD,
+            },
+            "remove": {
+                "type": "array",
+                "items": remove_item_schema,
+                "maxItems": MAIN_AGENT_MAX_CONSTRAINTS_REMOVE if normalized_ids else 0,
+            },
+        },
+        "required": ["add", "remove"],
+        "additionalProperties": False,
+    }
+
+
+def _nullable_constraints_schema(constraint_ids: list[str] | None) -> dict[str, Any]:
+    return {"anyOf": [{"type": "null"}, _constraint_ops_schema(constraint_ids)]}
+
+
+def _plan_day_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "date": {"type": "string", "minLength": 1},
+            "start": {"type": "string", "minLength": 1},
+            "end": {"type": "string", "minLength": 1},
+            "origin_name": _nullable_string(min_length=1),
+            "destination_name": _nullable_string(min_length=1),
+        },
+        "required": ["date", "start", "end", "origin_name", "destination_name"],
+        "additionalProperties": False,
+    }
+
+
+def _plan_itinerary_args_schema(constraint_ids: list[str] | None) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "days": {
+                "type": "array",
+                "items": _plan_day_schema(),
+                "minItems": 1,
+                "maxItems": MAIN_AGENT_MAX_DAYS,
+            },
+            "must_visit": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "maxItems": MAIN_AGENT_MAX_MUST_VISIT,
+            },
+            "constraints": _nullable_constraints_schema(constraint_ids),
+            "notes": _nullable_string(),
+        },
+        "required": ["days", "must_visit", "constraints", "notes"],
+        "additionalProperties": False,
+    }
+
+
+def _op_schema(op: str, properties: dict[str, Any]) -> dict[str, Any]:
+    schema_properties = {"op": {"type": "string", "enum": [op]}, **properties}
+    return {
+        "type": "object",
+        "properties": schema_properties,
+        "required": list(schema_properties),
+        "additionalProperties": False,
+    }
+
+
+def _name_array_schema() -> dict[str, Any]:
+    return {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}
+
+
+def _nullable_day_number() -> dict[str, Any]:
+    return {"anyOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]}
+
+
+def _edit_ops_schema() -> dict[str, Any]:
+    add_op = _op_schema(
+        "add",
+        {
+            "targets": _name_array_schema(),
+            "day": _nullable_day_number(),
+            "after": _nullable_string(min_length=1),
+        },
+    )
+    remove_op = _op_schema("remove", {"targets": _name_array_schema()})
+    move_op = _op_schema(
+        "move",
+        {
+            "target": {"type": "string", "minLength": 1},
+            "day": _nullable_day_number(),
+            "position": _nullable_day_number(),
+        },
+    )
+    replace_op = _op_schema(
+        "replace",
+        {
+            "target": {"type": "string", "minLength": 1},
+            "with": {"type": "string", "minLength": 1},
+        },
+    )
+    lock_op = _op_schema(
+        "lock",
+        {"targets": _name_array_schema(), "locked": {"type": "boolean"}},
+    )
+    set_stay_op = _op_schema(
+        "set_stay",
+        {"target": {"type": "string", "minLength": 1}, "min": {"type": "integer", "minimum": 1}},
+    )
+    set_time_op = _op_schema(
+        "set_time",
+        {
+            "target": {"type": "string", "minLength": 1},
+            "arrive": _nullable_string(min_length=1),
+            "depart": _nullable_string(min_length=1),
+        },
+    )
+    revert_op = _op_schema("revert", {"to_version": _nullable_day_number()})
+    return {
+        "anyOf": [
+            add_op,
+            remove_op,
+            move_op,
+            replace_op,
+            lock_op,
+            set_stay_op,
+            set_time_op,
+            revert_op,
+        ]
+    }
+
+
+def _edit_itinerary_args_schema(constraint_ids: list[str] | None) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "ops": {
+                "type": "array",
+                "items": _edit_ops_schema(),
+                "minItems": 1,
+                "maxItems": MAIN_AGENT_MAX_OPS,
+            },
+            "constraints": _nullable_constraints_schema(constraint_ids),
+            "notes": _nullable_string(),
+        },
+        "required": ["ops", "constraints", "notes"],
         "additionalProperties": False,
     }
 
@@ -494,75 +611,18 @@ def _score_adjustments_schema(
     }
 
 
-def update_profile_guided_schema(spot_ids: list[str]) -> dict[str, Any]:
-    """N1.5 `update_profile` の guided JSON schema。`uniqueItems` は使わない。"""
-
-    spot_value_schema: dict[str, Any]
-    if spot_ids:
-        spot_value_schema = {"type": "string", "enum": list(dict.fromkeys(spot_ids))}
-    else:
-        spot_value_schema = {"type": "string"}
-    return {
-        "type": "object",
-        "properties": {
-            "profile_delta": _profile_delta_schema(),
-            "score_adjustments": _score_adjustments_schema(
-                spot_value_schema, enabled=bool(spot_ids)
-            ),
-        },
-        "required": ["profile_delta", "score_adjustments"],
-        "additionalProperties": False,
-    }
-
-
-def _ordered_dynamic_context(
-    state: TurnState,
-    *,
-    include_turn_results: bool,
-    include_tag_vocabulary: bool,
-    mode: ResponseMode | None = None,
-    now: datetime | None = None,
-) -> str:
-    active_constraints = (
-        state.itinerary.constraints if state.itinerary is not None else state.pending_constraints
-    )
-    profile_and_trip: dict[str, Any] = {
-        "profile": state.profile.model_dump(mode="json"),
-        "current_itinerary": _itinerary_summary(state),
-        "active_constraints": active_constraints,
-        "last_candidates": [
-            value.model_dump(mode="json") for value in state.last_candidates
-        ],
-        "resolved_ambiguities": state.resolved_ambiguities,
-        "asked_slots": state.asked_slots,
-        "ask_streak": state.ask_streak,
-        "tool_results": state.tool_results,
-        "realtime": {
-            spot_id: state.realtime.get(spot_id, {}) for spot_id in state.spot_id_vocab
-        },
-    }
-    if include_turn_results:
-        profile_and_trip["mode"] = mode.value if mode is not None else None
-        profile_and_trip["turn_result"] = _turn_result(state)
-    vocab = [
-        {"spot_id": spot_id, "name_ja": state.spot_names.get(spot_id, spot_id)}
-        for spot_id in state.spot_id_vocab
-    ]
-    vocabulary_context = "④ 参照可能な spot_id 語彙:\n" + _compact_json(vocab)
-    if include_tag_vocabulary:
-        vocabulary_context += "\n" + _tag_vocabulary_context(state.tag_vocabulary)
-    # ⑥の発話より後ろには一切追加しない。
-    return "\n".join(
-        [
-            "③ 今日の日付（JST）・プロファイル・現在の旅程・有効な制約:\n"
-            + _date_context(now)
-            + "\n"
-            + _compact_json(profile_and_trip),
-            vocabulary_context,
-            "⑤ 会話履歴（understand/respond 共通）:\n" + (state.history or "(なし)"),
-            "⑥ ユーザーの発話:\n" + state.utterance,
-        ]
-    )
+def _trajectory_text(trajectory: Sequence[TrajectoryStep]) -> str:
+    if not trajectory:
+        return "(まだありません)"
+    lines: list[str] = []
+    for index, step in enumerate(trajectory, 1):
+        lines.append(f"[手{index}] tool={step.tool}")
+        lines.append(f"  thought: {step.thought}")
+        lines.append(f"  args: {_compact_json(step.args)}")
+        lines.append(f"  observation: {step.observation}")
+        if step.error is not None:
+            lines.append(f"  error: {_compact_json(step.error)}")
+    return "\n".join(lines)
 
 
 def _date_context(now: datetime | None) -> str:
@@ -580,87 +640,5 @@ def _date_context(now: datetime | None) -> str:
     )
 
 
-def _itinerary_summary(state: TurnState) -> dict[str, Any] | None:
-    if state.itinerary is None:
-        return None
-    itinerary = state.itinerary.itinerary
-    return {
-        "version": itinerary.version,
-        "days": [
-            {
-                "date": day.date,
-                "origin": day.origin.spot_id,
-                "destination": day.destination.spot_id,
-                "spot_ids_in_order": [item.spot_id for item in day.items],
-            }
-            for day in itinerary.days
-        ],
-    }
-
-
-def _turn_result(state: TurnState) -> dict[str, Any]:
-    return {
-        "intent": state.intent.value if state.intent is not None else None,
-        "profile_delta": (
-            state.profile_delta.model_dump(mode="json")
-            if state.profile_delta is not None
-            else None
-        ),
-        "constraints": [value.model_dump(mode="json") for value in state.constraints],
-        "constraints_remove": state.constraints_remove,
-        "score_adjustments": [
-            value.model_dump(mode="json") for value in state.score_adjustments
-        ],
-        "selection_hints": [
-            value.model_dump(mode="json") for value in state.selection_hints
-        ],
-        "unmodeled": [value.model_dump(mode="json") for value in state.unmodeled],
-        "accepted_steps": [value.model_dump(mode="json") for value in state.accepted_steps],
-        "rejected_steps": [value.model_dump(mode="json") for value in state.rejected_steps],
-        "skipped_steps": [value.model_dump(mode="json") for value in state.skipped_steps],
-        "aborted_at": state.aborted_at,
-        "degraded": [value.model_dump(mode="json") for value in state.degraded],
-        "assumptions": state.assumptions,
-        "ask_user": state.pending_ask,
-        "step_results": {
-            str(step_id): result.model_dump(mode="json")
-            for step_id, result in state.step_results.items()
-        },
-        "spot_names_from_db": {
-            spot_id: state.spot_names[spot_id]
-            for spot_id in _allowed_response_spot_ids(state)
-            if spot_id in state.spot_names
-        },
-    }
-
-
-def _allowed_response_spot_ids(state: TurnState) -> list[str]:
-    values: list[str] = []
-    for result in state.step_results.values():
-        raw_ids = result.data.get("spot_ids")
-        if isinstance(raw_ids, list):
-            values.extend(value for value in raw_ids if isinstance(value, str))
-        spot_id = result.data.get("spot_id")
-        if isinstance(spot_id, str):
-            values.append(spot_id)
-    if state.itinerary is not None:
-        values.extend(
-            item.spot_id
-            for day in state.itinerary.itinerary.days
-            for item in day.items
-        )
-    values.extend(reference.spot_id for reference in state.references)
-    return list(dict.fromkeys(values))
-
-
 def _compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
-
-
-def _tag_vocabulary_context(values: list[str]) -> str:
-    vocabulary = list(dict.fromkeys(value for value in values if value))
-    rendered = " | ".join(vocabulary) if vocabulary else "(なし)"
-    return (
-        f"生タグ語彙（{len(vocabulary)}語・ここにある語だけ使用可）:\n"
-        f"{rendered}"
-    )

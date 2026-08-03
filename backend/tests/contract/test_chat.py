@@ -43,8 +43,10 @@ class ScriptedRunner:
             ConversationEvent(
                 event="state",
                 data={
-                    "kind": "plan",
-                    "steps": [{"id": 1, "tool": "recommend"}],
+                    "kind": "step",
+                    "tool": "recommend",
+                    "status": "started",
+                    "label_ja": "おすすめを探しています",
                 },
             ),
             ConversationEvent(
@@ -79,8 +81,10 @@ class FailingRunner:
             ConversationEvent(
                 event="state",
                 data={
-                    "kind": "plan",
-                    "steps": [{"id": 1, "tool": "recommend"}],
+                    "kind": "step",
+                    "tool": "recommend",
+                    "status": "started",
+                    "label_ja": "おすすめを探しています",
                 },
             )
         )

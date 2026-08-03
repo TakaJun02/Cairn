@@ -14,16 +14,30 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Sequence
+from typing import Any, Protocol
 
 from app.core.llm import GenerationClient
 from app.domains.conversation.events import EventSinkLike, emit, state_event
+from app.domains.conversation.guards import has_repeated_ngram
 from app.domains.conversation.prompts import (
     build_update_profile_messages,
     update_profile_guided_schema,
 )
 from app.domains.conversation.state import DegradedState, ProfileState, TurnState
 from app.domains.conversation.types import ProfileDelta, ScoreAdjustment, UpdateProfileOutput
-from app.domains.conversation.understand import GenerationPort, has_repeated_ngram
+
+
+class GenerationPort(Protocol):
+    async def generate(
+        self,
+        messages: Sequence[dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 1024,
+        extra_body: dict[str, Any] | None = None,
+    ) -> str: ...
+
 
 logger = logging.getLogger("app.conversation.update_profile")
 

@@ -1,8 +1,18 @@
 """対話パイプライン内部の閉じた契約。
 
-API の入出力ではなく、`agent_planning_phase.md` §15.7・§18 をノード間で
-共有する型である。
-Tool 固有ドメインにはこのモジュールを import させない。
+API の入出力ではなく、`Docs/30_design/agent_react_architecture.md` をノード間で
+共有する型である。Tool 固有ドメインにはこのモジュールを import させない。
+
+段2(ReAct メインループ)により、以下の区分になっている:
+
+- Tool アダプタ(`tool_adapters.py`)向けの内部契約(`spot_id` ベース。旧設計から
+  ほぼ変更なし): `RecommendArgs` / `PlanItineraryArgs` / `EditItineraryArgs` /
+  `SearchKnowledgeArgs`
+- メインエージェント(`main_agent.py`)が guided JSON として書く契約
+  (スポット名ベース。§3.3 の最終契約): `MainAgentTurn` / `MainRecommendArgs` /
+  `MainPlanItineraryArgs` / `MainEditItineraryArgs` / `MainSearchKnowledgeArgs`
+- `ask_user`(`AskUserArgs` 等)は段5で使うため型だけ残す。段2のメインループの
+  Tool enum には含めない
 """
 
 from __future__ import annotations
@@ -24,6 +34,13 @@ class ConversationModel(BaseModel):
 
 
 class ToolName(StrEnum):
+    """Tool アダプタ(`tool_ports.ConversationToolPort`)の実行結果に載る Tool 名。
+
+    `ask_user` は段5で HITL 待ち受けを実装するまでメインループからは
+    呼ばれないが、型・アダプタは残す(CLAUDE.md 役割分担外のスコープ判断は
+    Docs/30_design/agent_react_architecture.md §16 の段取りに従う)。
+    """
+
     RECOMMEND = "recommend"
     PLAN_ITINERARY = "plan_itinerary"
     EDIT_ITINERARY = "edit_itinerary"
@@ -31,23 +48,33 @@ class ToolName(StrEnum):
     ASK_USER = "ask_user"
 
 
-class Intent(StrEnum):
+class MainToolName(StrEnum):
+    """メインエージェントの `action.tool` enum(段2のスコープ)。
+
+    `ask_user` は段5で追加する(Docs/30_design/agent_react_architecture.md §3.3)。
+    """
+
     RECOMMEND = "recommend"
-    PLAN = "plan"
-    EDIT = "edit"
-    QA = "qa"
-    PROFILE_ONLY = "profile_only"
-    CHITCHAT = "chitchat"
-    UNCLEAR = "unclear"
+    PLAN_ITINERARY = "plan_itinerary"
+    EDIT_ITINERARY = "edit_itinerary"
+    SEARCH_KNOWLEDGE = "search_knowledge"
+    DONE = "done"
 
 
 class ResponseMode(StrEnum):
+    """`respond` の 1 テンプレート内の分岐。
+
+    旧 `QUESTION`(ask_user 用)は、ReAct 化でメインループが `ask_user` を
+    持たなくなったため不要になった(段5で復活しうる)。
+    """
+
     EXPLANATION = "explanation"
-    QUESTION = "question"
     FAILURE = "failure"
 
 
 class Slot(StrEnum):
+    """段5で `ask_user` が使うスロット語彙。今回は未使用。"""
+
     ONBOARDING = "onboarding"
     PARTY = "party"
     MOBILITY = "mobility"
@@ -63,11 +90,6 @@ class ToolErrorCode(StrEnum):
     EMPTY_RESULT = "empty_result"
     UPSTREAM_TIMEOUT = "upstream_timeout"
     INTERNAL = "internal"
-
-
-class ReferenceResolution(ConversationModel):
-    surface: str = Field(min_length=1)
-    spot_id: str = Field(min_length=1)
 
 
 class ProfileDelta(ConversationModel):
@@ -103,11 +125,10 @@ class ProfileDelta(ConversationModel):
 
 
 class ConstraintDraft(ConversationModel):
-    """LLM 抽出直後の制約。
+    """メインエージェント(または旧 understand)由来の制約。
 
     `pred` は Pydantic enum にせず文字列で受ける。guided decoding 後にも
-    未知値をコードで `unmodeled` へ移す不変条件を
-    テスト可能にするためである。
+    未知値をコードで `unmodeled` へ移す不変条件をテスト可能にするためである。
     """
 
     id: str | None = None
@@ -127,6 +148,13 @@ class ConstraintDraft(ConversationModel):
         return value
 
 
+class UnmodeledItem(ConversationModel):
+    """分類・検証できなかった要素の報告(C4: 部分不正は要素単位で落とす)。"""
+
+    text: str = Field(min_length=1)
+    reason: str | None = None
+
+
 class ScoreAdjustment(ConversationModel):
     spot_id: str = Field(min_length=1)
     delta: float
@@ -141,55 +169,16 @@ class ScoreAdjustment(ConversationModel):
         return value
 
 
-class SelectionHint(ConversationModel):
-    text: str = Field(min_length=1)
-    handling: Literal["selection"] = "selection"
-
-
-class UnmodeledItem(ConversationModel):
-    text: str = Field(min_length=1)
-    handling: Literal["unmodeled"] = "unmodeled"
-    reason: str | None = None
-
-
-class PlanStep(ConversationModel):
-    """検証前の plan 手。
-
-    Tool 名を `str` のまま保持するのは、guided enum とは別に P2 をコードで
-    強制し、違反理由を `rejected_steps` に残すためである。
-    """
-
-    id: int
-    tool: str
-    args: dict[str, Any] = Field(default_factory=dict)
-
-
-class UnderstandOutput(ConversationModel):
-    """N2 の guided JSON。宣言順は生成時の推論順そのものである。
-
-    `profile_delta` / `score_adjustments` はここでは扱わない。前段の
-    `update_profile`（N1.5）が単独の LLM 呼び出しで抽出し、`TurnState` へ
-    直接書き込む（`Docs/30_design/agent_react_architecture.md` §2）。
-    """
-
-    references: list[ReferenceResolution] = Field(default_factory=list)
-    constraints: list[ConstraintDraft] = Field(default_factory=list)
-    constraints_remove: list[str] = Field(default_factory=list)
-    selection_hints: list[SelectionHint] = Field(default_factory=list)
-    unmodeled: list[UnmodeledItem] = Field(default_factory=list)
-    intent: Intent
-    plan: list[PlanStep] = Field(default_factory=list)
-
-
 class UpdateProfileOutput(ConversationModel):
-    """N1.5 `update_profile` の guided JSON。
-
-    `profile_delta` は恒久的なプロフィールへの差分（空なら null）、
-    `score_adjustments` はそのターン限りの点数調整である。
-    """
+    """N1.5 `update_profile` の guided JSON(段1から変更なし)。"""
 
     profile_delta: ProfileDelta | None = None
     score_adjustments: list[ScoreAdjustment] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Tool アダプタ向け内部契約(spot_id ベース。既存 Tool 実装が期待する形のまま)
+# ---------------------------------------------------------------------------
 
 
 class RecommendArgs(ConversationModel):
@@ -199,8 +188,6 @@ class RecommendArgs(ConversationModel):
 
 
 class PlanItineraryArgs(ConversationModel):
-    # 不足値は §20.2 に従い planner が既定値で補う。
-    # そのため、ここでは空も受ける。
     days: list[dict[str, Any]] = Field(default_factory=list)
     must_visit: list[str] = Field(default_factory=list)
 
@@ -220,11 +207,12 @@ class AskUserOption(ConversationModel):
 
 
 class AskUserArgs(ConversationModel):
+    """段5で使う。今回のメインループの Tool enum には含めない。"""
+
     kind: Literal["preference", "clarify"]
     slot: Slot | None = None
     surface: str | None = None
     reason: str = Field(min_length=1)
-    # 2〜4 件かどうかは Pydantic ではなく G5 として理由つきで判定する。
     options: list[AskUserOption] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -244,7 +232,7 @@ class AskUserArgs(ConversationModel):
 
 class AskUserResult(ConversationModel):
     answer: str = Field(min_length=1)
-    answered_by: Literal["chip", "free_text"]
+    answered_by: Literal["chip", "free_text", "timeout"]
     slot: Slot | None = None
     surface: str | None = None
 
@@ -261,6 +249,94 @@ class ToolResult(ConversationModel):
     tool: ToolName
     data: dict[str, Any] = Field(default_factory=dict)
     degraded: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# メインエージェントの guided JSON(§3.2〜§3.3 の最終契約。スポット名ベース)
+# ---------------------------------------------------------------------------
+
+
+class MainRecommendArgs(ConversationModel):
+    instruction: str = Field(min_length=1)
+
+
+class MainConstraintAdd(ConversationModel):
+    """メインエージェントが直接書く制約(述語 DSL 17 種)。"""
+
+    pred: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    weight: float = 1.0
+    source_text: str = ""
+
+    @field_validator("weight")
+    @classmethod
+    def validate_weight(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("constraint.weight は有限の 0 以上にしてください")
+        return value
+
+
+class MainConstraintOps(ConversationModel):
+    add: list[MainConstraintAdd] = Field(default_factory=list)
+    remove: list[str] = Field(default_factory=list)
+
+
+class MainPlanDay(ConversationModel):
+    date: str = Field(min_length=1)
+    start: str = Field(min_length=1)
+    end: str = Field(min_length=1)
+    origin_name: str | None = None
+    destination_name: str | None = None
+
+
+class MainPlanItineraryArgs(ConversationModel):
+    days: list[MainPlanDay] = Field(default_factory=list)
+    must_visit: list[str] = Field(default_factory=list)
+    constraints: MainConstraintOps | None = None
+    notes: str | None = None
+
+
+class MainEditItineraryArgs(ConversationModel):
+    """`ops` は既存の add/remove/move/replace/lock/set_stay/set_time/revert の
+
+    形のまま、`targets`/`target`/`with` だけスポット名にした dict。
+    実際の検証(discriminated union)は名前解決後、`EditItineraryArgs.ops` を
+    通じて既存の `parse_ops` が行う。
+    """
+
+    ops: list[dict[str, Any]] = Field(default_factory=list)
+    constraints: MainConstraintOps | None = None
+    notes: str | None = None
+
+
+class MainSearchKnowledgeArgs(ConversationModel):
+    request: str = Field(min_length=1)
+    spot_name: str | None = None
+
+
+class MainAgentAction(ConversationModel):
+    tool: str
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+class MainAgentTurn(ConversationModel):
+    """メインループ 1 周の guided JSON(§3.2)。"""
+
+    thought: str
+    action: MainAgentAction
+
+
+class TrajectoryStep(ConversationModel):
+    """このターンの軌跡(§3.1 ⑤)。実行した手と結果を1件ずつ積む。
+
+    `observation` は名前空間ダイジェスト(spot_id を含まない自然文)。
+    """
+
+    tool: str
+    thought: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    observation: str
+    error: dict[str, Any] | None = None
 
 
 def constraint_to_mapping(value: ConstraintDraft) -> dict[str, Any]:

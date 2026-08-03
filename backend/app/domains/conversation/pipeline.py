@@ -1,4 +1,11 @@
-"""6 ノードを固定順で流す旅程計画エージェントの司会。"""
+"""load_context → update_profile → main_agent(ReAct) → respond → persist を
+
+固定順で流す旅程計画エージェントの司会(段2: ReAct 構成)。
+
+`Docs/30_design/agent_react_architecture.md` §1 が仕様。旧 6 ノード構成
+(understand / validate_plan / act)は廃止し、③ ReAct メインループ
+(`main_agent.run_main_agent`)に置き換えた。
+"""
 
 from __future__ import annotations
 
@@ -18,17 +25,11 @@ from app.domains.conversation.events import (
     emit,
     error_event,
 )
-from app.domains.conversation.executor import act
+from app.domains.conversation.main_agent import run_main_agent
 from app.domains.conversation.persist import PersistRepositoryPort, persist
-from app.domains.conversation.planner import validate_plan
 from app.domains.conversation.respond import RespondGenerationError, respond
 from app.domains.conversation.state import TurnState
 from app.domains.conversation.tool_ports import ConversationToolPort
-from app.domains.conversation.understand import (
-    GenerationPort,
-    UnderstandFatalError,
-    understand,
-)
 from app.domains.conversation.update_profile import update_profile
 
 logger = logging.getLogger("app.conversation.turn")
@@ -46,8 +47,8 @@ class ConversationPipeline:
     ) -> None:
         self.repository = repository
         self.event_sink = event_sink
-        # N2/N5 と P7 の専門呼び出しを同じ差し替え可能な
-        # client へ接続する。
+        # update_profile / main_agent / respond の全 LLM 呼び出しを同じ
+        # 差し替え可能な client へ接続する。
         self.llm_client = llm_client or GenerationClient(settings)
         self.tools = tools
         self.settings = settings
@@ -60,7 +61,7 @@ class ConversationPipeline:
         resolves: Mapping[str, Any] | None = None,
         turn_id: str | None = None,
     ) -> TurnState:
-        # N1
+        # ① load_context
         state = await load_context(
             self.repository,  # type: ignore[arg-type]
             user_id=user_id,
@@ -69,60 +70,40 @@ class ConversationPipeline:
             turn_id=turn_id,
         )
         try:
-            # N1.5 update_profile（load_context の後・understand の前。§2）
+            # ② update_profile(load_context の後・メインループの前。§2)
             await update_profile(
                 state,
                 client=self.llm_client,  # type: ignore[arg-type]
                 event_sink=self.event_sink,
             )
         except asyncio.CancelledError:
-            state.understand_failed = True
             await self._persist_or_finish(state)
             self._log_turn(state)
             raise
+
+        # ③ メインエージェント(ReAct ループ)
+        tools = self.tools or self._default_tools(state)
         try:
-            # N2
-            await understand(
+            await run_main_agent(
                 state,
+                tools=tools,
                 client=self.llm_client,  # type: ignore[arg-type]
                 event_sink=self.event_sink,
             )
         except asyncio.CancelledError:
-            state.understand_failed = True
+            # respond に一度も到達していないので、assistant 行は書かない
+            # (§13: persist には必ず到達する。ここまでの状態は保存する)。
             await self._persist_or_finish(state)
             self._log_turn(state)
             raise
-        except UnderstandFatalError:
-            await emit(
-                self.event_sink,
-                error_event(
-                    stage="understand",
-                    code="understand_failed",
-                    degraded=False,
-                    message=(
-                        "うまく理解できませんでした。"
-                        "もう一度入力してください。"
-                    ),
-                ),
-            )
-            await self._persist_or_finish(state)
-            self._log_turn(state)
-            return state
 
-        # N3
-        await validate_plan(state, event_sink=self.event_sink)
-
-        # N4（E3 のときは Tool なし）
-        if state.accepted_steps:
-            tools = self.tools or self._default_tools(state)
-            await act(state, tools=tools, event_sink=self.event_sink)
-
-        # N5 + N6 (finally 相当)
+        # ④ respond + ⑤ persist
         await self._respond_then_persist(state)
         self._log_turn(state)
         return state
 
     async def _respond_then_persist(self, state: TurnState) -> None:
+        state.responded = True
         try:
             try:
                 await respond(
@@ -150,7 +131,7 @@ class ConversationPipeline:
                 raise
         finally:
             # ストリーム中断や error イベント送出失敗も含め、
-            # N6 は respond の出口に必ず置く。
+            # ⑤ persist は respond の出口に必ず置く。
             await self._persist_or_finish(state)
 
     async def _persist_or_finish(self, state: TurnState) -> None:
@@ -206,15 +187,8 @@ class ConversationPipeline:
             extra={
                 **state.log_fields,
                 "turn_id": state.turn_id,
-                "intent": state.intent.value if state.intent is not None else None,
-                "asked": state.log_fields.get("asked"),
-                "resumed_from_ask": state.log_fields.get("resumed_from_ask", False),
-                "executed_tools": [
-                    value.tool.value for value in state.step_results.values()
-                ],
-                "rejected_steps": [
-                    value.model_dump(mode="json") for value in state.rejected_steps
-                ],
+                "executed_tools": [step.tool for step in state.trajectory],
+                "main_agent_failed": state.main_agent_failed,
                 "degraded": [value.model_dump(mode="json") for value in state.degraded],
             },
         )
@@ -226,7 +200,7 @@ async def run_turn(
     user_id: int,
     utterance: str,
     event_sink: EventSinkLike = None,
-    llm_client: GenerationPort | Any | None = None,
+    llm_client: Any | None = None,
     resolves: Mapping[str, Any] | None = None,
     settings: Settings | None = None,
 ) -> TurnState:

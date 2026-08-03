@@ -30,12 +30,6 @@ def adapt_conversation_event(
             payload = _candidate_payload(payload, spot_names or {})
         elif kind == "itinerary" and "phase" not in payload and "stage" in payload:
             payload["phase"] = payload.pop("stage")
-        elif kind == "plan":
-            payload["steps"] = [
-                {"id": step.get("id"), "tool": step.get("tool")}
-                for raw in payload.get("steps", [])
-                if isinstance((step := _mapping(raw)), dict)
-            ]
         elif kind == "clarify":
             payload["options"] = [
                 _clarification_option(raw)
@@ -96,12 +90,11 @@ class ChatEventBuffer:
     async def emit(self, event: ConversationEvent) -> None:
         adapted = adapt_conversation_event(event)
         if adapted.root.event == "state" and adapted.root.data.kind in {
-            "plan",
+            "step",
             "candidates",
             "itinerary",
             "ask_user",
             "clarify",
-            "searching",
         }:
             self.tool_phase_started.set()
         if adapted.root.event == "done":
