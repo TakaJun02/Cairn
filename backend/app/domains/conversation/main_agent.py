@@ -15,6 +15,11 @@ Tool を実行して軌跡(§3.1 ⑤)へ積み、次の周へ進む。`done` で
 (`recommend_agent.run_recommend_subagent`)を経由するようになった。
 `instruction`(自然言語)→ `filter` の翻訳はそちらが guided decoding で行い、
 このモジュールは翻訳結果をそのまま既存 Tool へ渡すだけである(§4)。
+
+段4で `plan_itinerary`/`edit_itinerary` は旅程計画サブエージェント
+(`itinerary_subagent.run_plan_itinerary`/`run_edit_itinerary`)を経由する
+ようになった。名寄せ本実装・フロー1〜4はそちらに集約されている(§5)。
+このモジュールは Tool 選択・ループ制御(§3・§10)だけを持つ。
 """
 
 from __future__ import annotations
@@ -24,49 +29,34 @@ import json
 import logging
 import time
 from collections.abc import Sequence
-from datetime import date
 from typing import Any, Protocol
 
 from pydantic import ValidationError
 
 from app.core.llm import GenerationError
 from app.domains.conversation.events import EventSinkLike, emit, error_event, state_event
-from app.domains.conversation.guards import (
-    has_repeated_ngram,
-    normalize_revert_ops,
-    validate_and_normalize_constraints,
-)
+from app.domains.conversation.guards import has_repeated_ngram
 from app.domains.conversation.history import estimate_tokens
-from app.domains.conversation.itinerary_digest import format_itinerary_digest
-from app.domains.conversation.name_resolution import (
-    build_name_resolution_context,
-    resolve_constraint_target,
-    resolve_spot_names,
+from app.domains.conversation.itinerary_subagent import (
+    active_constraint_ids,
+    run_edit_itinerary,
+    run_plan_itinerary,
 )
+from app.domains.conversation.name_resolution import build_name_resolution_context
 from app.domains.conversation.prompts import (
     build_main_agent_messages,
     main_agent_done_only_schema,
     main_agent_guided_schema,
 )
 from app.domains.conversation.recommend_agent import run_recommend_subagent
-from app.domains.conversation.state import (
-    CandidateReference,
-    DegradedState,
-    ItineraryState,
-    TurnState,
-)
+from app.domains.conversation.recommendation_context import build_recommendation_context
+from app.domains.conversation.state import CandidateReference, DegradedState, TurnState
 from app.domains.conversation.tool_ports import ConversationToolPort
 from app.domains.conversation.types import (
-    ConstraintDraft,
-    EditItineraryArgs,
     MainAgentTurn,
-    MainConstraintOps,
-    MainEditItineraryArgs,
-    MainPlanItineraryArgs,
     MainRecommendArgs,
     MainSearchKnowledgeArgs,
     MainToolName,
-    PlanItineraryArgs,
     RecommendArgs,
     SearchKnowledgeArgs,
     ToolError,
@@ -74,8 +64,6 @@ from app.domains.conversation.types import (
     ToolResult,
     TrajectoryStep,
 )
-from app.domains.itinerary.types import Diff, Itinerary
-from app.domains.recommendation.types import RecommendationContext, RecommendationProfile
 
 logger = logging.getLogger("app.conversation.main_agent")
 
@@ -147,7 +135,7 @@ async def run_main_agent(
         iteration += 1
         reduced = executed_count >= MAX_EXECUTED_STEPS or iteration > MAX_LOOP_ITERATIONS
 
-        constraint_ids = _active_constraint_ids(state)
+        constraint_ids = active_constraint_ids(state)
         messages = build_main_agent_messages(state, reduced=reduced)
         estimated_tokens = sum(estimate_tokens(value["content"]) for value in messages)
 
@@ -368,9 +356,9 @@ async def _dispatch(
                 state, tools, raw_args, step_id, client=client, event_sink=event_sink
             )
         if tool == MainToolName.PLAN_ITINERARY.value:
-            return await _dispatch_plan_itinerary(state, tools, raw_args, step_id)
+            return await run_plan_itinerary(state, tools, raw_args, step_id)
         if tool == MainToolName.EDIT_ITINERARY.value:
-            return await _dispatch_edit_itinerary(state, tools, raw_args, step_id)
+            return await run_edit_itinerary(state, tools, raw_args, step_id)
         if tool == MainToolName.SEARCH_KNOWLEDGE.value:
             return await _dispatch_search_knowledge(state, tools, raw_args, step_id)
     except Exception as exc:  # noqa: BLE001 - Tool 実装からの漏れも結果へ閉じる(C6)
@@ -410,7 +398,7 @@ async def _dispatch_recommend(
     """
 
     parsed = MainRecommendArgs.model_validate(raw_args)
-    context = _build_recommendation_context(state)
+    context = build_recommendation_context(state)
     act_result = await run_recommend_subagent(
         instruction=parsed.instruction,
         profile=context.profile,
@@ -475,157 +463,6 @@ async def _dispatch_search_knowledge(
     return digest, None
 
 
-async def _dispatch_plan_itinerary(
-    state: TurnState,
-    tools: ConversationToolPort,
-    raw_args: dict[str, Any],
-    step_id: int,
-) -> tuple[str, dict[str, Any] | None]:
-    parsed = MainPlanItineraryArgs.model_validate(raw_args)
-    name_context = _name_context(state)
-    dropped: list[str] = []
-
-    days: list[dict[str, Any]] = []
-    for day in parsed.days:
-        origin_id = _resolve_endpoint(
-            name_context, day.origin_name, state.default_origin_spot_id, dropped
-        )
-        destination_id = _resolve_endpoint(
-            name_context, day.destination_name, origin_id, dropped
-        )
-        days.append(
-            {
-                "date": day.date,
-                "start": day.start,
-                "end": day.end,
-                "origin": _endpoint_dict(state, origin_id),
-                "destination": _endpoint_dict(state, destination_id),
-            }
-        )
-    must_visit_ids, must_visit_dropped = resolve_spot_names(name_context, parsed.must_visit)
-    dropped.extend(must_visit_dropped)
-
-    used_ids = set(_active_constraint_ids(state))
-    constraints, constraints_dropped = _prepare_constraints_add(
-        name_context,
-        parsed.constraints,
-        spots=state.spot_catalog,
-        created_at_version=1,
-        used_ids=used_ids,
-    )
-    dropped.extend(constraints_dropped)
-    if parsed.constraints is not None and parsed.constraints.remove:
-        dropped.append(
-            "旅程がまだ無いため制約の解除は無視しました: "
-            + "、".join(parsed.constraints.remove)
-        )
-
-    if not days:
-        error = ToolError(
-            code=ToolErrorCode.REFERENCE_UNRESOLVED,
-            message_ja="旅程の日程が指定されていません。",
-            recoverable=True,
-        )
-        return error.message_ja, _error_payload(error)
-
-    selection_text = parsed.notes or ""
-    context = _build_recommendation_context(state)
-    result = await tools.plan_itinerary(
-        step_id=step_id,
-        user_id=state.user_id,
-        args=PlanItineraryArgs(days=days, must_visit=must_visit_ids),
-        constraints=constraints,
-        selection_text=selection_text,
-        recommendation_context=context,
-        use_specialist=bool(selection_text.strip()),
-    )
-    if isinstance(result, ToolError):
-        return result.message_ja, _error_payload(result)
-    state.step_results[step_id] = result
-    merged_constraints = [
-        *state.pending_constraints,
-        *[value.model_dump(mode="json", exclude_none=True) for value in constraints],
-    ]
-    _apply_itinerary_result(state, result, constraints=merged_constraints)
-    digest = _format_itinerary_result_digest(state, result, dropped=dropped)
-    return digest, None
-
-
-async def _dispatch_edit_itinerary(
-    state: TurnState,
-    tools: ConversationToolPort,
-    raw_args: dict[str, Any],
-    step_id: int,
-) -> tuple[str, dict[str, Any] | None]:
-    if state.itinerary is None:
-        error = ToolError(
-            code=ToolErrorCode.PRECONDITION_UNMET,
-            message_ja="編集できる旅程がまだありません。先に plan_itinerary を使ってください。",
-            recoverable=True,
-        )
-        return error.message_ja, _error_payload(error)
-
-    parsed = MainEditItineraryArgs.model_validate(raw_args)
-    name_context = _name_context(state)
-    dropped: list[str] = []
-
-    resolved_ops, ops_dropped = _resolve_ops(name_context, parsed.ops)
-    dropped.extend(ops_dropped)
-    resolved_ops, _ = normalize_revert_ops(resolved_ops)
-    if not resolved_ops and parsed.ops:
-        error = ToolError(
-            code=ToolErrorCode.REFERENCE_UNRESOLVED,
-            message_ja="指定されたスポット名をすべて解決できませんでした。",
-            recoverable=True,
-            details={"dropped": dropped},
-        )
-        return error.message_ja, _error_payload(error)
-
-    active_ids = set(_active_constraint_ids(state))
-    remove_ids = list(parsed.constraints.remove) if parsed.constraints is not None else []
-    valid_remove = [value for value in remove_ids if value in active_ids]
-    invalid_remove = [value for value in remove_ids if value not in active_ids]
-    if invalid_remove:
-        dropped.append("現在有効な制約 id ではありません: " + "、".join(invalid_remove))
-
-    constraints, constraints_dropped = _prepare_constraints_add(
-        name_context,
-        parsed.constraints,
-        spots=state.spot_catalog,
-        created_at_version=state.itinerary.version + 1,
-        used_ids=active_ids - set(valid_remove),
-    )
-    dropped.extend(constraints_dropped)
-
-    selection_text = parsed.notes or ""
-    context = _build_recommendation_context(state)
-    result = await tools.edit_itinerary(
-        step_id=step_id,
-        user_id=state.user_id,
-        args=EditItineraryArgs(ops=resolved_ops),
-        constraints=constraints,
-        constraints_remove=valid_remove,
-        selection_text=selection_text,
-        recommendation_context=context,
-        use_specialist=bool(selection_text.strip()),
-    )
-    if isinstance(result, ToolError):
-        return result.message_ja, _error_payload(result)
-    state.step_results[step_id] = result
-    kept = [
-        value
-        for value in state.itinerary.constraints
-        if str(value.get("id")) not in set(valid_remove)
-    ]
-    merged_constraints = [
-        *kept,
-        *[value.model_dump(mode="json", exclude_none=True) for value in constraints],
-    ]
-    _apply_itinerary_result(state, result, constraints=merged_constraints)
-    digest = _format_itinerary_result_digest(state, result, dropped=dropped)
-    return digest, None
-
-
 # ---------------------------------------------------------------------------
 # 名前解決の補助
 # ---------------------------------------------------------------------------
@@ -639,134 +476,8 @@ def _name_context(state: TurnState):
     )
 
 
-def _resolve_endpoint(
-    name_context: Any,
-    name: str | None,
-    fallback_spot_id: str | None,
-    dropped: list[str],
-) -> str | None:
-    if name is None:
-        return fallback_spot_id
-    resolved = name_context.resolve(name)
-    if resolved is None:
-        dropped.append(name)
-        return fallback_spot_id
-    return resolved
-
-
-def _endpoint_dict(state: TurnState, spot_id: str | None) -> dict[str, Any]:
-    if spot_id is None:
-        return {"kind": "spot", "id": ""}
-    spot = state.spot_catalog.get(spot_id)
-    kind = "facility" if spot is not None and spot.kind == "facility" else "spot"
-    return {"kind": kind, "id": spot_id}
-
-
-def _resolve_ops(
-    name_context: Any, ops: Sequence[dict[str, Any]]
-) -> tuple[list[dict[str, Any]], list[str]]:
-    dropped: list[str] = []
-    resolved: list[dict[str, Any]] = []
-    for raw in ops:
-        operation = dict(raw)
-        op = operation.get("op")
-        if op in {"add", "remove", "lock"}:
-            names = operation.get("targets") or []
-            ids, op_dropped = resolve_spot_names(
-                name_context, names if isinstance(names, list) else [names]
-            )
-            dropped.extend(op_dropped)
-            if not ids:
-                continue
-            operation["targets"] = ids
-        elif op in {"move", "set_stay", "set_time"}:
-            name = operation.get("target")
-            spot_id = name_context.resolve(name) if isinstance(name, str) else None
-            if spot_id is None:
-                if isinstance(name, str):
-                    dropped.append(name)
-                continue
-            operation["target"] = spot_id
-        elif op == "replace":
-            target_name = operation.get("target")
-            with_name = operation.get("with")
-            target_id = name_context.resolve(target_name) if isinstance(target_name, str) else None
-            with_id = name_context.resolve(with_name) if isinstance(with_name, str) else None
-            if target_id is None or with_id is None:
-                for name in (target_name, with_name):
-                    if isinstance(name, str) and name_context.resolve(name) is None:
-                        dropped.append(name)
-                continue
-            operation["target"] = target_id
-            operation["with"] = with_id
-        elif op == "revert":
-            pass
-        else:  # pragma: no cover - guided decoding が enum で防ぐ
-            continue
-        resolved.append(operation)
-    return resolved, dropped
-
-
-def _prepare_constraints_add(
-    name_context: Any,
-    ops: MainConstraintOps | None,
-    *,
-    spots: dict[str, Any],
-    created_at_version: int,
-    used_ids: set[str],
-) -> tuple[list[ConstraintDraft], list[str]]:
-    """メインエージェントが書いた制約を、名前解決 + 検証まで済ませる。
-
-    ここで id を確定させておくことで、Tool 実行後に `state.itinerary.constraints`
-    (会話状態側の表示用コピー)を組み立て直せる(既存 Tool 実装が内部で
-    行う正規化と、id の割り当てロジックは同一 = `validate_and_normalize_constraints`)。
-    """
-
-    if ops is None or not ops.add:
-        return [], []
-    drafts: list[ConstraintDraft] = []
-    for item in ops.add:
-        args = dict(item.args)
-        for key in ("target", "a", "b"):
-            value = args.get(key)
-            if isinstance(value, str):
-                args[key] = resolve_constraint_target(name_context, value)
-        drafts.append(
-            ConstraintDraft(
-                pred=item.pred,
-                args=args,
-                weight=item.weight,
-                source_text=item.source_text,
-            )
-        )
-    guard_result = validate_and_normalize_constraints(
-        drafts,
-        spots,
-        created_at_version=created_at_version,
-        used_ids=used_ids,
-    )
-    dropped = [
-        f"{value.text}: {value.reason}" if value.reason else value.text
-        for value in guard_result.unmodeled
-    ]
-    return list(guard_result.constraints), dropped
-
-
-def _active_constraint_ids(state: TurnState) -> list[str]:
-    active = (
-        state.itinerary.constraints
-        if state.itinerary is not None
-        else state.pending_constraints
-    )
-    return [
-        str(value["id"])
-        for value in active
-        if isinstance(value.get("id"), str) and value["id"]
-    ]
-
-
 # ---------------------------------------------------------------------------
-# 結果の適用(last_candidates/presented_spot_ids/itinerary の更新)
+# 結果の適用(last_candidates/presented_spot_ids の更新)
 # ---------------------------------------------------------------------------
 
 
@@ -799,27 +510,6 @@ def _apply_recommend_result(state: TurnState, result: ToolResult) -> None:
                 code=code,
                 stage="recommend",
                 message="recommend は縮退経路を使用しました",
-            )
-        )
-
-
-def _apply_itinerary_result(
-    state: TurnState, result: ToolResult, *, constraints: list[dict[str, Any]]
-) -> None:
-    raw = result.data.get("itinerary")
-    if isinstance(raw, dict):
-        itinerary = Itinerary.model_validate(raw)
-        state.itinerary = ItineraryState(
-            itinerary=itinerary,
-            constraints=constraints,
-            parent_version=(state.itinerary.version if state.itinerary is not None else None),
-        )
-    for code in result.degraded:
-        state.degraded.append(
-            DegradedState(
-                code=code,
-                stage=result.tool.value,
-                message=f"{result.tool.value} は縮退経路を使用しました",
             )
         )
 
@@ -881,79 +571,3 @@ def _format_search_digest(data: dict[str, Any], *, dropped: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _format_itinerary_result_digest(
-    state: TurnState, result: ToolResult, *, dropped: list[str]
-) -> str:
-    itinerary = Itinerary.model_validate(result.data["itinerary"])
-    diff_raw = result.data.get("diff")
-    diff = Diff.model_validate(diff_raw) if isinstance(diff_raw, dict) else None
-    unmodeled = result.data.get("unmodeled", []) or []
-    combined_dropped = [*dropped]
-    for value in unmodeled:
-        if isinstance(value, dict) and value.get("reason"):
-            label = value.get("source_text") or value.get("pred")
-            combined_dropped.append(f"{label}: {value['reason']}")
-    return format_itinerary_digest(
-        itinerary,
-        spot_names=state.spot_names,
-        diff=diff,
-        dropped=combined_dropped,
-    )
-
-
-# ---------------------------------------------------------------------------
-# レコメンド文脈(旧 executor.build_recommendation_context の移植)
-# ---------------------------------------------------------------------------
-
-
-def _build_recommendation_context(state: TurnState) -> RecommendationContext:
-    itinerary = state.itinerary.itinerary if state.itinerary is not None else None
-    day_dates: dict[int, date] = {}
-    day_previous: dict[int, str] = {}
-    day_origins: dict[int, str] = {}
-    previous_spot_id: str | None = None
-    base_spot_id: str | None = state.default_origin_spot_id
-    travel_date: date | None = None
-    if itinerary is not None:
-        for index, day in enumerate(itinerary.days, 1):
-            try:
-                parsed_date = date.fromisoformat(day.date)
-            except ValueError:
-                continue
-            day_dates[index] = parsed_date
-            travel_date = travel_date or parsed_date
-            day_origins[index] = day.origin.spot_id
-            if day.items:
-                day_previous[index] = day.items[-1].spot_id
-                previous_spot_id = day.items[-1].spot_id
-            base_spot_id = base_spot_id or day.origin.spot_id
-    profile_values = state.profile.model_dump(mode="python")
-    if state.profile_delta is not None:
-        delta = state.profile_delta
-        interests = dict(profile_values["interests"])
-        interests.update({key.value: value for key, value in delta.interests.items()})
-        profile_values.update(
-            {
-                "interests": interests,
-                "party": delta.party.value if delta.party is not None else None,
-                "mobility": (delta.mobility.value if delta.mobility is not None else None),
-                "pace": delta.pace.value if delta.pace is not None else None,
-                "avoid": list(dict.fromkeys([*profile_values["avoid"], *delta.avoid])),
-                "notes": delta.notes,
-            }
-        )
-        for field in ("party", "mobility", "pace", "notes"):
-            if profile_values[field] is None:
-                profile_values[field] = getattr(state.profile, field)
-    profile = RecommendationProfile.model_validate(profile_values)
-    return RecommendationContext(
-        profile=profile,
-        presented_spot_ids=state.presented_spot_ids,
-        previous_spot_id=previous_spot_id,
-        base_spot_id=base_spot_id,
-        travel_date=travel_date,
-        day_dates=day_dates,
-        day_previous_spot_ids=day_previous,
-        day_origin_spot_ids=day_origins,
-        score_adjustments={value.spot_id: value.delta for value in state.score_adjustments},
-    )

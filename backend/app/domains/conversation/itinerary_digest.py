@@ -32,11 +32,15 @@ def format_itinerary_digest(
     spot_names: Mapping[str, str],
     diff: Diff | None = None,
     dropped: Sequence[str] = (),
+    ambiguous: Sequence[str] = (),
     notes: str | None = None,
 ) -> str:
     """日ごとの出発時刻・各スポット名・到着/滞在/移動・終了時刻・譲歩・diff・
 
-    落とした要素を、短い日本語テキストにする。`spot_id` は出さない。
+    落とした要素・曖昧だった要素(候補つき)を、短い日本語テキストにする。
+    `spot_id` は出さない。`dropped` は完全に解決できなかった要素、
+    `ambiguous` は複数候補に解けた要素(`name_resolution.describe_ambiguous`
+    で候補つきに整形済みの文字列)を渡す(§5 フロー4)。
     """
 
     if itinerary is None or not itinerary.days:
@@ -80,6 +84,8 @@ def format_itinerary_digest(
             )
     if dropped:
         lines.append("解決できなかった項目: " + "、".join(dropped))
+    if ambiguous:
+        lines.append("曖昧だった項目: " + "、".join(ambiguous))
     if notes:
         lines.append(f"補足: {notes}")
     return "\n".join(lines)
