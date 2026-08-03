@@ -16,6 +16,7 @@ from app.api.routers.chat import (
     get_chat_turn_runner,
 )
 from app.core.config import Settings, get_settings
+from app.domains.conversation.ask_registry import AskUserRegistry, wait_for_answer
 from app.domains.conversation.events import ConversationEvent
 from app.domains.users import MessageData, ProfileData, ThreadData, UserData
 from app.main import create_app
@@ -299,3 +300,163 @@ async def test_disconnect_keeps_worker_and_thread_can_restore_completed_turn() -
 
     assert restored.status_code == 200
     assert restored.json()["messages"][0]["content"] == "切断後も保存済み"
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/chat/answer(§1.4: ask_user への回答。HITL)
+# ---------------------------------------------------------------------------
+
+
+async def test_chat_answer_resolves_the_waiting_turn_with_free_text() -> None:
+    repository = MemoryChatUserRepository()
+    app = _app(repository, ScriptedRunner())
+    registry = AskUserRegistry()
+    app.state.ask_registry = registry
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        waiter = asyncio.create_task(wait_for_answer(registry, key=1, timeout_sec=2))
+        await asyncio.sleep(0)  # begin() が呼ばれるまで進める
+        response = await client.post(
+            "/api/v1/chat/answer",
+            json={"answer": "30分程度なら"},
+            headers={"Authorization": "Bearer chat-token"},
+        )
+        answer = await waiter
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert answer is not None
+    assert answer.answer == "30分程度なら"
+    assert answer.answered_by == "free_text"
+    assert answer.resolves is None
+
+
+async def test_chat_answer_with_resolves_is_recorded_as_chip() -> None:
+    repository = MemoryChatUserRepository()
+    app = _app(repository, ScriptedRunner())
+    registry = AskUserRegistry()
+    app.state.ask_registry = registry
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        waiter = asyncio.create_task(wait_for_answer(registry, key=1, timeout_sec=2))
+        await asyncio.sleep(0)
+        response = await client.post(
+            "/api/v1/chat/answer",
+            json={"answer": "鶴間池", "resolves": {"surface": "2番目", "value": "spot_012"}},
+            headers={"Authorization": "Bearer chat-token"},
+        )
+        answer = await waiter
+
+    assert response.status_code == 204
+    assert answer is not None
+    assert answer.answered_by == "chip"
+    assert answer.resolves == {"surface": "2番目", "value": "spot_012"}
+
+
+async def test_chat_answer_with_slot_resolves_is_also_a_chip() -> None:
+    repository = MemoryChatUserRepository()
+    app = _app(repository, ScriptedRunner())
+    registry = AskUserRegistry()
+    app.state.ask_registry = registry
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        waiter = asyncio.create_task(wait_for_answer(registry, key=1, timeout_sec=2))
+        await asyncio.sleep(0)
+        response = await client.post(
+            "/api/v1/chat/answer",
+            json={
+                "answer": "30分程度なら",
+                "resolves": {"slot": "mobility", "value": "short_walk_ok"},
+            },
+            headers={"Authorization": "Bearer chat-token"},
+        )
+        answer = await waiter
+
+    assert response.status_code == 204
+    assert answer is not None
+    assert answer.answered_by == "chip"
+    assert answer.resolves == {"slot": "mobility", "value": "short_walk_ok"}
+
+
+async def test_chat_answer_without_a_waiting_turn_is_409() -> None:
+    repository = MemoryChatUserRepository()
+    app = _app(repository, ScriptedRunner())
+    app.state.ask_registry = AskUserRegistry()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/v1/chat/answer",
+            json={"answer": "回答したいけど質問はまだ来ていない"},
+            headers={"Authorization": "Bearer chat-token"},
+        )
+
+    assert response.status_code == 409
+
+
+async def test_chat_answer_requires_authentication() -> None:
+    repository = MemoryChatUserRepository()
+    app = _app(repository, ScriptedRunner())
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/v1/chat/answer",
+            json={"answer": "はい"},
+        )
+
+    assert response.status_code == 401
+
+
+async def test_chat_stays_409_while_the_turn_is_waiting_for_an_ask_user_answer() -> None:
+    """§1.4: 質問待ち中も実行中ターンのまま。`POST /chat` は 409 のまま。"""
+
+    repository = MemoryChatUserRepository()
+    started = asyncio.Event()
+
+    async def waiting_runner(
+        *,
+        event_sink: Any,
+        ask_registry: AskUserRegistry,
+        **kwargs: Any,
+    ) -> None:
+        del kwargs
+        started.set()
+        await wait_for_answer(ask_registry, key=1, timeout_sec=2)
+        await event_sink.emit(
+            ConversationEvent(
+                event="done",
+                data={"turn_id": "waiting", "message_id": 1, "degraded": False},
+            )
+        )
+
+    app = _app(repository, waiting_runner)
+    headers = {"Authorization": "Bearer chat-token"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first_task = asyncio.create_task(
+            client.post("/api/v1/chat", json={"message": "1つ目"}, headers=headers)
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        second = await client.post(
+            "/api/v1/chat", json={"message": "2つ目"}, headers=headers
+        )
+        answered = await client.post(
+            "/api/v1/chat/answer",
+            json={"answer": "30分程度なら"},
+            headers=headers,
+        )
+        first = await asyncio.wait_for(first_task, timeout=1)
+
+    assert second.status_code == 409
+    assert answered.status_code == 204
+    assert first.status_code == 200

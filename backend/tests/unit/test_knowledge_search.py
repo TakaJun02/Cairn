@@ -13,6 +13,7 @@ from app.domains.narration.search.agent import (
     HARD_BUDGET_TOKENS,
     SOFT_BUDGET_TOKENS,
     KnowledgeSearchAgent,
+    SearchToolName,
     _guided_schema,
 )
 from app.domains.narration.search.records import (
@@ -296,6 +297,145 @@ async def test_answer_before_any_tool_is_rejected() -> None:
     assert agent.last_trace.steps[0].tool == "answer"
     assert agent.last_trace.tool_executions == 1
     assert "Tool 実行 0 回の answer は無効" in client.messages[1][1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# ask_user(§6): ask コールバック(port)の注入
+# ---------------------------------------------------------------------------
+
+
+def _ask_decision(
+    *, surface: str = "どちらの池", reason: str = "候補が複数あります"
+) -> dict[str, Any]:
+    return _decision(
+        "ask_user",
+        {
+            "kind": "clarify",
+            "surface": surface,
+            "reason": reason,
+            "options": [
+                {"label": "鶴間池", "value": "鶴間池"},
+                {"label": "元滝伏流水", "value": "元滝伏流水"},
+            ],
+        },
+    )
+
+
+def test_ask_user_tool_is_not_offered_without_a_callback() -> None:
+    """port が None なら Tool 自体を出さない(§6)。"""
+
+    agent = KnowledgeSearchAgent(
+        KnowledgeRetrieval(MemoryRepository([]), RecordingEmbedding()),
+        NoWebSearch(),
+        decision_client=ScriptedDecisionClient([]),
+    )
+
+    available = agent._available_tools(answer_only=False, soft_mode=False)
+
+    assert SearchToolName.ASK_USER not in available
+
+
+def test_ask_user_tool_is_excluded_once_soft_budget_is_reached() -> None:
+    """soft 予算(70%)以降は port があっても ask_user を選ばせない(narration_qa.md §7.1)。"""
+
+    async def ask_callback(**kwargs: Any) -> str:  # pragma: no cover
+        raise AssertionError("soft 予算以降は呼ばれないはず")
+
+    agent = KnowledgeSearchAgent(
+        KnowledgeRetrieval(MemoryRepository([]), RecordingEmbedding()),
+        NoWebSearch(),
+        decision_client=ScriptedDecisionClient([]),
+        ask_callback=ask_callback,
+    )
+
+    assert SearchToolName.ASK_USER in agent._available_tools(
+        answer_only=False, soft_mode=False
+    )
+    assert SearchToolName.ASK_USER not in agent._available_tools(
+        answer_only=False, soft_mode=True
+    )
+    assert SearchToolName.ASK_USER not in agent._available_tools(
+        answer_only=True, soft_mode=False
+    )
+
+
+async def test_ask_user_callback_is_invoked_and_answer_returns_as_observation() -> None:
+    """回答は観測として同じ反復(decide ループ)に返る(§6)。"""
+
+    calls: list[dict[str, Any]] = []
+
+    async def ask_callback(
+        *,
+        kind: str,
+        slot: str | None,
+        surface: str | None,
+        reason: str,
+        options: list[dict[str, str]],
+    ) -> str:
+        calls.append(
+            {"kind": kind, "slot": slot, "surface": surface, "reason": reason, "options": options}
+        )
+        return "質問「候補が複数あります」への回答: 鶴間池(回答方法: chip)"
+
+    repository = MemoryRepository(
+        [_hit(doc_id="faci_spot/spot_001", title="鶴間池", body="静かな池です")]
+    )
+    client = ScriptedDecisionClient(
+        [
+            _ask_decision(),
+            _decision("lexical_search", {"keywords": ["鶴間池"]}),
+            _decision(
+                "answer",
+                {
+                    "answer_ja": "鶴間池は静かな池です。",
+                    "sources": [{"kind": "knowledge", "doc_id": "faci_spot/spot_001"}],
+                    "coverage": "full",
+                },
+            ),
+        ]
+    )
+    agent = KnowledgeSearchAgent(
+        KnowledgeRetrieval(repository, RecordingEmbedding()),
+        NoWebSearch(),
+        decision_client=client,
+        ask_callback=ask_callback,
+    )
+
+    result = await agent.search("池について教えて")
+
+    assert isinstance(result, SearchResult)
+    assert calls == [
+        {
+            "kind": "clarify",
+            "slot": None,
+            "surface": "どちらの池",
+            "reason": "候補が複数あります",
+            "options": [
+                {"label": "鶴間池", "value": "鶴間池"},
+                {"label": "元滝伏流水", "value": "元滝伏流水"},
+            ],
+        }
+    ]
+    assert [step.tool for step in agent.last_trace.steps] == [
+        "ask_user",
+        "lexical_search",
+        "answer",
+    ]
+    # 回答が観測として次の decide 周のプロンプトに含まれる(action_log 経由)。
+    second_prompt = client.messages[1][1]["content"]
+    assert "鶴間池(回答方法: chip)" in second_prompt
+
+
+def test_guided_schema_includes_ask_user_fields_when_offered() -> None:
+    schema = _guided_schema(available_tools=[tool.value for tool in SearchToolName])
+
+    assert "ask_user" in schema["properties"]["tool"]["enum"]
+    args_properties = schema["properties"]["args"]["properties"]
+    assert "kind" in args_properties
+    assert args_properties["kind"]["enum"] == ["preference", "clarify"]
+    assert "slot" in args_properties
+    assert "surface" in args_properties
+    assert "options" in args_properties
 
 
 async def test_spot_document_id_is_prefixed_before_request() -> None:

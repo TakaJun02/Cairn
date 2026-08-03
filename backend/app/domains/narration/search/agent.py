@@ -61,11 +61,20 @@ class DecisionClient(Protocol):
     ) -> str: ...
 
 
+# ask コールバック(port)。conversation 側のアダプタが注入する(§6)。
+# narration → conversation の逆依存を作らないため、キーワード引数
+# (`kind`/`slot`/`surface`/`reason`/`options`。narration_qa.md §2 の
+# `{kind, slot?/surface?, reason, options}` と同じ形)と観測文字列だけを
+# やり取りする(`AskUserArgs` 型そのものは import しない)。
+AskCallback = Callable[..., Awaitable[str]]
+
+
 class SearchToolName(StrEnum):
     SEMANTIC = "semantic_search"
     LEXICAL = "lexical_search"
     DOCUMENT = "get_document"
     WEB = "web_search"
+    ASK_USER = "ask_user"
     ANSWER = "answer"
 
 
@@ -118,7 +127,28 @@ class _Answer(_AgentModel):
     coverage: Literal["full", "partial", "none"]
 
 
-ToolArgs = _Queries | _Keywords | _DocIds | _Answer
+class _AskOption(_AgentModel):
+    label: str = Field(min_length=1)
+    value: str = Field(min_length=1)
+
+
+class _AskUser(_AgentModel):
+    """`ask_user` の引数(narration_qa.md §2 の表: `{kind, slot?/surface?,
+
+    reason, options: 2..4}`)。メインエージェント・レコメンド SA と同じ形を
+    共有する — `kind="preference"` なら `slot`、`kind="clarify"` なら
+    `surface` を使う(ここでは strict な相互排他検証はしない。conversation
+    側の `AskUserArgs` が最終的に検証する。§6)。
+    """
+
+    kind: Literal["preference", "clarify"]
+    slot: str | None = None
+    surface: str | None = None
+    reason: str = Field(min_length=1)
+    options: list[_AskOption] = Field(min_length=2, max_length=4)
+
+
+ToolArgs = _Queries | _Keywords | _DocIds | _Answer | _AskUser
 SearchEventSink = Callable[[SearchStateEvent], Awaitable[None] | None]
 
 
@@ -261,6 +291,7 @@ class KnowledgeSearchAgent:
         *,
         decision_client: DecisionClient | None = None,
         event_sink: SearchEventSink | None = None,
+        ask_callback: AskCallback | None = None,
         context_window_tokens: int = CONTEXT_WINDOW_TOKENS,
         output_reserve_tokens: int = DECISION_OUTPUT_RESERVE_TOKENS,
         observation_token_limit: int = OBSERVATION_TOKEN_LIMIT,
@@ -271,6 +302,9 @@ class KnowledgeSearchAgent:
         self.web_search = web_search
         self.decision_client = decision_client or GenerationClient()
         self.event_sink = event_sink
+        # §6: port が None なら ask_user Tool 自体を出さない(呼び出し元が
+        # 単体テストや他の呼び出し元では従来どおり動く)。
+        self.ask_callback = ask_callback
         self.effective_context_tokens = context_window_tokens - output_reserve_tokens
         self.soft_budget_tokens = int(self.effective_context_tokens * SOFT_BUDGET_RATIO)
         self.hard_budget_tokens = int(self.effective_context_tokens * HARD_BUDGET_RATIO)
@@ -279,6 +313,21 @@ class KnowledgeSearchAgent:
         self.timeout_seconds = timeout_seconds
         self.last_trace = SearchTrace()
         self._reset("", None)
+
+    def _available_tools(
+        self, *, answer_only: bool, soft_mode: bool
+    ) -> list[SearchToolName]:
+        """`_messages`/`_guided_schema` が共有する、この周に許す Tool の一覧。
+
+        soft 予算(70%)以降は ask_user を選ばせない(narration_qa.md §7.1)。
+        """
+
+        if answer_only:
+            return [SearchToolName.ANSWER]
+        tools = [tool for tool in SearchToolName if tool is not SearchToolName.ASK_USER]
+        if self.ask_callback is not None and not soft_mode:
+            tools.append(SearchToolName.ASK_USER)
+        return tools
 
     async def search(
         self,
@@ -324,6 +373,9 @@ class KnowledgeSearchAgent:
             messages = self._messages(answer_only=force_answer, soft_mode=soft_mode)
             context_tokens = _estimate_tokens(messages)
 
+            available_tools = self._available_tools(
+                answer_only=force_answer, soft_mode=soft_mode
+            )
             try:
                 raw = await self.decision_client.generate(
                     messages,
@@ -335,7 +387,9 @@ class KnowledgeSearchAgent:
                             "json_schema": {
                                 "name": "knowledge_search_decide",
                                 "strict": True,
-                                "schema": _guided_schema(answer_only=force_answer),
+                                "schema": _guided_schema(
+                                    available_tools=[tool.value for tool in available_tools]
+                                ),
                             },
                         }
                     },
@@ -581,6 +635,18 @@ class KnowledgeSearchAgent:
                 lines.append("Web 検索にヒットはありませんでした。")
             return "\n".join(lines)
 
+        if tool is SearchToolName.ASK_USER:
+            assert isinstance(args, _AskUser)
+            if self.ask_callback is None:  # pragma: no cover - 防御的分岐
+                return "ask_user は現在利用できません。他の Tool を使うか answer してください。"
+            return await self.ask_callback(
+                kind=args.kind,
+                slot=args.slot,
+                surface=args.surface,
+                reason=args.reason,
+                options=[option.model_dump() for option in args.options],
+            )
+
         raise AssertionError(f"terminal tool は実行できません: {tool}")
 
     def _knowledge_observation(
@@ -762,8 +828,9 @@ class KnowledgeSearchAgent:
         answer_only: bool,
         soft_mode: bool,
     ) -> list[dict[str, str]]:
-        tools = [SearchToolName.ANSWER.value] if answer_only else [
-            tool.value for tool in SearchToolName
+        tools = [
+            tool.value
+            for tool in self._available_tools(answer_only=answer_only, soft_mode=soft_mode)
         ]
         spot_context = (
             f"対象スポットの文書 ID: faci_spot/{self._spot_id}\n"
@@ -861,15 +928,31 @@ def _parse_tool_args(tool: SearchToolName, args: Mapping[str, Any]) -> ToolArgs:
         return _Keywords.model_validate(args)
     if tool is SearchToolName.DOCUMENT:
         return _DocIds.model_validate(args)
+    if tool is SearchToolName.ASK_USER:
+        return _AskUser.model_validate(args)
     return _Answer.model_validate(args)
 
 
-def _guided_schema(*, answer_only: bool = False) -> dict[str, Any]:
-    """xgrammar 未実装の uniqueItems を使わない flat args schema。"""
+def _guided_schema(
+    *,
+    answer_only: bool = False,
+    available_tools: list[str] | None = None,
+) -> dict[str, Any]:
+    """xgrammar 未実装の uniqueItems を使わない flat args schema。
 
-    available = [SearchToolName.ANSWER.value] if answer_only else [
-        tool.value for tool in SearchToolName
-    ]
+    `available_tools` を渡すと呼び出し元(`_run`)がその周に許す Tool だけへ
+    `tool` の enum を絞れる(soft 予算以降・port 未注入時に ask_user を外す。
+    §6)。省略時は従来どおり(`answer_only` だけで判定)。
+    """
+
+    if available_tools is not None:
+        available = available_tools
+    else:
+        available = (
+            [SearchToolName.ANSWER.value]
+            if answer_only
+            else [tool.value for tool in SearchToolName]
+        )
     return {
         "type": "object",
         "properties": {
@@ -895,6 +978,24 @@ def _guided_schema(*, answer_only: bool = False) -> dict[str, Any]:
                         "items": {"type": "string"},
                         "minItems": 1,
                         "maxItems": 2,
+                    },
+                    "kind": {"type": "string", "enum": ["preference", "clarify"]},
+                    "slot": {"type": "string"},
+                    "surface": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "value": {"type": "string"},
+                            },
+                            "required": ["label", "value"],
+                            "additionalProperties": False,
+                        },
+                        "minItems": 2,
+                        "maxItems": 4,
                     },
                     "answer_ja": {"type": "string"},
                     "sources": {
@@ -930,6 +1031,19 @@ def _guided_schema(*, answer_only: bool = False) -> dict[str, Any]:
 
 
 def _system_prompt(available_tools: list[str]) -> str:
+    ask_user_instruction = (
+        (
+            "ask_user={kind,slot?,surface?,reason,options:2..4} はユーザーに"
+            "聞きます。ほぼ常に kind=\"clarify\" を使います"
+            "(取り違えが目視できない場面だけ。例: 同名の複数施設のどちらを"
+            "指すか曖昧なとき)。その場合 surface に聞き返す表層形を書き、"
+            "slot は null にします。reason は質問文(そのまま画面に表示され"
+            "ます)、options は label/value のペアです。回答は次の周に観測"
+            "として返ります。念のための確認には使いません。"
+        )
+        if "ask_user" in available_tools
+        else ""
+    )
     return (
         "あなたは鳥海山観光の知識検索サブエージェントです。"
         "ユーザーへの話者ではなく、respond が使う根拠付き素材を作ります。"
@@ -941,7 +1055,7 @@ def _system_prompt(available_tools: list[str]) -> str:
         "lexical_search={keywords:1..6} は固有名詞・数値・施設名の完全一致、"
         "get_document={doc_ids:1..2} は既知 doc_id の全文取得、"
         "web_search={queries:1..3} は今日・現在・営業状況など最新情報、"
-        "answer={answer_ja,sources,coverage} は terminal です。"
+        f"answer={{answer_ja,sources,coverage}} は terminal です。{ask_user_instruction}"
         "対象スポットの文書 ID が与えられたスポット固有質問は、最初に get_document を"
         "選んでください。意味的な一般質問は semantic_search、象潟ICなど固有語は"
         "lexical_search、今日の状況は web_search を最初に選びます。"
@@ -1004,6 +1118,7 @@ _APPROX_TOKEN = re.compile(
 
 __all__ = [
     "HARD_BUDGET_TOKENS",
+    "AskCallback",
     "KnowledgeSearchAgent",
     "OBSERVATION_TOKEN_LIMIT",
     "RECURSION_SAFETY_LIMIT",

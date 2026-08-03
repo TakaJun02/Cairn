@@ -14,6 +14,7 @@ from app.api.sse import (
     frame_sse,
     iter_sse_frames,
 )
+from app.domains.conversation.ask_registry import AskUserRegistry
 from app.domains.conversation.events import ConversationEvent, MemoryEventSink
 from app.domains.conversation.tool_adapters import ToolAdapters
 from app.domains.conversation.types import AskUserArgs
@@ -62,6 +63,11 @@ async def test_ask_user_and_clarify_sse_include_reason_without_changing_options(
     sink = MemoryEventSink()
     adapter = object.__new__(ToolAdapters)
     adapter.event_sink = sink
+    # thread_id/user_id を None にして、pending_ask の DB 書き込みと
+    # レジストリでの待機をスキップする(この層はイベント本文だけを検査する)。
+    adapter.thread_id = None
+    adapter.user_id = None
+    adapter.ask_registry = AskUserRegistry()
 
     await adapter.ask_user(
         step_id=1,

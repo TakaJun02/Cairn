@@ -136,7 +136,13 @@ class FakeTools:
         self.plan_queue: list[Any] = []
         self.edit_queue: list[Any] = []
         self.search_queue: list[Any] = []
+        self.ask_queue: list[Any] = []
         self.calls: list[str] = []
+        # narration の ask コールバック(port)の統合テスト用: 設定すると
+        # search_knowledge が渡された ask_callback を実際に 1 回呼ぶ
+        # (§6: search_knowledge SA が内部で ask_user を選んだことを模す)。
+        self.invoke_ask_callback_with: dict[str, Any] | None = None
+        self.ask_callback_observations: list[str] = []
 
     async def recommend(
         self, *, step_id: int, args: Any, context: Any, use_specialist: bool
@@ -183,9 +189,14 @@ class FakeTools:
         self.calls.append("edit_itinerary")
         return self.edit_queue.pop(0)
 
-    async def search_knowledge(self, *, step_id: int, args: Any) -> Any:
+    async def search_knowledge(
+        self, *, step_id: int, args: Any, ask_callback: Any = None
+    ) -> Any:
         del args
         self.calls.append("search_knowledge")
+        if self.invoke_ask_callback_with is not None and ask_callback is not None:
+            observation = await ask_callback(**self.invoke_ask_callback_with)
+            self.ask_callback_observations.append(observation)
         if self.search_queue:
             return self.search_queue.pop(0)
         return ToolResult(
@@ -194,8 +205,14 @@ class FakeTools:
             data={"answer_ja": "資料の回答", "sources": [], "coverage": "none", "spot_id": None},
         )
 
-    async def ask_user(self, *, step_id: int, args: Any) -> Any:  # pragma: no cover
-        raise AssertionError("段2では ask_user を呼びません")
+    async def ask_user(self, *, step_id: int, args: Any) -> Any:
+        del args
+        self.calls.append("ask_user")
+        if self.ask_queue:
+            return self.ask_queue.pop(0)
+        raise AssertionError(
+            "ask_user が呼ばれましたが、FakeTools.ask_queue に応答が積まれていません"
+        )
 
 
 async def test_simple_recommend_turn_completes_end_to_end() -> None:
@@ -447,3 +464,267 @@ async def test_cancelled_respond_persists_partial_text_before_propagating() -> N
     assert repository.persisted[0].respond_status == "partial"
     assert repository.persisted[0].responded is True
     assert sink.events[-1].event == "done"
+
+
+# ---------------------------------------------------------------------------
+# 受け入れ条件(段5): 3 経路それぞれで
+# 「質問 → 回答 → 同一ターン続行 → done → respond」が通ること
+# ---------------------------------------------------------------------------
+
+
+async def test_ask_user_timeout_still_continues_to_done_and_respond() -> None:
+    """§7: タイムアウトでも `answered_by:"timeout"` で続行し respond まで到達する。"""
+
+    sink = MemoryEventSink()
+    repository = MemoryConversationRepository()
+    tools = FakeTools(sink=sink)
+    tools.ask_queue = [
+        ToolResult(
+            step_id=1,
+            tool=ToolName.ASK_USER,
+            data={
+                "answer": "(タイムアウトのため回答がありませんでした)",
+                "answered_by": "timeout",
+            },
+        )
+    ]
+    client = TurnClient(
+        [
+            _update_profile_output(),
+            _turn_json(
+                "ask_user",
+                {
+                    "kind": "preference",
+                    "slot": "mobility",
+                    "surface": None,
+                    "reason": "どのくらい歩けますか",
+                    "options": [
+                        {"label": "あまり歩きたくない", "value": "avoid_walk"},
+                        {"label": "30分程度なら", "value": "short_walk_ok"},
+                    ],
+                },
+            ),
+            _update_profile_output(),  # 未回答なので profile_delta は空
+            _done_json(),
+        ],
+        response_chunks=["回答が確認できなかったため、仮定して進めます。"],
+    )
+
+    state = await ConversationPipeline(
+        repository,
+        event_sink=sink,
+        llm_client=client,
+        tools=tools,
+    ).run(user_id=1, utterance="おすすめは？")
+
+    assert state.responded is True
+    assert state.ask_user_count == 1
+    assert state.qa_answers[0]["meta"]["answered_by"] == "timeout"
+    assert repository.persisted[0].responded is True
+    assert [event.event for event in sink.events][-1] == "done"
+
+
+async def test_main_agent_ask_user_round_trip_reaches_done_and_respond() -> None:
+    sink = MemoryEventSink()
+    repository = MemoryConversationRepository()
+    tools = FakeTools(sink=sink)
+    tools.ask_queue = [
+        ToolResult(
+            step_id=1,
+            tool=ToolName.ASK_USER,
+            data={"answer": "30分程度なら", "answered_by": "chip"},
+        )
+    ]
+    client = TurnClient(
+        [
+            _update_profile_output(),
+            _turn_json(
+                "ask_user",
+                {
+                    "kind": "preference",
+                    "slot": "mobility",
+                    "surface": None,
+                    "reason": "どのくらい歩けますか",
+                    "options": [
+                        {"label": "あまり歩きたくない", "value": "avoid_walk"},
+                        {"label": "30分程度なら", "value": "short_walk_ok"},
+                    ],
+                },
+            ),
+            _update_profile_output(
+                profile_delta={
+                    "interests": {},
+                    "party": None,
+                    "mobility": "short_walk_ok",
+                    "pace": None,
+                    "avoid": [],
+                    "notes": None,
+                }
+            ),
+            _done_json(),
+        ],
+        response_chunks=["30分程度歩ける前提でご案内します。"],
+    )
+
+    state = await ConversationPipeline(
+        repository,
+        event_sink=sink,
+        llm_client=client,
+        tools=tools,
+    ).run(user_id=1, utterance="おすすめは？")
+
+    assert state.responded is True
+    assert state.profile.mobility == "short_walk_ok"
+    assert state.ask_user_count == 1
+    assert repository.persisted[0].responded is True
+    assert repository.persisted[0].qa_answers[0]["answer"] == "30分程度なら"
+    assert [event.event for event in sink.events][-1] == "done"
+
+
+async def test_recommend_subagent_ask_user_round_trip_reaches_done_and_respond() -> None:
+    sink = MemoryEventSink()
+    repository = MemoryConversationRepository()
+    tools = FakeTools(sink=sink)
+    tools.ask_queue = [
+        ToolResult(
+            step_id=1,
+            tool=ToolName.ASK_USER,
+            data={"answer": "家族です", "answered_by": "chip"},
+        )
+    ]
+    ask_action = {
+        "slot": "party",
+        "reason": "どなたと行かれますか",
+        "options": [
+            {"label": "家族", "value": "family_kids"},
+            {"label": "一人", "value": "solo"},
+        ],
+    }
+    client = TurnClient(
+        [
+            _update_profile_output(),
+            _turn_json("recommend", {"instruction": "おすすめを教えて"}),
+            _turn_json("ask_user", ask_action),  # レコメンド SA 自身の判定(§4)
+            _update_profile_output(
+                profile_delta={
+                    "interests": {},
+                    "party": "family_kids",
+                    "mobility": None,
+                    "pace": None,
+                    "avoid": [],
+                    "notes": None,
+                }
+            ),
+            _recommend_act_json(filter={"tags": ["自然"]}),
+            _done_json(),
+        ],
+        response_chunks=["家族向けにご案内します。"],
+    )
+
+    state = await ConversationPipeline(
+        repository,
+        event_sink=sink,
+        llm_client=client,
+        tools=tools,
+    ).run(user_id=1, utterance="おすすめは？")
+
+    assert state.responded is True
+    assert state.profile.party == "family_kids"
+    assert tools.calls.count("recommend") == 1
+    assert repository.persisted[0].responded is True
+
+
+async def test_search_knowledge_ask_callback_round_trip_reaches_done_and_respond() -> None:
+    """§6: narration の ask コールバック(port)経由でも同じターンが続く。"""
+
+    sink = MemoryEventSink()
+    repository = MemoryConversationRepository()
+    tools = FakeTools(sink=sink)
+    tools.invoke_ask_callback_with = {
+        "kind": "clarify",
+        "slot": None,
+        "surface": "どちらの池",
+        "reason": "候補が複数あります",
+        "options": [
+            {"label": "鶴間池", "value": "鶴間池"},
+            {"label": "元滝伏流水", "value": "元滝伏流水"},
+        ],
+    }
+    tools.ask_queue = [
+        ToolResult(
+            step_id=1,
+            tool=ToolName.ASK_USER,
+            data={"answer": "鶴間池", "answered_by": "chip"},
+        )
+    ]
+    client = TurnClient(
+        [
+            _update_profile_output(),
+            _turn_json("search_knowledge", {"request": "由来を教えて", "spot_name": None}),
+            _done_json(),
+        ],
+        response_chunks=["鶴間池についてご説明します。"],
+    )
+
+    state = await ConversationPipeline(
+        repository,
+        event_sink=sink,
+        llm_client=client,
+        tools=tools,
+    ).run(user_id=1, utterance="由来は？")
+
+    assert state.responded is True
+    assert tools.ask_callback_observations
+    assert "鶴間池" in tools.ask_callback_observations[0]
+    assert repository.persisted[0].qa_answers[0]["answer"] == "鶴間池"
+
+
+async def test_search_knowledge_ask_callback_supports_preference_kind_too() -> None:
+    """narration_qa.md §2: ask_user の引数は `{kind,slot?/surface?,...}` の
+
+    メイン/レコメンド SA と同じ形。knowledge SA も kind=preference を選べる。
+    """
+
+    sink = MemoryEventSink()
+    repository = MemoryConversationRepository()
+    tools = FakeTools(sink=sink)
+    tools.invoke_ask_callback_with = {
+        "kind": "preference",
+        "slot": "mobility",
+        "surface": None,
+        "reason": "どのくらい歩けますか",
+        "options": [
+            {"label": "あまり歩きたくない", "value": "avoid_walk"},
+            {"label": "30分程度なら", "value": "short_walk_ok"},
+        ],
+    }
+    tools.ask_queue = [
+        ToolResult(
+            step_id=1,
+            tool=ToolName.ASK_USER,
+            data={"answer": "30分程度なら", "answered_by": "chip"},
+        )
+    ]
+    client = TurnClient(
+        [
+            _update_profile_output(),
+            _turn_json("search_knowledge", {"request": "由来を教えて", "spot_name": None}),
+            _done_json(),
+        ],
+        response_chunks=["ご案内します。"],
+    )
+
+    state = await ConversationPipeline(
+        repository,
+        event_sink=sink,
+        llm_client=client,
+        tools=tools,
+    ).run(user_id=1, utterance="由来は？")
+
+    assert state.responded is True
+    assert tools.ask_callback_observations
+    assert "30分程度なら" in tools.ask_callback_observations[0]
+    # knowledge SA の聞き返しは update_profile を回さない(§6)ので、
+    # プロフィールへは反映されない。
+    assert state.profile.mobility is None
+    assert repository.persisted[0].responded is True

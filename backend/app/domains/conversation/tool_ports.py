@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Protocol
 
 from app.domains.conversation.types import (
@@ -16,6 +16,11 @@ from app.domains.conversation.types import (
     ToolResult,
 )
 from app.domains.recommendation.types import RecommendationContext
+
+# 知識検索 SA(narration)へ注入する ask コールバック(port)。§6:
+# narration → conversation の逆依存を作らないため、narration 側は
+# `surface`/`reason`/`options`(label/value の dict)と観測文字列だけを知る。
+SearchAskCallback = Callable[..., Awaitable[str]]
 
 
 class ConversationToolPort(Protocol):
@@ -58,6 +63,7 @@ class ConversationToolPort(Protocol):
         *,
         step_id: int,
         args: SearchKnowledgeArgs,
+        ask_callback: SearchAskCallback | None = None,
     ) -> ToolResult | ToolError: ...
 
     async def ask_user(

@@ -1,17 +1,16 @@
 """① `load_context` とコンテキスト予算の組み立て。
 
-段2(ReAct 化)で `ask_user` の中断・復帰路(旧 `_resume_pending_ask`)は削除した
-(`Docs/30_design/agent_react_architecture.md` §7: 段5で `ask_user` は
-ターンを中断しない通常の Tool として作り直す)。`pending_ask` 列自体は
-段5で使うため `ContextSnapshot`/`TurnState` に残すが、ここでは素通りさせる
-だけで、ターン開始時に Tool 結果へ復元する処理は持たない。
+`ask_user` はターンを中断しない通常の Tool である(§7)。回答は
+`POST /api/v1/chat/answer` から `ask_registry` 経由で実行中のターンへ直接
+届き(`tool_adapters.ToolAdapters.ask_user` が待っている)、`load_context` を
+経由しない。`pending_ask` はリロード復元専用の表示状態(§7)で、ここでは
+素通りさせるだけで、ターン開始時に Tool 結果へ復元する処理は持たない。
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Protocol
 from uuid import uuid4
 
 from app.domains.conversation.history import build_conversation_history
@@ -32,11 +31,9 @@ async def load_context(
     user_id: int,
     utterance: str,
     turn_id: str | None = None,
-    resolves: Mapping[str, Any] | None = None,
 ) -> TurnState:
     """DB 由来の全状態を読み、履歴と参照可能語彙を 1 回だけ作る。"""
 
-    del resolves  # 段5で `POST /chat/answer` の解決値として使う。段2では未使用。
     snapshot = await repository.load_snapshot(user_id)
     history = build_conversation_history(
         snapshot.messages,

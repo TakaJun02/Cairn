@@ -5,14 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Annotated, Any
+from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from starlette.responses import StreamingResponse
 
 from app.api.auth import get_current_user
-from app.api.schemas.chat import ChatEvent, ChatRequest
+from app.api.schemas.chat import ChatAnswerRequest, ChatEvent, ChatRequest
 from app.api.sse import (
     ChatEventBuffer,
     DisconnectAwareGenerationClient,
@@ -22,6 +22,7 @@ from app.core.config import Settings, get_settings
 from app.core.db import session_scope
 from app.core.llm import GenerationClient
 from app.domains.conversation import run_turn
+from app.domains.conversation.ask_registry import AskAnswer, AskUserRegistry
 from app.domains.conversation.state import TurnState
 from app.domains.users import UserData
 
@@ -34,7 +35,11 @@ class EventStreamResponse(StreamingResponse):
 
 
 class ActiveTurnRegistry:
-    """同一プロセス内で 1 ユーザー 1 実行中ターンを守る。"""
+    """同一プロセス内で 1 ユーザー 1 実行中ターンを守る。
+
+    質問待ち中(`ask_user`)もターンの処理(コルーチン)は生きたままなので、
+    `POST /chat` は待機中も 409 のまま(§1.4 の「実行中ターンがある間」)。
+    """
 
     def __init__(self) -> None:
         self._user_ids: set[int] = set()
@@ -70,6 +75,20 @@ def get_active_turn_registry(request: Request) -> ActiveTurnRegistry:
     return registry
 
 
+def get_ask_registry(request: Request) -> AskUserRegistry:
+    """`ask_user` の HITL 待ち受けレジストリ(§7)。プロセス内(app.state)に
+
+    1 個だけ持ち、実行中のターン(`ToolAdapters.ask_user`)と
+    `POST /chat/answer`・`GET /thread` が同じインスタンスを見る。
+    """
+
+    registry = getattr(request.app.state, "ask_registry", None)
+    if registry is None:
+        registry = AskUserRegistry()
+        request.app.state.ask_registry = registry
+    return registry
+
+
 def get_chat_turn_runner() -> ChatTurnRunner:
     return _run_chat_turn
 
@@ -78,10 +97,10 @@ async def _run_chat_turn(
     *,
     user_id: int,
     utterance: str,
-    resolves: dict[str, str] | None,
     event_sink: ChatEventBuffer,
     settings: Settings,
     disconnected: asyncio.Event,
+    ask_registry: AskUserRegistry,
 ) -> TurnState:
     client = DisconnectAwareGenerationClient(
         GenerationClient(settings),
@@ -94,9 +113,9 @@ async def _run_chat_turn(
             user_id=user_id,
             utterance=utterance,
             event_sink=event_sink,
-            resolves=resolves,
             settings=settings,
             llm_client=client,
+            ask_registry=ask_registry,
         )
 
 
@@ -114,6 +133,7 @@ async def chat(
     settings: Annotated[Settings, Depends(get_settings)],
     registry: Annotated[ActiveTurnRegistry, Depends(get_active_turn_registry)],
     runner: Annotated[ChatTurnRunner, Depends(get_chat_turn_runner)],
+    ask_registry: Annotated[AskUserRegistry, Depends(get_ask_registry)],
 ) -> EventStreamResponse:
     if not registry.acquire(current_user.id):
         raise HTTPException(
@@ -131,10 +151,10 @@ async def chat(
             state = await runner(
                 user_id=current_user.id,
                 utterance=body.message,
-                resolves=(body.resolves.model_dump() if body.resolves is not None else None),
                 event_sink=buffer,
                 settings=settings,
                 disconnected=disconnected,
+                ask_registry=ask_registry,
             )
         except asyncio.CancelledError:
             # 切断を受けた N5 は run_turn 内で persist 済み。
@@ -178,3 +198,37 @@ async def chat(
             "Connection": "keep-alive",
         },
     )
+
+
+@router.post(
+    "/chat/answer",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={
+        status.HTTP_409_CONFLICT: {"description": "回答を待っているターンがありません"},
+    },
+)
+async def chat_answer(
+    body: ChatAnswerRequest,
+    current_user: Annotated[UserData, Depends(get_current_user)],
+    ask_registry: Annotated[AskUserRegistry, Depends(get_ask_registry)],
+) -> Response:
+    """`ask_user` への回答(§1.4)。イベントは元の SSE ストリームに流れる。
+
+    `resolves` があればチップ経由(`answered_by:"chip"`)、無ければ自由入力
+    (`answered_by:"free_text"`)。回答を待つターンが無ければ 409。
+    """
+
+    answered_by: Literal["chip", "free_text"] = (
+        "chip" if body.resolves is not None else "free_text"
+    )
+    answer = AskAnswer(
+        answer=body.answer,
+        answered_by=answered_by,
+        resolves=(body.resolves.model_dump() if body.resolves is not None else None),
+    )
+    if not ask_registry.resolve(current_user.id, answer):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="回答を待っているターンがありません",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

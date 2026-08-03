@@ -195,11 +195,30 @@ class ConversationRepository:
             self.session.add(user_message)
             await self.session.flush()
 
+            # `ask_user` への回答(§7)。書き込みはこの一括 persist でよい
+            # (data_model.md §4.4: user 行として質問とペアの meta を持つ)。
+            seq_cursor = next_seq
+            for qa in state.qa_answers:
+                seq_cursor += 1
+                self.session.add(
+                    Message(
+                        thread_id=state.thread_id,
+                        seq=seq_cursor,
+                        role="user",
+                        content=str(qa.get("answer", "")),
+                        status="complete",
+                        meta={"turn_id": state.turn_id, **qa.get("meta", {})},
+                    )
+                )
+            if state.qa_answers:
+                await self.session.flush()
+
             assistant_message: Message | None = None
             if state.responded:
+                seq_cursor += 1
                 assistant_message = Message(
                     thread_id=state.thread_id,
-                    seq=next_seq + 1,
+                    seq=seq_cursor,
                     role="assistant",
                     content=state.assistant_text,
                     status=state.respond_status,
@@ -237,17 +256,21 @@ class ConversationRepository:
         *,
         asked_at_message_id: int | None = None,
     ) -> None:
-        del asked_at_message_id  # 段5で `ask_user` の pending_ask 記録に使う。
+        # 未使用: pending_ask は ask_registry がターン内で即時反映/クリア済み。
+        del asked_at_message_id
         thread.presented_spot_ids = list(dict.fromkeys(state.presented_spot_ids))
         thread.last_candidates = [
             value.model_dump(mode="json") for value in state.last_candidates
         ]
-        # 段2は `ask_user` を呼ばないため、質問中の状態(pending_ask)は
-        # 常に持たない。asked_slots/ask_streak/resolved_ambiguities は
-        # 段5で使うユーティリティなので、読み込んだ値をそのまま素通りする
-        # (このターンでは書き換えない)。
-        thread.asked_slots = list(state.asked_slots)
-        thread.ask_streak = 0
+        # A1: 質問済み slot。A5: 同じ曖昧さを 2 回聞かない。
+        thread.asked_slots = list(dict.fromkeys(state.asked_slots))
+        thread.resolved_ambiguities = list(state.resolved_ambiguities)
+        # A2: 質問を含むターンの連続は 2 ターンまで。このターンで 1 回でも
+        # 質問できていれば streak を伸ばし、無ければリセットする。
+        thread.ask_streak = state.ask_streak + 1 if state.ask_user_count > 0 else 0
+        # `pending_ask` はターンの処理が回答を待っている間だけの表示状態
+        # (§7)。`ToolAdapters.ask_user` が別トランザクションで即時
+        # 書き込み/クリア済みなので、ここでは念のため NULL を保証するだけ。
         thread.pending_ask = None
         # `pending_constraints`(旅程がまだ無いターンの制約の一時保持)は、
         # ReAct 化により constraints が常に plan_itinerary/edit_itinerary の
@@ -339,19 +362,6 @@ def _assistant_meta(state: TurnState) -> dict[str, Any]:
         ],
         "qa_spot_id": qa_spot_id,
         "qa_spot_name": state.spot_names.get(qa_spot_id or "") if qa_spot_id else None,
-        # 段5で `ask_user` を再導入するまで、常に None。
-        "ask_slot": (
-            state.pending_ask.get("slot")
-            if state.pending_ask is not None
-            and state.pending_ask.get("kind") == "preference"
-            else None
-        ),
-        "clarify_surface": (
-            state.pending_ask.get("surface")
-            if state.pending_ask is not None
-            and state.pending_ask.get("kind") == "clarify"
-            else None
-        ),
     }
 
 

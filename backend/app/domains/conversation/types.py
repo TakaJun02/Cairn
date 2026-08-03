@@ -34,12 +34,7 @@ class ConversationModel(BaseModel):
 
 
 class ToolName(StrEnum):
-    """Tool アダプタ(`tool_ports.ConversationToolPort`)の実行結果に載る Tool 名。
-
-    `ask_user` は段5で HITL 待ち受けを実装するまでメインループからは
-    呼ばれないが、型・アダプタは残す(CLAUDE.md 役割分担外のスコープ判断は
-    Docs/30_design/agent_react_architecture.md §16 の段取りに従う)。
-    """
+    """Tool アダプタ(`tool_ports.ConversationToolPort`)の実行結果に載る Tool 名。"""
 
     RECOMMEND = "recommend"
     PLAN_ITINERARY = "plan_itinerary"
@@ -49,31 +44,25 @@ class ToolName(StrEnum):
 
 
 class MainToolName(StrEnum):
-    """メインエージェントの `action.tool` enum(段2のスコープ)。
-
-    `ask_user` は段5で追加する(Docs/30_design/agent_react_architecture.md §3.3)。
-    """
+    """メインエージェントの `action.tool` enum(§3.3)。"""
 
     RECOMMEND = "recommend"
     PLAN_ITINERARY = "plan_itinerary"
     EDIT_ITINERARY = "edit_itinerary"
     SEARCH_KNOWLEDGE = "search_knowledge"
+    ASK_USER = "ask_user"
     DONE = "done"
 
 
 class ResponseMode(StrEnum):
-    """`respond` の 1 テンプレート内の分岐。
-
-    旧 `QUESTION`(ask_user 用)は、ReAct 化でメインループが `ask_user` を
-    持たなくなったため不要になった(段5で復活しうる)。
-    """
+    """`respond` の 1 テンプレート内の分岐。"""
 
     EXPLANATION = "explanation"
     FAILURE = "failure"
 
 
 class Slot(StrEnum):
-    """段5で `ask_user` が使うスロット語彙。今回は未使用。"""
+    """`ask_user`(kind=preference)が使うスロット語彙(§3.3・§7)。"""
 
     ONBOARDING = "onboarding"
     PARTY = "party"
@@ -207,7 +196,7 @@ class AskUserOption(ConversationModel):
 
 
 class AskUserArgs(ConversationModel):
-    """段5で使う。今回のメインループの Tool enum には含めない。"""
+    """`ask_user` Tool の引数(§3.3・§7)。`kind` が `state:ask_user`/`clarify` を分ける。"""
 
     kind: Literal["preference", "clarify"]
     slot: Slot | None = None
@@ -351,6 +340,10 @@ def pred_values() -> list[str]:
 
 def preference_values() -> list[str]:
     return [value.value for value in PreferenceKey]
+
+
+def slot_values() -> list[str]:
+    return [value.value for value in Slot]
 
 
 def _deduplicate_nonempty(values: list[str]) -> list[str]:

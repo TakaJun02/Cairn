@@ -147,14 +147,6 @@ def summarize_assistant_event(meta: Mapping[str, Any]) -> str:
         suffix = f": {' / '.join(itinerary_names)}" if itinerary_names else ""
         summaries.append(f"[旅程更新 v{itinerary_version}{suffix}]")
 
-    ask_slot = meta.get("ask_slot")
-    if isinstance(ask_slot, str) and ask_slot:
-        summaries.append(f"[選好質問: {ask_slot}]")
-
-    clarify_surface = meta.get("clarify_surface")
-    if isinstance(clarify_surface, str) and clarify_surface:
-        summaries.append(f"[聞き返し: {clarify_surface}]")
-
     if summaries:
         return " ".join(summaries)
 

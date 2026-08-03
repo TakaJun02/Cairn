@@ -1,18 +1,13 @@
 """コードが強制するガード群(`Docs/30_design/agent_react_architecture.md` §10)。
 
-段2(ReAct 化)で、旧 P1〜P8(一括プラン検証)・G1〜G9 のうち `$N` 参照解決・
-3経路分類完全性チェックは不要になった(メインエージェントは毎周 1 手だけを
-書き、前段結果への参照は行わない。名前解決は `name_resolution.py` が担う)。
-
-残すもの:
 - `validate_and_normalize_constraints`: メインエージェントが直接書く制約
   (述語 DSL 17 種)の検証。`plan_itinerary`/`edit_itinerary` アダプタが使う
 - `normalize_revert_ops`: `edit_itinerary.ops` に `revert` が混じったときの
   排他化。メインループが Tool 実行前に使う
 - `validate_response_spot_names`: `respond` のクローズドワールド検査
-- `validate_ask_user`(G1〜G9)と `asked_slots`/`ask_streak`/
-  `resolved_ambiguities` を使うユーティリティ: 段5 (`ask_user` の HITL 化)で
-  使うため、今回は呼び出し元がなくても残す
+- `evaluate_ask_user`(R4・A1〜A5): `ask_user` の HITL 抑制ガード。
+  `ask_execution.execute_ask_user` がメイン・レコメンド SA・知識検索 SA の
+  3 経路共通で呼ぶ(§7・§10)
 """
 
 from __future__ import annotations
@@ -21,13 +16,14 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from app.domains.conversation.state import ProfileState, SpotFact
+from app.domains.conversation.state import SpotFact
 from app.domains.conversation.types import AskUserArgs, ConstraintDraft, UnmodeledItem
 from app.domains.itinerary.predicates import normalize_constraints
 
-_ALLOWED_INTERPRETATIONS = frozenset(
-    {"all_matches", "single_match", "current_itinerary", "last_candidates"}
-)
+# R4: `ask_user` は 1 ターン 2 回まで(メイン・SA 合算。§3.5・§10)。
+MAX_ASK_USER_PER_TURN = 2
+# A2: 質問を含むターンの連続は 2 ターンまで。
+MAX_ASK_STREAK = 2
 
 
 def has_repeated_ngram(
@@ -129,28 +125,35 @@ def validate_response_spot_names(
     return GuardResult(True)
 
 
-def validate_ask_user(
+def evaluate_ask_user(
     question: AskUserArgs,
     *,
-    asked_slots: Sequence[str],
+    ask_user_count: int,
     ask_streak: int,
-    intent: str | None,
-    profile: ProfileState,
-    has_non_question_step: bool,
-    question_count: int = 1,
+    asked_slots: Sequence[str],
+    resolved_ambiguities: Sequence[object] = (),
     allowed_spot_ids: set[str] | None = None,
     existing_spot_ids: set[str] | None = None,
-    resolved_ambiguities: Sequence[object] = (),
-    has_viable_plan: bool = False,
 ) -> GuardResult:
-    """段5で使う `ask_user` 抑制ガード(G1〜G9)。段2からの呼び出しはない。
+    """`ask_user` の抑制ガード(§10 R4・A1〜A5)。
 
-    `intent` は旧 `Intent` enum(段2で廃止)の代わりに文字列で受ける。
-    段5でメインループの「意図」概念を再設計する際に見直すこと。
+    メイン(`main_agent.py`)・レコメンド SA(`recommend_agent.py`)・知識検索 SA
+    (`narration/search/agent.py` の ask コールバック経由)の 3 経路すべてが
+    `ask_execution.execute_ask_user` を通じて本関数を呼ぶ。カウンタ
+    (`ask_user_count`/`ask_streak`)はターン全体で合算する(R4・A2)。
+
+    `allowed_spot_ids`/`existing_spot_ids` を渡したときだけ A4(clarify の
+    選択肢が実在 spot_id に解決できるか)を検査する。呼び出し元が spot_id
+    以外の具体値(レコメンド SA の enum 値・知識検索の文書ラベル等)を使う
+    場合は渡さなくてよい(A4 はメインエージェントの clarify 専用の防御)。
     """
 
-    if question_count > 1:
-        return GuardResult(False, "G1", "1 ターンに聞ける質問は 1 問です")
+    if ask_user_count >= MAX_ASK_USER_PER_TURN:
+        return GuardResult(
+            False, "R4", "このターンで質問できる回数の上限(2回)に達しました"
+        )
+    if ask_streak >= MAX_ASK_STREAK:
+        return GuardResult(False, "A2", "質問を含むターンが連続しています")
     if (
         question.kind == "preference"
         and question.slot is not None
@@ -158,58 +161,33 @@ def validate_ask_user(
     ):
         return GuardResult(
             False,
-            "G2",
+            "A1",
             f"slot={question.slot.value} は質問済みです",
         )
-    if ask_streak >= 2:
-        return GuardResult(False, "G3", "ask_user が 2 ターン連続しています")
-    major_slots_empty = (
-        profile.party is None
-        and profile.mobility is None
-        and not profile.interests
-    )
-    if (
-        question.kind == "preference"
-        and question.slot is not None
-        and intent == "recommend"
-        and not has_non_question_step
-        and not (major_slots_empty and question.slot.value == "onboarding")
-    ):
-        return GuardResult(
-            False,
-            "G4",
-            "推薦要求を選好質問だけで終えることはできません",
-        )
     if not 2 <= len(question.options) <= 4:
-        return GuardResult(False, "G5", "選択肢は 2〜4 個にしてください")
+        return GuardResult(False, "A3", "選択肢は 2〜4 個にしてください")
     if any(
         not option.label.strip() or not option.value.strip()
         for option in question.options
     ):
-        return GuardResult(False, "G5", "空の選択肢は使えません")
+        return GuardResult(False, "A3", "空の選択肢は使えません")
     if question.kind == "clarify":
-        allowed = allowed_spot_ids or set()
-        existing = existing_spot_ids or set()
-        for option in question.options:
-            if option.value in _ALLOWED_INTERPRETATIONS:
-                continue
-            if option.value not in existing or option.value not in allowed:
-                return GuardResult(
-                    False,
-                    "G6",
-                    (
-                        "選択肢が参照可能な spot_id または既定の解釈に"
-                        f"解決しません: {option.value}"
-                    ),
-                )
+        if allowed_spot_ids is not None or existing_spot_ids is not None:
+            allowed = allowed_spot_ids or set()
+            existing = existing_spot_ids or set()
+            for option in question.options:
+                if option.value not in existing or option.value not in allowed:
+                    return GuardResult(
+                        False,
+                        "A4",
+                        f"選択肢が具体値に解決しません: {option.value}",
+                    )
         normalized_surface = _normalize_surface(question.surface or "")
         if normalized_surface in {
             _normalize_surface(surface)
             for surface in _resolved_surfaces(resolved_ambiguities)
         }:
-            return GuardResult(False, "G7", "同じ曖昧さは既に聞き返しています")
-    if has_viable_plan:
-        return GuardResult(False, "G9", "妥当な plan を出せるため聞き返しません")
+            return GuardResult(False, "A5", "同じ曖昧さは既に聞き返しています")
     return GuardResult(True)
 
 

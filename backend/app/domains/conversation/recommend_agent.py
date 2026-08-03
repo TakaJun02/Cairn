@@ -6,8 +6,10 @@
 `filter`(タグ・mobility・weather_fit・area・day)へ、1 回の guided JSON で
 翻訳する。
 
-段3では SA の Tool は `done` だけ(`ask_user` は段5で追加する。§4 の決定どお
-り、enum にも含めずプロンプトにも書かない)。
+SA の Tool は `done`(filter/assumptions)と `ask_user`(slot/reason/options)の
+anyOf 排他(§4 (a))。プロフィールが薄すぎるときだけ 1 回質問できる(A7)。
+`state`/`tools` を渡さない呼び出し元(既存テスト等)では `ask_user` 分岐自体を
+スキーマから外し、従来どおり `done` 単発判定のまま動く。
 
 **タグ 80 語(`static.tag_vocabulary`)と `mobility` の enum は、このモジュール
 のプロンプトにだけ載る。**メインエージェント(`prompts.py` の
@@ -33,8 +35,12 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.domains.conversation.ask_execution import execute_ask_user
 from app.domains.conversation.events import EventSinkLike, emit, state_event
 from app.domains.conversation.guards import has_repeated_ngram
+from app.domains.conversation.state import TurnState
+from app.domains.conversation.tool_ports import ConversationToolPort
+from app.domains.conversation.types import AskUserArgs, AskUserOption, Slot, slot_values
 from app.domains.recommendation.types import Mobility, RecommendationProfile, RecommendFilter
 
 logger = logging.getLogger("app.conversation.recommend_agent")
@@ -50,13 +56,14 @@ _MOBILITY_VALUES: tuple[str, ...] = tuple(value.value for value in Mobility)
 _SYSTEM_PROMPT_TEMPLATE = """あなたは鳥海山観光ガイダンスの
 レコメンドサブエージェントです。
 メインエージェントからの指示(自然文)とプロフィールをもとに、既存の推薦処理
-へ渡す filter を 1 回の JSON で決めてください。指定された JSON Schema の
+へ渡す filter を決めてください。指定された JSON Schema の
 JSON 1 個(thought + action)だけを出力し、説明文や Markdown は出しません。
 
 出力フィールドは thought → action の順で埋めます。thought は結論を出す前の
-1〜2 文の日本語です。action.tool は "done" 固定です
-(質問する手段は今回ありません。薄い情報でも仮定して推薦してください)。
-action.args は filter と assumptions です。
+1〜2 文の日本語です。action.tool は次のとおりです。
+- done: filter と assumptions を確定する。action.args は filter と
+  assumptions です。
+{ask_user_section}
 
 filter の項目:
 - tags: 推薦の手がかりになった生タグです。0〜{max_tags} 個。
@@ -79,11 +86,18 @@ assumptions: 情報が薄いまま置いた仮定を日本語の短文で列挙�
 仮定を置かなかった場合は空配列にします。
 
 境界:
-- 質問はできません。情報が薄くても、最も妥当な仮定を置いて filter を決め、
+- {ask_user_boundary}情報が薄くても、最も妥当な仮定を置いて filter を決め、
   置いた仮定は必ず assumptions に書いてください(推薦そのものを止めない)。
 - 指示・プロフィールから読み取れない項目は filter に書かず null のままに
   します。無理に埋めません。
 """
+
+_ASK_USER_SECTION_TEMPLATE = """- ask_user: プロフィールが著しく薄く、このまま
+  では的外れになりそうなときだけ、1 回だけ聞き返せます。action.args =
+  {{"slot":スロット名({slot_vocabulary} のどれか),"reason":質問文(専用
+  フォームにそのまま表示されます),"options":[{{"label":選択肢の表示文,
+  "value":選択肢を識別する短い値}}](2〜4 個)}}。回答は次の周に観測として
+  返ります。念のための確認には使いません。"""
 
 
 class GenerationPort(Protocol):
@@ -136,43 +150,117 @@ async def run_recommend_subagent(
     client: GenerationPort,
     event_sink: EventSinkLike = None,
     wallclock_sec: float = RECOMMEND_AGENT_WALLCLOCK_SEC,
+    state: TurnState | None = None,
+    tools: ConversationToolPort | None = None,
+    step_id: int = 0,
 ) -> RecommendActResult:
-    """`instruction` → `filter` の 1 回翻訳(§4 (a))。"""
+    """`instruction` → `filter` の翻訳(§4 (a))。
 
-    await emit(
-        event_sink,
-        state_event(
-            "step",
-            tool="recommend",
-            status="progress",
-            label_ja="指示を条件に翻訳しています",
-        ),
-    )
+    `state`/`tools` を渡すと `ask_user`(§4 (b))を許す: プロフィールが薄すぎる
+    と判断すれば 1 回だけ質問し(A7)、回答 → `update_profile` 再実行 →
+    更新後プロフィールで再判定してから `done` する。渡さない場合(既存の
+    呼び出し元・テスト)は `ask_user` 分岐自体をスキーマから外し、従来どおり
+    `done` の単発判定のまま動く。
+    """
+
+    ask_enabled = state is not None and tools is not None
+    asked = False
+    current_profile = profile
     vocabulary = list(dict.fromkeys(tag_vocabulary))
-    messages = build_recommend_agent_messages(
-        instruction=instruction, profile=profile, tag_vocabulary=vocabulary
-    )
-    schema = recommend_agent_guided_schema(vocabulary)
-    turn = await _call(client, messages, schema, wallclock_sec=wallclock_sec)
-    if turn is None:
-        return RecommendActResult(
-            filter=RecommendFilter(),
-            assumptions=[
-                "指示をうまく解釈できなかったため、条件を絞らずおすすめしました。"
-            ],
-            dropped=[],
-            degraded=True,
+
+    while True:
+        await emit(
+            event_sink,
+            state_event(
+                "step",
+                tool="recommend",
+                status="progress",
+                label_ja="指示を条件に翻訳しています",
+            ),
         )
-    sanitized_filter, dropped = _sanitize_filter(
-        turn.action.args.get("filter"), vocabulary
-    )
-    assumptions = _sanitize_assumptions(turn.action.args.get("assumptions"))
-    return RecommendActResult(
-        filter=RecommendFilter.model_validate(sanitized_filter),
-        assumptions=assumptions,
-        dropped=dropped,
-        degraded=False,
-    )
+        allow_ask = ask_enabled and not asked
+        messages = build_recommend_agent_messages(
+            instruction=instruction,
+            profile=current_profile,
+            tag_vocabulary=vocabulary,
+            allow_ask_user=allow_ask,
+        )
+        schema = recommend_agent_guided_schema(vocabulary, allow_ask_user=allow_ask)
+        turn = await _call(
+            client,
+            messages,
+            schema,
+            wallclock_sec=wallclock_sec,
+            allow_ask_user=allow_ask,
+        )
+        if turn is None:
+            return RecommendActResult(
+                filter=RecommendFilter(),
+                assumptions=[
+                    "指示をうまく解釈できなかったため、条件を絞らずおすすめしました。"
+                ],
+                dropped=[],
+                degraded=True,
+            )
+
+        if allow_ask and turn.action.tool == "ask_user":
+            asked = True  # A7: 質問できるのは 1 回まで。次周は allow_ask=False。
+            question = _parse_recommend_ask_args(turn.action.args)
+            if question is not None:
+                assert state is not None and tools is not None  # allow_ask が真の前提
+                outcome = await execute_ask_user(
+                    state,
+                    tools,
+                    question,
+                    step_id=step_id,
+                    client=client,
+                    event_sink=event_sink,
+                )
+                if outcome.executed:
+                    current_profile = RecommendationProfile.model_validate(
+                        state.profile.model_dump(mode="python")
+                    )
+            continue
+
+        sanitized_filter, dropped = _sanitize_filter(
+            turn.action.args.get("filter"), vocabulary
+        )
+        assumptions = _sanitize_assumptions(turn.action.args.get("assumptions"))
+        return RecommendActResult(
+            filter=RecommendFilter.model_validate(sanitized_filter),
+            assumptions=assumptions,
+            dropped=dropped,
+            degraded=False,
+        )
+
+
+def _parse_recommend_ask_args(raw_args: Mapping[str, Any]) -> AskUserArgs | None:
+    """SA の `ask_user{slot,reason,options}` を `AskUserArgs` へ正規化する。
+
+    guided decoding のスキーマがほとんどを防ぐが、モック・逸脱応答に備えて
+    ここでも検証する。壊れていれば None を返し、呼び出し元は質問を実行せず
+    次周(`allow_ask=False`)で `done` を確定させる(推薦を止めない。NFR-5)。
+    """
+
+    slot_raw = raw_args.get("slot")
+    reason_raw = raw_args.get("reason")
+    options_raw = raw_args.get("options")
+    if not isinstance(slot_raw, str) or not isinstance(reason_raw, str):
+        return None
+    if not isinstance(options_raw, list):
+        return None
+    try:
+        slot = Slot(slot_raw)
+        options = [
+            AskUserOption(
+                label=str(option.get("label", "")), value=str(option.get("value", ""))
+            )
+            for option in options_raw
+            if isinstance(option, Mapping)
+        ]
+        return AskUserArgs(kind="preference", slot=slot, reason=reason_raw, options=options)
+    except (ValueError, ValidationError):
+        return None
 
 
 async def _call(
@@ -181,9 +269,11 @@ async def _call(
     schema: dict[str, Any],
     *,
     wallclock_sec: float,
+    allow_ask_user: bool = False,
 ) -> _RecommendActTurn | None:
     """1 回の guided JSON 呼び出し。契約違反時は 1 回だけ再試行する。"""
 
+    allowed_tools = {"done", "ask_user"} if allow_ask_user else {"done"}
     attempt_messages = messages
     for attempt in range(2):
         try:
@@ -206,7 +296,7 @@ async def _call(
             if has_repeated_ngram(raw):
                 raise ValueError("同一 n-gram の反復を検知しました")
             parsed = _RecommendActTurn.model_validate(json.loads(raw))
-            if parsed.action.tool != "done":
+            if parsed.action.tool not in allowed_tools:
                 raise ValueError(f"未対応の tool です: {parsed.action.tool}")
             return parsed
         except asyncio.CancelledError:
@@ -236,6 +326,7 @@ def build_recommend_agent_messages(
     instruction: str,
     profile: RecommendationProfile,
     tag_vocabulary: list[str],
+    allow_ask_user: bool = False,
 ) -> list[dict[str, str]]:
     """SA のプロンプトを組み立てる。タグ 80 語・mobility の enum はここにだけ載る。"""
 
@@ -245,6 +336,16 @@ def build_recommend_agent_messages(
             "、".join(tag_vocabulary) if tag_vocabulary else "(語彙が空のため tags は使えません)"
         ),
         mobility_vocabulary="、".join(f'"{value}"' for value in _MOBILITY_VALUES),
+        ask_user_section=(
+            _ASK_USER_SECTION_TEMPLATE.format(slot_vocabulary=" | ".join(slot_values()))
+            if allow_ask_user
+            else ""
+        ),
+        ask_user_boundary=(
+            "質問できるのは 1 回までです。2 回目以降は聞かず、"
+            if allow_ask_user
+            else "質問はできません。"
+        ),
     )
     dynamic = "\n\n".join(
         [
@@ -258,8 +359,17 @@ def build_recommend_agent_messages(
     ]
 
 
-def recommend_agent_guided_schema(tag_vocabulary: list[str]) -> dict[str, Any]:
-    """xgrammar 互換の schema。`uniqueItems` は使わない(未実装のため)。"""
+def recommend_agent_guided_schema(
+    tag_vocabulary: list[str],
+    *,
+    allow_ask_user: bool = False,
+) -> dict[str, Any]:
+    """xgrammar 互換の schema。`uniqueItems` は使わない(未実装のため)。
+
+    `allow_ask_user=False`(既定。既存の呼び出し元との完全互換)では
+    `action` は `tool` enum が `["done"]` の平坦なオブジェクトのまま返す。
+    `True` のときだけ `done`/`ask_user` の anyOf 排他に広げる(§4 (a))。
+    """
 
     tag_item_schema: dict[str, Any] = (
         {"type": "string", "enum": tag_vocabulary} if tag_vocabulary else {"type": "string"}
@@ -285,31 +395,66 @@ def recommend_agent_guided_schema(tag_vocabulary: list[str]) -> dict[str, Any]:
         "required": ["tags", "mobility", "weather_fit", "area", "day"],
         "additionalProperties": False,
     }
+    done_branch = {
+        "type": "object",
+        "properties": {
+            "tool": {"type": "string", "enum": ["done"]},
+            "args": {
+                "type": "object",
+                "properties": {
+                    "filter": filter_schema,
+                    "assumptions": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": MAX_ASSUMPTIONS,
+                    },
+                },
+                "required": ["filter", "assumptions"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["tool", "args"],
+        "additionalProperties": False,
+    }
+    action_schema: dict[str, Any] = done_branch
+    if allow_ask_user:
+        ask_user_branch = {
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "enum": ["ask_user"]},
+                "args": {
+                    "type": "object",
+                    "properties": {
+                        "slot": {"type": "string", "enum": slot_values()},
+                        "reason": {"type": "string", "minLength": 1},
+                        "options": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {"type": "string", "minLength": 1},
+                                    "value": {"type": "string", "minLength": 1},
+                                },
+                                "required": ["label", "value"],
+                                "additionalProperties": False,
+                            },
+                            "minItems": 2,
+                            "maxItems": 4,
+                        },
+                    },
+                    "required": ["slot", "reason", "options"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["tool", "args"],
+            "additionalProperties": False,
+        }
+        action_schema = {"anyOf": [done_branch, ask_user_branch]}
     return {
         "type": "object",
         "properties": {
             "thought": {"type": "string", "minLength": 1},
-            "action": {
-                "type": "object",
-                "properties": {
-                    "tool": {"type": "string", "enum": ["done"]},
-                    "args": {
-                        "type": "object",
-                        "properties": {
-                            "filter": filter_schema,
-                            "assumptions": {
-                                "type": "array",
-                                "items": {"type": "string", "minLength": 1},
-                                "maxItems": MAX_ASSUMPTIONS,
-                            },
-                        },
-                        "required": ["filter", "assumptions"],
-                        "additionalProperties": False,
-                    },
-                },
-                "required": ["tool", "args"],
-                "additionalProperties": False,
-            },
+            "action": action_schema,
         },
         "required": ["thought", "action"],
         "additionalProperties": False,

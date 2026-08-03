@@ -29,12 +29,14 @@ from app.domains.conversation.types import (
     TrajectoryStep,
     pred_values,
     preference_values,
+    slot_values,
 )
 from app.domains.recommendation.types import Mobility
 
 _PREFERENCE_VOCABULARY = " | ".join(preference_values())
 _MOBILITY_VOCABULARY = " | ".join(f'"{value.value}"' for value in Mobility)
 _PRED_VOCABULARY = " | ".join(pred_values())
+_SLOT_VOCABULARY = " | ".join(slot_values())
 _JAPAN_TZ = ZoneInfo("Asia/Tokyo")
 _WEEKDAYS_JA = ("月", "火", "水", "木", "金", "土", "日")
 
@@ -83,7 +85,7 @@ JSON 1 個(thought + action)だけを出力してください。説明文や Mar
 出力フィールドは thought → action の順で埋めます。thought は結論を出す前の
 1〜2 文の日本語です。
 
-Tool(action.tool)は次の 5 つです。1 周につき 1 つだけ選びます。
+Tool(action.tool)は次の 6 つです。1 周につき 1 つだけ選びます。
 - recommend: おすすめのスポットを探す。args = {{"instruction": 自然文}}。
   件数(k=5)はコードが固定するので書きません。
 - plan_itinerary: 旅程がまだ無いときに新規作成する。
@@ -98,19 +100,31 @@ Tool(action.tool)は次の 5 つです。1 周につき 1 つだけ選びます�
   "notes":文字列 または null}}
 - search_knowledge: 由来・歴史・注意事項などを調べる。
   args = {{"request":自然文,"spot_name":スポット名 または null}}
+- ask_user: ユーザーに聞き返す(取り違えが目視できない場面だけ)。
+  args = {{"kind":"preference"|"clarify",
+  "slot":kind=preference のとき次のどれか({_SLOT_VOCABULARY}) それ以外は null,
+  "surface":kind=clarify のとき聞き返す表層形(元発話の一部) それ以外は null,
+  "reason":質問文(専用フォームにそのまま表示される),
+  "options":[{{"label":選択肢の表示文,"value":kind=clarify のときスポット名。
+  kind=preference のときは選択肢を識別する短い値}}](2〜4 個)}}。
+  回答は同じターンの軌跡に返ります(ターンは中断しません)。
 - done: このターンで打つ手を終える。args = {{}}。
   done を選んだ後、あなた自身は応答文を書きません(respond が別に書きます)。
 
 境界(必ず守ること):
 - あなたはスポットを常に**名前**で扱います。spot_id を見ることも書くこともあり
   ません。旅程・候補・履歴に出てくる地点はすべて名前で書かれています。
+  ask_user(kind=clarify)の options[].value もスポット**名**で書いてください
+  (コードが解決できなければその質問は実行されません)。
 - 1 ターンに recommend / plan_itinerary / edit_itinerary / search_knowledge を
   複数回選べます。旅程の書き換えも 1 ターンに複数回行えます。
 - 直前までの軌跡(⑤)を見て、既に得た情報を無駄にせず次の一手を決めます。
   同じ Tool を同じ引数でもう一度選ばないでください(実行されません)。
-- 質問して確認する手段は今はありません。日付・時刻・起点などが不明なときは
-  最も妥当な仮定を置いて進めてください(置いた仮定は Tool の結果に現れ、
-  最後の応答で必ず説明されます)。
+- ask_user は「聞かないと取り違えが起きる」場面だけに使います(候補が複数の
+  同名地点に解ける・破壊的操作の解釈が割れる等)。日付・時刻・起点などが
+  薄いだけなら、最も妥当な仮定を置いて進めてください(置いた仮定は Tool の
+  結果に現れ、最後の応答で必ず説明されます)。ask_user は 1 ターンに 2 回まで
+  です。同じ slot・同じ曖昧さを 2 回聞いてはいけません。
 - constraints はあなたが直接書きます。述語(pred)は次の 17 種のどれかです:
   {_PRED_VOCABULARY}
   args の中身は述語ごとに異なります(例: require/exclude/first/last は
@@ -148,10 +162,18 @@ def build_update_profile_messages(
     state: TurnState,
     *,
     now: datetime | None = None,
+    utterance_override: str | None = None,
 ) -> list[dict[str, str]]:
-    """N1.5 `update_profile` 用のプロンプト。会話履歴 + 最新発話が入力である。"""
+    """N1.5 `update_profile` 用のプロンプト。会話履歴 + 最新発話が入力である。
+
+    `utterance_override` は `ask_user` の回答に対して本ステップをターン内で
+    もう 1 回走らせるとき(§2・§7)に使う。`state.utterance`(このターンの
+    元発話)自体は書き換えない — メインループの ⑥ はターンを通じて元発話の
+    ままにする(質問と回答は既に軌跡/履歴に残るため)。
+    """
 
     del now  # 日付情報は不要(understand/respond と異なり期日解釈をしない)
+    utterance = utterance_override if utterance_override is not None else state.utterance
     vocab = [
         {"spot_id": spot_id, "name_ja": state.spot_names.get(spot_id, spot_id)}
         for spot_id in state.spot_id_vocab
@@ -161,7 +183,7 @@ def build_update_profile_messages(
             "① 現在のプロフィール:\n" + _compact_json(state.profile.model_dump(mode="json")),
             "② 参照可能な spot_id 語彙:\n" + _compact_json(vocab),
             "③ 会話履歴:\n" + (state.history or "(なし)"),
-            "④ ユーザーの発話:\n" + state.utterance,
+            "④ ユーザーの発話:\n" + utterance,
         ]
     )
     return [
@@ -259,29 +281,32 @@ def build_respond_messages(
     ]
 
 
-def main_agent_guided_schema(constraint_ids: list[str] | None = None) -> dict[str, Any]:
+def main_agent_guided_schema(
+    constraint_ids: list[str] | None = None,
+    *,
+    allow_ask_user: bool = True,
+) -> dict[str, Any]:
     """xgrammar 互換の schema。分岐ごとに `tool` の enum を排他にする。
 
     `uniqueItems` は意図的に一切使わない(xgrammar 未実装のため)。
+    `allow_ask_user=False` は R4/A2(§10)の上限に達したとき、呼び出し元
+    (`main_agent.py`)がこの周だけ `ask_user` を分岐から外すために使う。
     """
 
+    branches = [
+        _tool_action_schema("recommend", _recommend_args_schema()),
+        _tool_action_schema("plan_itinerary", _plan_itinerary_args_schema(constraint_ids)),
+        _tool_action_schema("edit_itinerary", _edit_itinerary_args_schema(constraint_ids)),
+        _tool_action_schema("search_knowledge", _search_knowledge_args_schema()),
+    ]
+    if allow_ask_user:
+        branches.append(_tool_action_schema("ask_user", _ask_user_args_schema()))
+    branches.append(_tool_action_schema("done", _empty_args_schema()))
     return {
         "type": "object",
         "properties": {
             "thought": {"type": "string", "minLength": 1},
-            "action": {
-                "anyOf": [
-                    _tool_action_schema("recommend", _recommend_args_schema()),
-                    _tool_action_schema(
-                        "plan_itinerary", _plan_itinerary_args_schema(constraint_ids)
-                    ),
-                    _tool_action_schema(
-                        "edit_itinerary", _edit_itinerary_args_schema(constraint_ids)
-                    ),
-                    _tool_action_schema("search_knowledge", _search_knowledge_args_schema()),
-                    _tool_action_schema("done", _empty_args_schema()),
-                ]
-            },
+            "action": {"anyOf": branches},
         },
         "required": ["thought", "action"],
         "additionalProperties": False,
@@ -342,6 +367,38 @@ def _search_knowledge_args_schema() -> dict[str, Any]:
             "spot_name": _nullable_string(min_length=1),
         },
         "required": ["request", "spot_name"],
+        "additionalProperties": False,
+    }
+
+
+def _ask_user_option_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "label": {"type": "string", "minLength": 1},
+            "value": {"type": "string", "minLength": 1},
+        },
+        "required": ["label", "value"],
+        "additionalProperties": False,
+    }
+
+
+def _ask_user_args_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["preference", "clarify"]},
+            "slot": {"anyOf": [{"type": "null"}, {"type": "string", "enum": slot_values()}]},
+            "surface": _nullable_string(min_length=1),
+            "reason": {"type": "string", "minLength": 1},
+            "options": {
+                "type": "array",
+                "items": _ask_user_option_schema(),
+                "minItems": 2,
+                "maxItems": 4,
+            },
+        },
+        "required": ["kind", "slot", "surface", "reason", "options"],
         "additionalProperties": False,
     }
 

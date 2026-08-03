@@ -181,6 +181,7 @@ def test_main_agent_guided_schema_has_exclusive_tool_enum_per_branch() -> None:
         ["plan_itinerary"],
         ["edit_itinerary"],
         ["search_knowledge"],
+        ["ask_user"],
         ["done"],
     ]
     for branch in branches:

@@ -4,22 +4,28 @@
 組み立てて 1 回 LLM を呼び、`{"thought","action":{"tool","args"}}` を受け取り、
 Tool を実行して軌跡(§3.1 ⑤)へ積み、次の周へ進む。`done` でループを終える。
 
-段2の Tool enum は `recommend` / `plan_itinerary` / `edit_itinerary` /
-`search_knowledge` / `done` の5つ。`ask_user` は段5で追加する。
+Tool enum は `recommend` / `plan_itinerary` / `edit_itinerary` /
+`search_knowledge` / `ask_user` / `done` の6つ。`ask_user` は結果(回答)を
+軌跡へ持ち帰る通常の Tool である(§7。ターンは中断しない)。
 
 既存 Tool(`tool_adapters.ToolAdapters`)は spot_id ベースの契約のまま変更しない。
 このモジュールが「メインエージェントが書いたスポット名 → spot_id」の変換と、
 その逆(結果 → 名前空間ダイジェスト)を橋渡しする。
 
-段3で `recommend` の `_dispatch_recommend` はレコメンドサブエージェント
-(`recommend_agent.run_recommend_subagent`)を経由するようになった。
-`instruction`(自然言語)→ `filter` の翻訳はそちらが guided decoding で行い、
-このモジュールは翻訳結果をそのまま既存 Tool へ渡すだけである(§4)。
+`recommend` の `_dispatch_recommend` はレコメンドサブエージェント
+(`recommend_agent.run_recommend_subagent`)を経由する。`instruction`
+(自然言語)→ `filter` の翻訳はそちらが guided decoding で行い、このモジュールは
+翻訳結果をそのまま既存 Tool へ渡すだけである(§4)。
 
-段4で `plan_itinerary`/`edit_itinerary` は旅程計画サブエージェント
-(`itinerary_subagent.run_plan_itinerary`/`run_edit_itinerary`)を経由する
-ようになった。名寄せ本実装・フロー1〜4はそちらに集約されている(§5)。
-このモジュールは Tool 選択・ループ制御(§3・§10)だけを持つ。
+`plan_itinerary`/`edit_itinerary` は旅程計画サブエージェント
+(`itinerary_subagent.run_plan_itinerary`/`run_edit_itinerary`)を経由する。
+名寄せ本実装・フロー1〜4はそちらに集約されている(§5)。
+
+`ask_user` の実行(ガード検査 → HITL 待ち受け → 状態更新 → update_profile
+再実行)は `ask_execution.execute_ask_user` に集約する。レコメンド SA
+(`recommend_agent.py`)・知識検索 SA(narration 側のアダプタ経由)と共通。
+
+このモジュールは Tool 選択・ループ制御(§3・§10)を持つ。
 """
 
 from __future__ import annotations
@@ -34,8 +40,13 @@ from typing import Any, Protocol
 from pydantic import ValidationError
 
 from app.core.llm import GenerationError
+from app.domains.conversation.ask_execution import execute_ask_user
 from app.domains.conversation.events import EventSinkLike, emit, error_event, state_event
-from app.domains.conversation.guards import has_repeated_ngram
+from app.domains.conversation.guards import (
+    MAX_ASK_STREAK,
+    MAX_ASK_USER_PER_TURN,
+    has_repeated_ngram,
+)
 from app.domains.conversation.history import estimate_tokens
 from app.domains.conversation.itinerary_subagent import (
     active_constraint_ids,
@@ -53,12 +64,15 @@ from app.domains.conversation.recommendation_context import build_recommendation
 from app.domains.conversation.state import CandidateReference, DegradedState, TurnState
 from app.domains.conversation.tool_ports import ConversationToolPort
 from app.domains.conversation.types import (
+    AskUserArgs,
+    AskUserOption,
     MainAgentTurn,
     MainRecommendArgs,
     MainSearchKnowledgeArgs,
     MainToolName,
     RecommendArgs,
     SearchKnowledgeArgs,
+    Slot,
     ToolError,
     ToolErrorCode,
     ToolResult,
@@ -96,6 +110,10 @@ _STEP_LABELS: dict[str, dict[str, str]] = {
     "search_knowledge": {
         "started": "資料を調べています",
         "finished": "調査結果をまとめました",
+    },
+    "ask_user": {
+        "started": "質問を準備しています",
+        "finished": "回答を受け取りました",
     },
 }
 
@@ -161,10 +179,16 @@ async def run_main_agent(
             reduced = True
             messages = build_main_agent_messages(state, reduced=True)
 
+        # R4/A2(§10): 上限に達した周は ask_user をスキーマから外す(縮小
+        # スキーマではなく、6 分岐のうち ask_user だけを外した 5 分岐)。
+        allow_ask = (
+            state.ask_user_count < MAX_ASK_USER_PER_TURN
+            and state.ask_streak < MAX_ASK_STREAK
+        )
         schema = (
             main_agent_done_only_schema()
             if reduced
-            else main_agent_guided_schema(constraint_ids)
+            else main_agent_guided_schema(constraint_ids, allow_ask_user=allow_ask)
         )
         turn = await _call_main_agent(
             client, messages, schema, wallclock_sec=wallclock_sec
@@ -360,7 +384,13 @@ async def _dispatch(
         if tool == MainToolName.EDIT_ITINERARY.value:
             return await run_edit_itinerary(state, tools, raw_args, step_id)
         if tool == MainToolName.SEARCH_KNOWLEDGE.value:
-            return await _dispatch_search_knowledge(state, tools, raw_args, step_id)
+            return await _dispatch_search_knowledge(
+                state, tools, raw_args, step_id, client=client, event_sink=event_sink
+            )
+        if tool == MainToolName.ASK_USER.value:
+            return await _dispatch_ask_user(
+                state, tools, raw_args, step_id, client=client, event_sink=event_sink
+            )
     except Exception as exc:  # noqa: BLE001 - Tool 実装からの漏れも結果へ閉じる(C6)
         logger.exception("main_agent_dispatch_failed", extra={"tool": tool})
         error = ToolError(
@@ -405,6 +435,9 @@ async def _dispatch_recommend(
         tag_vocabulary=state.tag_vocabulary,
         client=client,
         event_sink=event_sink,
+        state=state,
+        tools=tools,
+        step_id=step_id,
     )
     if act_result.degraded:
         state.degraded.append(
@@ -443,6 +476,9 @@ async def _dispatch_search_knowledge(
     tools: ConversationToolPort,
     raw_args: dict[str, Any],
     step_id: int,
+    *,
+    client: GenerationPort,
+    event_sink: EventSinkLike,
 ) -> tuple[str, dict[str, Any] | None]:
     parsed = MainSearchKnowledgeArgs.model_validate(raw_args)
     spot_id: str | None = None
@@ -452,15 +488,123 @@ async def _dispatch_search_knowledge(
         spot_id = context.resolve(parsed.spot_name)
         if spot_id is None:
             dropped.append(parsed.spot_name)
+
+    async def ask_callback(
+        *,
+        kind: str,
+        slot: str | None = None,
+        surface: str | None = None,
+        reason: str,
+        options: list[dict[str, str]],
+    ) -> str:
+        """§6: narration → conversation の逆依存を作らない ask コールバック(port)。
+
+        narration 側は `kind`/`slot`/`surface`/`reason`/`options`(label/value
+        の dict。narration_qa.md §2 の `{kind, slot?/surface?, reason,
+        options}` と同じ形)と観測文字列だけを知る。ガード・HITL 待ち受け・
+        状態更新は `ask_execution.execute_ask_user` に委譲する
+        (update_profile は知識検索の聞き返しでは回さない。§6 の対象外)。
+        """
+
+        parsed_options = [
+            AskUserOption(
+                label=str(option.get("label", "")),
+                value=str(option.get("value") or option.get("label", "")),
+            )
+            for option in options
+        ]
+        try:
+            if kind == "preference":
+                question = AskUserArgs(
+                    kind="preference",
+                    slot=Slot(slot) if slot else None,
+                    reason=reason,
+                    options=parsed_options,
+                )
+            else:
+                question = AskUserArgs(
+                    kind="clarify",
+                    surface=surface,
+                    reason=reason,
+                    options=parsed_options,
+                )
+        except (ValueError, ValidationError) as exc:
+            return (
+                f"質問を確定できませんでした(契約違反: {exc})。"
+                "最も確からしい解釈を採り、仮定を明示して進めてください。"
+            )
+        outcome = await execute_ask_user(
+            state,
+            tools,
+            question,
+            step_id=step_id,
+            client=client,
+            event_sink=event_sink,
+            run_update_profile=False,
+        )
+        return outcome.digest
+
     result = await tools.search_knowledge(
         step_id=step_id,
         args=SearchKnowledgeArgs(request=parsed.request, spot_id=spot_id),
+        ask_callback=ask_callback,
     )
     if isinstance(result, ToolError):
         return result.message_ja, _error_payload(result)
     state.step_results[step_id] = result
     digest = _format_search_digest(result.data, dropped=dropped)
     return digest, None
+
+
+async def _dispatch_ask_user(
+    state: TurnState,
+    tools: ConversationToolPort,
+    raw_args: dict[str, Any],
+    step_id: int,
+    *,
+    client: GenerationPort,
+    event_sink: EventSinkLike,
+) -> tuple[str, dict[str, Any] | None]:
+    """メインエージェント自身の `ask_user`(§3.3・§7)。
+
+    メインエージェントは spot_id を見ない・書かないため(§3.3)、
+    `kind=clarify` の `options[].value` はスポット**名**で書かれる。ここで
+    名前 → spot_id を解決してから `ask_execution.execute_ask_user` へ渡す。
+    1 つでも解決できなければ質問そのものを実行しない(A4)。
+    """
+
+    parsed = AskUserArgs.model_validate(raw_args)
+    if parsed.kind == "clarify":
+        context = _name_context(state)
+        unresolved: list[str] = []
+        resolved_options: list[AskUserOption] = []
+        for option in parsed.options:
+            spot_id = context.resolve(option.value)
+            if spot_id is None:
+                unresolved.append(option.value)
+            else:
+                resolved_options.append(AskUserOption(label=option.label, value=spot_id))
+        if unresolved:
+            return (
+                "質問を確定できませんでした"
+                f"({'、'.join(unresolved)} を地点として解決できません)。"
+                "最も妥当な解釈を採って進めてください。",
+                None,
+            )
+        parsed = parsed.model_copy(update={"options": resolved_options})
+
+    allowed_spot_ids = set(state.spot_catalog)
+    outcome = await execute_ask_user(
+        state,
+        tools,
+        parsed,
+        step_id=step_id,
+        client=client,
+        event_sink=event_sink,
+        allowed_spot_ids=allowed_spot_ids,
+        existing_spot_ids=allowed_spot_ids,
+    )
+    return outcome.digest, outcome.error
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node tests/b14.test.js",
+    "test": "node --test tests/",
     "preview": "vite preview"
   },
   "dependencies": {

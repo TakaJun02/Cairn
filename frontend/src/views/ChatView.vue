@@ -14,7 +14,7 @@ import OC_ChatInput from '@/components/OC_ChatInput.vue';
 
 const userStore = useUserStore()
 const chatStore = useChatStore()
-const { messages, isLoading, isSessionLoaded, isUndoing, currentPrompt } = storeToRefs(chatStore)
+const { messages, isLoading, isSessionLoaded, isUndoing, currentPrompt, isAnswering } = storeToRefs(chatStore)
 
 const messagesContainer = ref(null);
 
@@ -22,6 +22,11 @@ const chatInputText = ref('');
 const isPromptDismissed = ref(false);
 
 const isAskUserFormVisible = computed(() => Boolean(currentPrompt.value) && !isPromptDismissed.value);
+
+// 質問フォーム表示中は下の通常入力欄を塞がない(frontend_nav.md §2.3.1 の
+// 5)。isLoading はターン全体(質問待ちの間も含む)を表すため、これで
+// そのまま「送信不可」にすると回答できなくなる。
+const isChatInputBlocked = computed(() => isLoading.value && !currentPrompt.value);
 
 // --- Dynamic placeholder for input ---
 const placeholderText = computed(() => {
@@ -77,7 +82,7 @@ function handlePromptOption(option) {
 }
 
 function handlePromptAnswer(answer) {
-  void chatStore.sendMessage(answer)
+  void chatStore.sendAnswer(answer)
 }
 
 function handlePromptDismiss() {
@@ -183,16 +188,16 @@ onMounted(() => {
       <OC_AskUserForm
         v-if="isAskUserFormVisible"
         :prompt="currentPrompt"
-        :is-sending="isLoading"
+        :is-sending="isAnswering"
         @select-option="handlePromptOption"
         @answer="handlePromptAnswer"
         @dismiss="handlePromptDismiss"
       />
-      <OC_ChatInput 
-        v-model="chatInputText" 
-        @sendMessage="handleSendMessage" 
+      <OC_ChatInput
+        v-model="chatInputText"
+        @sendMessage="handleSendMessage"
         @stop="chatStore.stopStreaming"
-        :is-sending="isLoading" 
+        :is-sending="isChatInputBlocked"
         :placeholder="placeholderText"
       />
     </div>

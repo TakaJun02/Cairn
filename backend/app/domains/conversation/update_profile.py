@@ -87,16 +87,21 @@ async def update_profile(
     client: GenerationPort | None = None,
     event_sink: EventSinkLike = None,
     wallclock_sec: float = UPDATE_PROFILE_WALLCLOCK_SEC,
+    utterance_override: str | None = None,
 ) -> TurnState:
     """`state.profile` / `profile_delta` / `score_adjustments` を埋める。
 
     guided decoding や通信が失敗しても例外は上げず、このターンは差分なし
     として続行する（後続ノードを止めない。NFR-5）。
+
+    `utterance_override` を渡すと、`ask_user` の回答文に対して本ステップを
+    ターン内でもう 1 回実行できる(§2・§7: 回答 → プロフィール更新 →
+    更新後プロフィールで続行)。
     """
 
     resolved_client = client or GenerationClient()
     schema = update_profile_guided_schema(state.spot_id_vocab)
-    messages = build_update_profile_messages(state)
+    messages = build_update_profile_messages(state, utterance_override=utterance_override)
     started_at = time.perf_counter()
     output: UpdateProfileOutput | None = None
     failure: str | None = None

@@ -7,9 +7,16 @@ import {
   apiUrl,
   bearerHeaders,
   getThread,
+  postChatAnswer,
   undoItinerary as requestItineraryUndo,
 } from '@/lib/api'
+import { buildChipAnswerPayload, buildFreeTextAnswerPayload } from '@/lib/askAnswer'
 import { createSseParser } from '@/lib/sse'
+
+// ask_user の回答待ち(chat_sse.md §1.4)。リロード後などライブな SSE
+// ストリームが無い状態で回答したときのフォールバック用ポーリング間隔・上限。
+const ANSWER_POLL_INTERVAL_MS = 1500
+const ANSWER_POLL_MAX_ATTEMPTS = 40
 
 function clientId() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -84,8 +91,17 @@ export const useChatStore = defineStore('chat', () => {
   const profile = ref(null)
   const currentPrompt = ref(null)
   const isUndoing = ref(false)
+  // POST /chat/answer 自体の送信中だけを表す(ターン全体の isLoading とは
+  // 別。ask_user 待機中も isLoading は true のままなので、フォームの
+  // ボタンをそれで無効化すると回答できなくなる)。
+  const isAnswering = ref(false)
 
   let activeController = null
+  // ライブな /chat SSE ストリームが読み進み中かどうか。true の間は
+  // sendAnswer が POST /chat/answer するだけでよい(続きは同じストリームが
+  // 運ぶ)。false ならリロード等でストリームが無いので、GET /thread の
+  // ポーリングで取り直す(chat_sse.md §1.5)。
+  let isStreamActive = false
 
   const clearPrompt = () => {
     currentPrompt.value = null
@@ -124,6 +140,9 @@ export const useChatStore = defineStore('chat', () => {
       case 'ask_user':
       case 'clarify':
         setPrompt(state)
+        // ローディング表示を「回答待ち」に切り替える(質問フォームは別途
+        // 表示されるが、スピナーの文言もそれと分かるようにしておく)。
+        message.statusText = '回答をお待ちしています'
         break
       case 'profile':
         profile.value = state.profile
@@ -160,17 +179,26 @@ export const useChatStore = defineStore('chat', () => {
         message.serverId = data?.message_id ?? null
         message.statusText = ''
         message.isPending = false
+        // ターンが終われば生きた待機は無い(§7)。答えそびれた質問が
+        // あっても(タイムアウト等)、ここで確実にフォームを消す。
+        clearPrompt()
         break
       default:
         console.warn('[ChatStore] Unknown SSE event:', event)
     }
   }
 
-  async function sendMessage(userInput, resolves = null) {
+  async function sendMessage(userInput) {
     const content = String(userInput || '').trim()
     if (!content || isLoading.value) return false
 
-    const promptAtSend = currentPrompt.value
+    // 質問フォーム表示中は、通常入力欄からの送信も /chat/answer に回す
+    // (frontend_nav.md §2.3.1 の 5: 下の入力欄は塞がないが、回答待ちの間は
+    // その送信先を切り替える)。
+    if (currentPrompt.value) {
+      return sendAnswer(content)
+    }
+
     isLoading.value = true
     messages.value.push({
       id: clientId(),
@@ -197,6 +225,7 @@ export const useChatStore = defineStore('chat', () => {
 
     const controller = new AbortController()
     activeController = controller
+    isStreamActive = true
     let receivedDone = false
 
     try {
@@ -208,10 +237,7 @@ export const useChatStore = defineStore('chat', () => {
           Accept: 'text/event-stream',
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          message: content,
-          ...(resolves && { resolves }),
-        }),
+        body: JSON.stringify({ message: content }),
       })
 
       if (!response.ok) {
@@ -238,6 +264,9 @@ export const useChatStore = defineStore('chat', () => {
       })
       const reader = response.body.getReader()
 
+      // ask_user/clarify を受けても、このループは回答を待つあいだも
+      // 回り続ける(ストリームは開いたまま。§7)。回答は sendAnswer が
+      // POST /chat/answer で送り、続きのイベントは同じ reader が受ける。
       while (!receivedDone) {
         const { value, done } = await reader.read()
         if (done) break
@@ -249,7 +278,6 @@ export const useChatStore = defineStore('chat', () => {
       if (!receivedDone && !controller.signal.aborted) {
         throw new Error('応答ストリームが完了前に切断されました。')
       }
-      if (currentPrompt.value === promptAtSend) clearPrompt()
       return true
     } catch (error) {
       if (error?.name === 'AbortError') {
@@ -267,6 +295,7 @@ export const useChatStore = defineStore('chat', () => {
     } finally {
       aiMessage.isPending = false
       aiMessage.statusText = ''
+      isStreamActive = false
       if (activeController === controller) {
         activeController = null
         isLoading.value = false
@@ -278,17 +307,89 @@ export const useChatStore = defineStore('chat', () => {
     activeController?.abort()
   }
 
+  /**
+   * `ask_user` への回答(chat_sse.md §1.4)。`POST /api/v1/chat/answer` は
+   * 204 のみを返し、イベントはすべて元の SSE ストリームに流れる。
+   * ライブなストリームが読み進み中ならここでは何もしなくてよい(reader が
+   * 続きを運ぶ)。無ければ(リロード後等)GET /thread をポーリングして
+   * 取り直す。
+   */
+  async function sendAnswer(answerText, resolves = null) {
+    const payload = resolves
+      ? { answer: String(answerText ?? '').trim(), resolves }
+      : buildFreeTextAnswerPayload(answerText)
+    if (!payload || isAnswering.value) return false
+
+    messages.value.push({
+      id: clientId(),
+      content: payload.answer,
+      sender: 'user',
+      timestamp: new Date(),
+    })
+    // 送った時点でフォームを消す(サーバー側の pending も即時クリアされる。
+    // 23_ux_issues.md §6-8: 古い質問への回答送信を防ぐため、フォームは
+    // 常に「いま回答を待っている質問」だけを表示する)。
+    clearPrompt()
+
+    isAnswering.value = true
+    try {
+      await postChatAnswer(payload)
+      if (!isStreamActive) {
+        await waitForTurnToFinishThenRefresh()
+      }
+      return true
+    } catch (error) {
+      console.error('[ChatStore] Failed to send answer:', error)
+      const target = messages.value.findLast((value) => value.sender === 'ai')
+      if (target) {
+        target.error = error?.status === 409
+          ? 'この質問への回答受付は終了しました。もう一度お試しください。'
+          : (error?.message || '回答を送信できませんでした。')
+      }
+      return false
+    } finally {
+      isAnswering.value = false
+    }
+  }
+
+  /**
+   * ライブな SSE ストリームが無い状態(リロード後等)で回答したときの
+   * フォールバック。GET /thread を「新しいターンの決着がつくまで」
+   * ポーリングし、届いたらセッション全体を取り直す(chat_sse.md §1.5)。
+   */
+  async function waitForTurnToFinishThenRefresh() {
+    const messageCountBefore = messages.value.filter((value) => value.serverId != null).length
+    isLoading.value = true
+    try {
+      for (let attempt = 0; attempt < ANSWER_POLL_MAX_ATTEMPTS; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, ANSWER_POLL_INTERVAL_MS))
+        let session = null
+        try {
+          session = await getThread()
+        } catch (error) {
+          console.error('[ChatStore] Failed to poll thread after answer:', error)
+          continue
+        }
+        if (session?.pending) continue // まだ次の質問を待っている
+        const total = (session?.messages || []).length
+        if (total > messageCountBefore) {
+          applySessionSnapshot(session)
+          return
+        }
+      }
+    } finally {
+      isLoading.value = false
+    }
+  }
+
   async function selectPromptOption(option) {
-    if (isLoading.value) return false
+    if (isAnswering.value) return false
     const prompt = currentPrompt.value
     if (!prompt) return false
 
-    const label = typeof option === 'string' ? option : option?.label
-    if (!label) return false
-    const resolves = prompt.kind === 'clarify'
-      ? { surface: prompt.surface, value: option?.value || label }
-      : null
-    return sendMessage(label, resolves)
+    const payload = buildChipAnswerPayload(prompt, option)
+    if (!payload) return false
+    return sendAnswer(payload.answer, payload.resolves)
   }
 
   async function undoItinerary(messageId) {
@@ -328,56 +429,66 @@ export const useChatStore = defineStore('chat', () => {
     navStore.reset()
   }
 
+  /**
+   * `GET /thread` の応答をそのまま画面状態へ反映する(chat_sse.md §3.1:
+   * これ 1 回で画面が完全に戻る)。`rehydrateSession`(初回復元)と
+   * `waitForTurnToFinishThenRefresh`(回答後、ライブなストリームが無いとき
+   * の取り直し)の両方から使う共通処理。
+   */
+  async function applySessionSnapshot(session) {
+    const restored = (session?.messages || []).map((message) => ({
+      id: `server-${message.id}`,
+      serverId: message.id,
+      content: message.content,
+      sender: message.role === 'assistant' ? 'ai' : 'user',
+      timestamp: new Date(message.created_at),
+      isPending: false,
+      statusText: '',
+      notices: [],
+      error: '',
+      candidates: message.role === 'assistant' ? restoredCandidates(message.meta) : null,
+      itinerary: null,
+      profile: null,
+      meta: message.meta || {},
+    }))
+
+    profile.value = session?.profile || null
+
+    if (session?.itinerary) {
+      const itinerary = normalizeItineraryState(session.itinerary)
+      const target = [...restored].reverse().find((message) => (
+        message.sender === 'ai'
+        && message.meta?.itinerary_version === itinerary.version
+      )) || [...restored].reverse().find((message) => message.sender === 'ai')
+      const itineraryMessage = target || {
+        id: clientId(),
+        content: '',
+        sender: 'ai',
+        timestamp: new Date(),
+        isPending: false,
+        statusText: '',
+        notices: [],
+        error: '',
+        candidates: null,
+        profile: null,
+      }
+      if (!target) restored.push(itineraryMessage)
+      itineraryMessage.itinerary = itinerary
+      await navStore.applyItineraryState(itinerary)
+    }
+
+    // `pending` が唯一の真実(§1.4)。生きた待機が無ければ null が返る。
+    currentPrompt.value = normalizePending(session?.pending)
+    messages.value = restored
+  }
+
   async function rehydrateSession() {
     if (!userStore.isLoggedIn || isSessionLoaded.value) return
 
     isLoading.value = true
     try {
       const session = await getThread()
-      const restored = (session?.messages || []).map((message) => ({
-        id: `server-${message.id}`,
-        serverId: message.id,
-        content: message.content,
-        sender: message.role === 'assistant' ? 'ai' : 'user',
-        timestamp: new Date(message.created_at),
-        isPending: false,
-        statusText: '',
-        notices: [],
-        error: '',
-        candidates: message.role === 'assistant' ? restoredCandidates(message.meta) : null,
-        itinerary: null,
-        profile: null,
-        meta: message.meta || {},
-      }))
-
-      profile.value = session?.profile || null
-
-      if (session?.itinerary) {
-        const itinerary = normalizeItineraryState(session.itinerary)
-        const target = [...restored].reverse().find((message) => (
-          message.sender === 'ai'
-          && message.meta?.itinerary_version === itinerary.version
-        )) || [...restored].reverse().find((message) => message.sender === 'ai')
-        const itineraryMessage = target || {
-          id: clientId(),
-          content: '',
-          sender: 'ai',
-          timestamp: new Date(),
-          isPending: false,
-          statusText: '',
-          notices: [],
-          error: '',
-          candidates: null,
-          profile: null,
-        }
-        if (!target) restored.push(itineraryMessage)
-        itineraryMessage.itinerary = itinerary
-        await navStore.applyItineraryState(itinerary)
-      }
-
-      currentPrompt.value = normalizePending(session?.pending)
-
-      messages.value = restored
+      await applySessionSnapshot(session)
     } catch (error) {
       console.error('[ChatStore] Failed to rehydrate session:', error)
       messages.value = []
@@ -395,7 +506,9 @@ export const useChatStore = defineStore('chat', () => {
     profile,
     currentPrompt,
     isUndoing,
+    isAnswering,
     sendMessage,
+    sendAnswer,
     stopStreaming,
     selectPromptOption,
     undoItinerary,

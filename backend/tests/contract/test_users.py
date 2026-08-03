@@ -1,5 +1,6 @@
 """login → Bearer → thread の外部契約とユーザー境界を検証する。"""
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import httpx
@@ -7,6 +8,7 @@ import httpx
 from app.api.auth import get_user_repository
 from app.api.routers.spots import get_catalog_repository
 from app.domains.catalog import SpotsSnapshot
+from app.domains.conversation.ask_registry import AskUserRegistry
 from app.domains.users import MessageData, ProfileData, ThreadData, UserData
 from app.domains.users.repo import _public_pending
 from app.main import create_app
@@ -80,6 +82,10 @@ class MemoryUserRepository:
         await self.ensure_context(user_id)
         return self.threads[user_id]
 
+    async def clear_pending_ask(self, user_id: int) -> None:
+        current = self.threads[user_id]
+        self.threads[user_id] = replace(current, pending=None)
+
 
 class CommitGatedMemoryUserRepository(MemoryUserRepository):
     """commit 前のトークンを別リクエストから不可視にするテストダブル。"""
@@ -144,7 +150,12 @@ def test_pending_ask_is_restored_with_reason_and_unchanged_public_shapes() -> No
     }
 
 
-async def test_thread_response_includes_pending_reason() -> None:
+async def test_thread_response_includes_pending_reason_when_wait_is_alive() -> None:
+    """`pending` は「生きた待機がある」ときだけ返る(§7・chat_sse.md §3.1)。
+
+    `ask_registry` に待機を登録しておくのが「ターンが生きている」の代わり。
+    """
+
     repository = MemoryUserRepository()
     app = create_app()
     app.dependency_overrides[get_user_repository] = lambda: repository
@@ -166,10 +177,14 @@ async def test_thread_response_includes_pending_reason() -> None:
                 "options": ["この条件で進める", "条件を変更する"],
             },
         )
+        registry = AskUserRegistry()
+        registry.begin(identity["user_id"])
+        app.state.ask_registry = registry
         thread = await client.get(
             "/api/v1/thread",
             headers={"Authorization": f"Bearer {identity['token']}"},
         )
+        registry.end(identity["user_id"])
 
     assert thread.status_code == 200
     assert thread.json()["pending"] == {
@@ -178,6 +193,41 @@ async def test_thread_response_includes_pending_reason() -> None:
         "reason": "仮定した旅程条件の確認",
         "options": ["この条件で進める", "条件を変更する"],
     }
+
+
+async def test_thread_pending_is_cleared_when_no_live_wait_exists() -> None:
+    """ターンが死んでいた(プロセス再起動等)ら `pending` を null にし、DB も掃除する。"""
+
+    repository = MemoryUserRepository()
+    app = create_app()
+    app.dependency_overrides[get_user_repository] = lambda: repository
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        login = await client.post("/api/v1/login", json={"user_name": "stale-pending-user"})
+        identity = login.json()
+        profile = repository.profiles[identity["user_id"]]
+        repository.threads[identity["user_id"]] = ThreadData(
+            messages=[],
+            itinerary=None,
+            profile=profile,
+            pending={
+                "kind": "clarify",
+                "surface": "2番目",
+                "reason": "候補が複数あります",
+                "options": [{"label": "鶴間池", "value": "spot_001"}],
+            },
+        )
+        # `ask_registry` には何も登録しない = 生きた待機が無い状態を模す。
+        thread = await client.get(
+            "/api/v1/thread",
+            headers={"Authorization": f"Bearer {identity['token']}"},
+        )
+
+    assert thread.status_code == 200
+    assert thread.json()["pending"] is None
+    assert repository.threads[identity["user_id"]].pending is None
 
 
 async def test_login_commits_token_before_immediate_authenticated_request() -> None:

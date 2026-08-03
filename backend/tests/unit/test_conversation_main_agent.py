@@ -1,9 +1,10 @@
-"""③ ReAct メインループの層 1 仕様(段2)。
+"""③ ReAct メインループの層 1 仕様(段2〜段5)。
 
-`Docs/30_design/agent_react_architecture.md` §3・§10 と、段2の受け入れ条件
-(単純推薦・QA が「Tool → done」の2周で完了する / R1〜R3 / ToolError の
-recoverable 分岐 / state:step の発火順 / 名前解決)を検査する。
-実 LLM(127.0.0.1:8000)は一切叩かない(すべてスクリプト化したモッククライアント)。
+`Docs/30_design/agent_react_architecture.md` §3・§7・§10 と、受け入れ条件
+(単純推薦・QA が「Tool → done」の2周で完了する / R1〜R4 / ToolError の
+recoverable 分岐 / state:step の発火順 / 名前解決 / ask_user の HITL 接続)
+を検査する。実 LLM(127.0.0.1:8000)は一切叩かない(すべてスクリプト化した
+モッククライアント)。
 """
 
 from __future__ import annotations
@@ -80,6 +81,7 @@ class FakeTools:
         self.plan_queue: list[Any] = []
         self.edit_queue: list[Any] = []
         self.search_queue: list[Any] = []
+        self.ask_queue: list[Any] = []
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def recommend(
@@ -96,12 +98,21 @@ class FakeTools:
         self.calls.append(("edit_itinerary", {"step_id": step_id, "args": args, **kwargs}))
         return self.edit_queue.pop(0)
 
-    async def search_knowledge(self, *, step_id: int, args: Any) -> Any:
-        self.calls.append(("search_knowledge", {"step_id": step_id, "args": args}))
+    async def search_knowledge(
+        self, *, step_id: int, args: Any, ask_callback: Any = None
+    ) -> Any:
+        self.calls.append(
+            ("search_knowledge", {"step_id": step_id, "args": args, "ask_callback": ask_callback})
+        )
         return self.search_queue.pop(0)
 
-    async def ask_user(self, *, step_id: int, args: Any) -> Any:  # pragma: no cover
-        raise AssertionError("段2のメインループは ask_user を呼びません")
+    async def ask_user(self, *, step_id: int, args: Any) -> Any:
+        self.calls.append(("ask_user", {"step_id": step_id, "args": args}))
+        if self.ask_queue:
+            return self.ask_queue.pop(0)
+        raise AssertionError(
+            "ask_user が呼ばれましたが、FakeTools.ask_queue に応答が積まれていません"
+        )
 
 
 def _spots() -> dict[str, SpotFact]:
@@ -368,9 +379,9 @@ async def test_r1_step_budget_switches_to_done_only_schema() -> None:
         "schema"
     ]
     assert ninth_schema["properties"]["action"]["properties"]["tool"]["enum"] == ["done"]
-    # 1〜8 手目は通常スキーマ(anyOf で5つの Tool を許す)。
+    # 1〜8 手目は通常スキーマ(anyOf で6つの Tool を許す。ask_user 含む)。
     first_schema = client.calls[0]["extra_body"]["response_format"]["json_schema"]["schema"]
-    assert len(first_schema["properties"]["action"]["anyOf"]) == 5
+    assert len(first_schema["properties"]["action"]["anyOf"]) == 6
 
 
 def _pad_history_to_reach(target_tokens: int) -> str:
@@ -555,3 +566,230 @@ async def test_plan_itinerary_resolves_names_and_reports_dropped() -> None:
     assert "架空スポット" in state.trajectory[0].observation
     assert "解決できなかった" in state.trajectory[0].observation
     assert "spot_001" not in state.trajectory[0].observation
+
+
+# ---------------------------------------------------------------------------
+# ask_user(§7): メインエージェント自身の HITL 接続
+# ---------------------------------------------------------------------------
+
+
+def _ask_user_action(
+    *,
+    kind: str,
+    slot: str | None = None,
+    surface: str | None = None,
+    reason: str = "確認させてください",
+    options: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "slot": slot,
+        "surface": surface,
+        "reason": reason,
+        "options": options
+        or [
+            {"label": "はい", "value": "yes"},
+            {"label": "いいえ", "value": "no"},
+        ],
+    }
+
+
+def _update_profile_json(*, mobility: str | None = None) -> str:
+    delta = None
+    if mobility is not None:
+        delta = {
+            "interests": {},
+            "party": None,
+            "mobility": mobility,
+            "pace": None,
+            "avoid": [],
+            "notes": None,
+        }
+    return json.dumps({"profile_delta": delta, "score_adjustments": []}, ensure_ascii=False)
+
+
+def _ask_result(*, answer: str, answered_by: str = "chip") -> ToolResult:
+    return ToolResult(
+        step_id=1, tool=ToolName.ASK_USER, data={"answer": answer, "answered_by": answered_by}
+    )
+
+
+async def test_ask_user_preference_answer_updates_profile_and_continues_to_done() -> None:
+    """メイン: ask_user → 回答 → update_profile 再実行 → ループ続行 → done。"""
+
+    state = _state()
+    tools = FakeTools()
+    tools.ask_queue = [_ask_result(answer="30分程度なら")]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="preference",
+                    slot="mobility",
+                    reason="どのくらい歩けますか",
+                    options=[
+                        {"label": "あまり歩きたくない", "value": "avoid_walk"},
+                        {"label": "30分程度なら", "value": "short_walk_ok"},
+                    ],
+                ),
+            ),
+            _update_profile_json(mobility="short_walk_ok"),  # execute_ask_user の再実行分
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert [call[0] for call in tools.calls] == ["ask_user"]
+    assert state.ask_user_count == 1
+    assert state.asked_slots == ["mobility"]
+    assert state.profile.mobility == "short_walk_ok"
+    assert state.qa_answers[0]["answer"] == "30分程度なら"
+    assert "30分程度なら" in state.trajectory[0].observation
+    assert state.trajectory[0].tool == "ask_user"
+    assert state.main_agent_turns == 2  # ①ask_user ②done(done は軌跡に載らない)
+
+
+async def test_ask_user_clarify_resolves_spot_names_to_ids_before_dispatch() -> None:
+    """§3.3: メインは spot_id を書かない。options[].value は名前で渡す。"""
+
+    state = _state()
+    tools = FakeTools()
+    tools.ask_queue = [_ask_result(answer="鶴間池")]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="clarify",
+                    surface="2番目のやつ",
+                    reason="候補が 2 つあります",
+                    options=[
+                        {"label": "鶴間池", "value": "鶴間池"},
+                        {"label": "元滝伏流水", "value": "元滝伏流水"},
+                    ],
+                ),
+            ),
+            _update_profile_json(),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    ask_call = next(call for call in tools.calls if call[0] == "ask_user")
+    resolved_values = [option.value for option in ask_call[1]["args"].options]
+    assert resolved_values == ["spot_001", "spot_002"]
+    assert state.resolved_ambiguities == [
+        {"surface": "2番目のやつ", "resolved_to": "spot_001"}
+    ]
+
+
+async def test_ask_user_clarify_with_unresolvable_name_is_not_executed() -> None:
+    """A4: 選択肢が具体値(spot_id)に解決できない質問は実行せず落とす。"""
+
+    state = _state()
+    tools = FakeTools()
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="clarify",
+                    surface="どこか",
+                    reason="どちらのことですか",
+                    options=[
+                        {"label": "鶴間池", "value": "鶴間池"},
+                        {"label": "架空スポット", "value": "架空スポット"},
+                    ],
+                ),
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert tools.calls == []  # 実行されない(ガード前に名前解決で落ちる)
+    assert "解決" in state.trajectory[0].observation
+    assert state.ask_user_count == 0
+
+
+async def test_ask_user_guard_rejection_reports_reason_and_continues() -> None:
+    """A1: 質問済み slot への再質問はガードで落ち、仮定して進める指示が残る。"""
+
+    state = _state()
+    state.asked_slots = ["mobility"]
+    tools = FakeTools()
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="preference",
+                    slot="mobility",
+                    reason="どのくらい歩けますか",
+                ),
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert tools.calls == []
+    assert "質問できませんでした" in state.trajectory[0].observation
+    assert "最も確からしい解釈" in state.trajectory[0].observation
+    assert state.ask_user_count == 0
+
+
+async def test_ask_user_r4_limit_removes_ask_user_from_schema_after_two_questions() -> None:
+    """R4: 1 ターンに ask_user は 2 回まで。3 周目のスキーマから外れる。"""
+
+    state = _state()
+    tools = FakeTools()
+    tools.ask_queue = [
+        _ask_result(answer="30分程度なら"),
+        _ask_result(answer="家族です"),
+    ]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(kind="preference", slot="mobility", reason="歩けますか"),
+            ),
+            _update_profile_json(),
+            _turn_json(
+                "ask_user",
+                _ask_user_action(kind="preference", slot="party", reason="どなたと"),
+            ),
+            _update_profile_json(),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert state.ask_user_count == 2
+    assert state.main_agent_turns == 3  # ①ask_user ②ask_user ③done
+
+    # client.calls には update_profile 再実行分も混ざるので、
+    # メインループ自身の周(schema に "action" プロパティを持つ)だけを拾う。
+    main_loop_schemas = [
+        call["extra_body"]["response_format"]["json_schema"]["schema"]
+        for call in client.calls
+        if "action" in call["extra_body"]["response_format"]["json_schema"]["schema"]["properties"]
+    ]
+    assert len(main_loop_schemas) == 3
+    third_schema = main_loop_schemas[2]
+    third_tools = [
+        branch["properties"]["tool"]["enum"][0]
+        for branch in third_schema["properties"]["action"]["anyOf"]
+    ]
+    assert "ask_user" not in third_tools
+    first_tools = [
+        branch["properties"]["tool"]["enum"][0]
+        for branch in main_loop_schemas[0]["properties"]["action"]["anyOf"]
+    ]
+    assert "ask_user" in first_tools

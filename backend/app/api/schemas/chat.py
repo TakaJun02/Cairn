@@ -18,18 +18,38 @@ class ApiModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class ClarificationResolutionRequest(ApiModel):
-    surface: str = Field(min_length=1)
-    value: str = Field(min_length=1)
-
-
 class ChatRequest(ApiModel):
     message: str = Field(min_length=1)
-    resolves: ClarificationResolutionRequest | None = None
 
     @field_validator("message", mode="before")
     @classmethod
     def strip_message(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
+class ClarificationResolutionRequest(ApiModel):
+    """`kind:"clarify"` のチップ回答(§1.4)。"""
+
+    surface: str = Field(min_length=1)
+    value: str = Field(min_length=1)
+
+
+class AskUserResolutionRequest(ApiModel):
+    """`kind:"preference"` のチップ回答(§1.4)。"""
+
+    slot: str = Field(min_length=1)
+    value: str = Field(min_length=1)
+
+
+class ChatAnswerRequest(ApiModel):
+    """`POST /api/v1/chat/answer`(§1.4)。`resolves` はチップ経由のときだけ付く。"""
+
+    answer: str = Field(min_length=1)
+    resolves: AskUserResolutionRequest | ClarificationResolutionRequest | None = None
+
+    @field_validator("answer", mode="before")
+    @classmethod
+    def strip_answer(cls, value: Any) -> Any:
         return value.strip() if isinstance(value, str) else value
 
 
@@ -46,6 +66,7 @@ class StepState(ApiModel):
         "plan_itinerary",
         "edit_itinerary",
         "search_knowledge",
+        "ask_user",
     ]
     status: Literal["started", "progress", "finished"]
     label_ja: str = Field(min_length=1)

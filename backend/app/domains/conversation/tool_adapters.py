@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.core.llm import GenerationClient
+from app.domains.conversation.ask_registry import (
+    DEFAULT_ASK_TIMEOUT_SEC,
+    AskUserRegistry,
+    wait_for_answer,
+    write_pending_ask_now,
+)
 from app.domains.conversation.events import (
     EventSinkLike,
     emit,
@@ -20,8 +27,10 @@ from app.domains.conversation.itinerary_selector import (
     LLMItinerarySelector,
     SelectorGenerationPort,
 )
+from app.domains.conversation.tool_ports import SearchAskCallback
 from app.domains.conversation.types import (
     AskUserArgs,
+    AskUserResult,
     ConstraintDraft,
     EditItineraryArgs,
     PlanItineraryArgs,
@@ -68,6 +77,7 @@ from app.domains.recommendation.types import (
 )
 
 SearchRunner = Callable[..., Awaitable[SearchResult | SearchToolError]]
+PendingAskWriter = Callable[..., Awaitable[None]]
 
 
 class ToolAdapters:
@@ -83,6 +93,11 @@ class ToolAdapters:
         search_runner: SearchRunner = search_knowledge,
         attach_routes: bool = True,
         generation_client: SelectorGenerationPort | None = None,
+        thread_id: int | None = None,
+        user_id: int | None = None,
+        ask_registry: AskUserRegistry | None = None,
+        ask_timeout_sec: float = DEFAULT_ASK_TIMEOUT_SEC,
+        pending_ask_writer: PendingAskWriter | None = None,
     ) -> None:
         self.session = session
         self.event_sink = event_sink
@@ -93,6 +108,13 @@ class ToolAdapters:
         self.generation_client = generation_client or GenerationClient(self.settings)
         self.recommendation_repository = RecommendationRepository(session)
         self.itinerary_repository = ItineraryRepository(session)
+        # `ask_user` の HITL 待ち受け(§7)。1 ユーザー 1 スレッドなので
+        # レジストリは user_id で引く(`POST /chat/answer` 側も同じ key)。
+        self.thread_id = thread_id
+        self.user_id = user_id
+        self.ask_registry = ask_registry or AskUserRegistry()
+        self.ask_timeout_sec = ask_timeout_sec
+        self.pending_ask_writer = pending_ask_writer or write_pending_ask_now
 
     async def recommend(
         self,
@@ -295,6 +317,7 @@ class ToolAdapters:
         *,
         step_id: int,
         args: SearchKnowledgeArgs,
+        ask_callback: SearchAskCallback | None = None,
     ) -> ToolResult | ToolError:
         async def searching_sink(value: SearchStateEvent) -> None:
             # 旧 searching は state:step に統合する(§11)。narration ドメイン
@@ -315,6 +338,7 @@ class ToolAdapters:
                 args.spot_id,
                 settings=self.settings,
                 event_sink=searching_sink,
+                ask_callback=ask_callback,
             )
         except Exception as exc:  # noqa: BLE001
             return _exception_error(exc)
@@ -339,7 +363,16 @@ class ToolAdapters:
         step_id: int,
         args: AskUserArgs,
     ) -> ToolResult | ToolError:
-        payload = args.model_dump(mode="json", exclude_none=True)
+        """`ask_user` の HITL 実体(§7)。
+
+        1. `state:ask_user`/`clarify` を送出(ストリームは開いたまま)
+        2. `threads.pending_ask` を別トランザクションで即時反映
+           (`GET /thread` が進行中でも見えるように)
+        3. レジストリで回答を待つ(タイムアウト 10 分)
+        4. 回答受領・タイムアウトいずれでも `pending_ask` を即時 NULL に戻す
+        5. `AskResult{answer, answered_by}` を呼び出し元へそのまま返す
+        """
+
         if args.kind == "preference":
             await emit(
                 self.event_sink,
@@ -363,10 +396,43 @@ class ToolAdapters:
                     ],
                 ),
             )
+
+        pending = args.model_dump(mode="json", exclude_none=True)
+        pending["asked_at"] = _utcnow_iso()
+        if self.thread_id is not None:
+            await self.pending_ask_writer(
+                thread_id=self.thread_id, pending=pending, settings=self.settings
+            )
+
+        answer = None
+        if self.user_id is not None:
+            answer = await wait_for_answer(
+                self.ask_registry, key=self.user_id, timeout_sec=self.ask_timeout_sec
+            )
+
+        if self.thread_id is not None:
+            await self.pending_ask_writer(
+                thread_id=self.thread_id, pending=None, settings=self.settings
+            )
+
+        if answer is None:
+            result = AskUserResult(
+                answer="(タイムアウトのため回答がありませんでした)",
+                answered_by="timeout",
+                slot=args.slot,
+                surface=args.surface,
+            )
+        else:
+            result = AskUserResult(
+                answer=answer.answer,
+                answered_by=answer.answered_by,
+                slot=args.slot,
+                surface=args.surface,
+            )
         return ToolResult(
             step_id=step_id,
             tool=ToolName.ASK_USER,
-            data=payload,
+            data=result.model_dump(mode="json", exclude_none=True),
         )
 
     async def _itinerary_utilities(
@@ -574,3 +640,7 @@ def _exception_error(exc: Exception) -> ToolError:
 
 def _empty_diff() -> dict[str, list[Any]]:
     return {"added": [], "removed": [], "moved": [], "retimed": []}
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(UTC).isoformat()

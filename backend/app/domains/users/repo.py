@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -159,6 +159,18 @@ class UserRepository:
         if profile is None:  # pragma: no cover - ensure_context 後の防御
             raise UserContextError("profile を読み戻せませんでした")
         return _profile_data(profile)
+
+    async def clear_pending_ask(self, user_id: int) -> None:
+        """生きた待機が無い `pending_ask` を掃除する(§7・chat_sse.md §3.1)。
+
+        プロセス再起動等でターンが死んでいるのに `pending_ask` が残っている
+        ケースを `GET /thread` が検知したときに呼ぶ。
+        """
+
+        await self.session.execute(
+            update(Thread).where(Thread.user_id == user_id).values(pending_ask=None)
+        )
+        await self.session.commit()
 
 
 def _user_data(user: User) -> UserData:

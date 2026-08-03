@@ -186,6 +186,21 @@ export async function getThread() {
   return body
 }
 
+/**
+ * ask_user への回答(chat_sse.md §1.4)。204 のみ成功。イベントは元の SSE
+ * ストリームに流れるので、ここでは応答ボディを返さない。
+ * `payload.resolves` はチップ経由のときだけ付ける({surface,value} または
+ * {slot,value})。回答を待つターンが無ければ 409(呼び出し側で処理する)。
+ */
+export async function postChatAnswer(payload) {
+  const { status } = await apiFetch('/chat/answer', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+  if (status !== 204) throw new Error(`unexpected status ${status}`)
+  return true
+}
+
 export async function getSpots(etag = null) {
   const headers = etag ? { 'If-None-Match': etag } : {}
   const { status, body, headers: responseHeaders } = await apiFetch('/spots', { headers })

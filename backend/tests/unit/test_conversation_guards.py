@@ -1,19 +1,21 @@
-"""段2で残したガード(制約検証・revert 排他化・応答クローズドワールド・
+"""制約検証・revert 排他化・応答クローズドワールド・反復検知と、
 
-反復検知)と、段5用に残す `ask_user` 抑制ガード(G1〜G9)の層 1 仕様。
-旧 P1〜P8(一括プラン検証。`planner.py`)は ReAct 化で廃止した。
+`ask_user` 抑制ガード(R4・A1〜A5。`Docs/30_design/agent_react_architecture.md`
+§10)の層 1 仕様。旧 P1〜P8(一括プラン検証。`planner.py`)は ReAct 化で
+廃止した。旧 G1〜G9(ADR-0018 の中断・復帰方式の抑制ガード)は
+`evaluate_ask_user` へ作り替えた(ADR-0019・§7)。
 """
 
 from __future__ import annotations
 
 from app.domains.conversation.guards import (
+    evaluate_ask_user,
     has_repeated_ngram,
     normalize_revert_ops,
     validate_and_normalize_constraints,
-    validate_ask_user,
     validate_response_spot_names,
 )
-from app.domains.conversation.state import ProfileState, SpotFact
+from app.domains.conversation.state import SpotFact
 from app.domains.conversation.types import AskUserArgs, ConstraintDraft
 
 
@@ -118,62 +120,30 @@ def test_validate_response_spot_names_rejects_unpresented_names() -> None:
     assert rejected.rule == "closed_world_response"
 
 
-def test_g1_to_g5() -> None:
+def test_r4_and_a1_a2_a3_reject_preference_questions() -> None:
     base = AskUserArgs.model_validate(_preference_args())
-    profile = ProfileState(party="solo")
 
-    assert validate_ask_user(
-        base,
-        asked_slots=[],
-        ask_streak=0,
-        intent="edit",
-        profile=profile,
-        has_non_question_step=False,
-        question_count=2,
-    ).rule == "G1"
-    assert validate_ask_user(
-        base,
-        asked_slots=["pace"],
-        ask_streak=0,
-        intent="edit",
-        profile=profile,
-        has_non_question_step=False,
-    ).rule == "G2"
-    assert validate_ask_user(
-        base,
-        asked_slots=[],
-        ask_streak=2,
-        intent="edit",
-        profile=profile,
-        has_non_question_step=False,
-    ).rule == "G3"
-    assert validate_ask_user(
-        base,
-        asked_slots=[],
-        ask_streak=0,
-        intent="recommend",
-        profile=profile,
-        has_non_question_step=False,
-    ).rule == "G4"
+    assert evaluate_ask_user(
+        base, ask_user_count=2, ask_streak=0, asked_slots=[]
+    ).rule == "R4"
+    assert evaluate_ask_user(
+        base, ask_user_count=0, ask_streak=2, asked_slots=[]
+    ).rule == "A2"
+    assert evaluate_ask_user(
+        base, ask_user_count=0, ask_streak=0, asked_slots=["pace"]
+    ).rule == "A1"
     one_option = _preference_args()
     one_option["options"] = [{"label": "1つだけ", "value": "one"}]
-    assert validate_ask_user(
+    assert evaluate_ask_user(
         AskUserArgs.model_validate(one_option),
-        asked_slots=[],
+        ask_user_count=0,
         ask_streak=0,
-        intent="edit",
-        profile=profile,
-        has_non_question_step=False,
-    ).rule == "G5"
-    assert validate_ask_user(
-        base,
         asked_slots=[],
-        ask_streak=0,
-        intent="edit",
-        profile=profile,
-        has_non_question_step=False,
-        has_viable_plan=True,
-    ).rule == "G9"
+    ).rule == "A3"
+    # 通常時は受理される。
+    assert evaluate_ask_user(
+        base, ask_user_count=0, ask_streak=0, asked_slots=[]
+    ).accepted is True
 
 
 def _clarification(*, invalid_value: str | None = None) -> AskUserArgs:
@@ -197,41 +167,27 @@ def _clarification(*, invalid_value: str | None = None) -> AskUserArgs:
     )
 
 
-def test_g3_g6_g7_and_g9_apply_to_unified_ask_user() -> None:
+def test_a4_and_a5_apply_to_clarify_only() -> None:
     existing = {"spot_001", "spot_002", "spot_003", "spot_004", "spot_005"}
-    common = {
-        "asked_slots": [],
-        "intent": "unclear",
-        "profile": ProfileState(),
-        "has_non_question_step": False,
-        "allowed_spot_ids": existing,
-        "existing_spot_ids": existing,
-    }
-    assert validate_ask_user(
-        _clarification(),
-        **common,
-        resolved_ambiguities=[],
-        ask_streak=2,
-        has_viable_plan=False,
-    ).rule == "G3"
-    assert validate_ask_user(
+    common = {"ask_user_count": 0, "ask_streak": 0, "asked_slots": []}
+
+    assert evaluate_ask_user(
         _clarification(invalid_value="spot_999"),
         **common,
-        resolved_ambiguities=[],
-        ask_streak=0,
-        has_viable_plan=False,
-    ).rule == "G6"
-    assert validate_ask_user(
+        allowed_spot_ids=existing,
+        existing_spot_ids=existing,
+    ).rule == "A4"
+    assert evaluate_ask_user(
         _clarification(),
         **common,
         resolved_ambiguities=[{"surface": "2番目"}],
-        ask_streak=0,
-        has_viable_plan=False,
-    ).rule == "G7"
-    assert validate_ask_user(
-        _clarification(),
-        **common,
-        resolved_ambiguities=[],
-        ask_streak=0,
-        has_viable_plan=True,
-    ).rule == "G9"
+    ).rule == "A5"
+    # allowed/existing_spot_ids を渡さない呼び出し元(recommend SA・知識検索
+    # SA)では A4 を検査しない(値の意味が spot_id とは限らないため)。
+    assert evaluate_ask_user(
+        _clarification(invalid_value="not-a-spot-id"), **common
+    ).accepted is True
+    # 正常系は受理される。
+    assert evaluate_ask_user(
+        _clarification(), **common, allowed_spot_ids=existing, existing_spot_ids=existing
+    ).accepted is True

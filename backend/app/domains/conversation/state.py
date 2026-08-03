@@ -122,13 +122,17 @@ class TurnState(StateModel):
     history_tokens: int = 0
     last_candidates: list[CandidateReference] = Field(default_factory=list)
     presented_spot_ids: list[str] = Field(default_factory=list)
-    # 段5 (`ask_user` の HITL 化) で使う。段2では読み書きするだけで、
-    # メインループからは更新されない(常に読み込み時の値のまま持ち回る)。
+    # `ask_user` の HITL 抑制ガード(§10 A1/A2/A5)。読み込み時の値を、
+    # ターン内で質問が実行されるたびにメインループ/SA が更新する。
     asked_slots: list[str] = Field(default_factory=list)
     ask_streak: int = 0
     resolved_ambiguities: list[Any] = Field(default_factory=list)
     pending_ask: dict[str, Any] | None = None
     pending_constraints: list[dict[str, Any]] = Field(default_factory=list)
+    # このターンで実行できた ask_user の回数(メイン・SA 合算。R4=2)。
+    ask_user_count: int = 0
+    # ask_user への回答(user 行として persist する。§7・data_model.md §4.4)。
+    qa_answers: list[dict[str, Any]] = Field(default_factory=list)
     realtime: dict[str, dict[str, int | None]] = Field(default_factory=dict)
     spot_id_vocab: list[str] = Field(default_factory=list)
     spot_names: dict[str, str] = Field(default_factory=dict)

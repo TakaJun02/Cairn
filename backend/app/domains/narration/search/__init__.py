@@ -1,7 +1,11 @@
 """知識検索サブエージェントの公開面。"""
 
 from app.core.config import Settings
-from app.domains.narration.search.agent import KnowledgeSearchAgent, SearchEventSink
+from app.domains.narration.search.agent import (
+    AskCallback,
+    KnowledgeSearchAgent,
+    SearchEventSink,
+)
 from app.domains.narration.search.types import (
     KnowledgeSource,
     SearchResult,
@@ -19,6 +23,7 @@ async def search_knowledge(
     *,
     settings: Settings | None = None,
     event_sink: SearchEventSink | None = None,
+    ask_callback: AskCallback | None = None,
 ) -> SearchResult | ToolError:
     """DB 実装は実際の Tool 呼び出し時まで import しない。"""
 
@@ -29,9 +34,11 @@ async def search_knowledge(
         spot_id,
         settings=settings,
         event_sink=event_sink,
+        ask_callback=ask_callback,
     )
 
 __all__ = [
+    "AskCallback",
     "KnowledgeSearchAgent",
     "KnowledgeSource",
     "SearchResult",

@@ -7,6 +7,7 @@ from app.core.db import get_session_factory
 from app.core.llm import GenerationClient
 from app.domains.knowledge.embedding import OpenAIEmbeddingClient
 from app.domains.narration.search.agent import (
+    AskCallback,
     KnowledgeSearchAgent,
     SearchEventSink,
 )
@@ -22,8 +23,15 @@ async def search_knowledge(
     *,
     settings: Settings | None = None,
     event_sink: SearchEventSink | None = None,
+    ask_callback: AskCallback | None = None,
 ) -> SearchResult | ToolError:
-    """独立コンテキストで検索し、回答素材と出典だけを返す。"""
+    """独立コンテキストで検索し、回答素材と出典だけを返す。
+
+    `ask_callback` は §6 の ask コールバック(port)。`conversation` 側の
+    `ToolAdapters.search_knowledge` から注入される。None のままなら
+    `KnowledgeSearchAgent` は ask_user Tool を一切出さない(単体呼び出しでは
+    従来どおり)。
+    """
 
     resolved_settings = settings or get_settings()
     embedding = OpenAIEmbeddingClient(resolved_settings)
@@ -38,6 +46,7 @@ async def search_knowledge(
                 web,
                 decision_client=GenerationClient(resolved_settings),
                 event_sink=event_sink,
+                ask_callback=ask_callback,
             )
             return await agent.search(request, spot_id)
     finally:

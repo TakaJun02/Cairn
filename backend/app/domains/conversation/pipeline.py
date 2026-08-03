@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.llm import GenerationClient
+from app.domains.conversation.ask_registry import AskUserRegistry
 from app.domains.conversation.context import ContextRepositoryPort, load_context
 from app.domains.conversation.events import (
     EventSinkLike,
@@ -44,6 +44,7 @@ class ConversationPipeline:
         llm_client: Any | None = None,
         tools: ConversationToolPort | None = None,
         settings: Settings | None = None,
+        ask_registry: AskUserRegistry | None = None,
     ) -> None:
         self.repository = repository
         self.event_sink = event_sink
@@ -52,13 +53,16 @@ class ConversationPipeline:
         self.llm_client = llm_client or GenerationClient(settings)
         self.tools = tools
         self.settings = settings
+        # `ask_user` の HITL 待ち受け(§7)。API 層(`api/routers/chat.py`)が
+        # `request.app.state` から取り出して渡す(`ActiveTurnRegistry` と
+        # 同じ流儀)。既定 `ToolAdapters` が実際の待ち受けに使う。
+        self.ask_registry = ask_registry or AskUserRegistry()
 
     async def run(
         self,
         *,
         user_id: int,
         utterance: str,
-        resolves: Mapping[str, Any] | None = None,
         turn_id: str | None = None,
     ) -> TurnState:
         # ① load_context
@@ -66,7 +70,6 @@ class ConversationPipeline:
             self.repository,  # type: ignore[arg-type]
             user_id=user_id,
             utterance=utterance,
-            resolves=resolves,
             turn_id=turn_id,
         )
         try:
@@ -178,6 +181,9 @@ class ConversationPipeline:
             settings=self.settings,
             spot_names=state.spot_names,
             generation_client=self.llm_client,
+            thread_id=state.thread_id,
+            user_id=state.user_id,
+            ask_registry=self.ask_registry,
         )
 
     @staticmethod
@@ -201,8 +207,8 @@ async def run_turn(
     utterance: str,
     event_sink: EventSinkLike = None,
     llm_client: Any | None = None,
-    resolves: Mapping[str, Any] | None = None,
     settings: Settings | None = None,
+    ask_registry: AskUserRegistry | None = None,
 ) -> TurnState:
     """次委譲の SSE router が呼ぶ入口。router 自体はここで作らない。"""
 
@@ -214,4 +220,5 @@ async def run_turn(
         event_sink=event_sink,
         llm_client=llm_client,
         settings=settings,
-    ).run(user_id=user_id, utterance=utterance, resolves=resolves)
+        ask_registry=ask_registry,
+    ).run(user_id=user_id, utterance=utterance)

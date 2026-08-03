@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.auth import get_current_user, get_user_repository
+from app.api.routers.chat import get_ask_registry
 from app.api.schemas.users import (
     CurrentItineraryResponse,
     LoginResponse,
@@ -13,6 +14,7 @@ from app.api.schemas.users import (
     ThreadResponse,
     UserNameRequest,
 )
+from app.domains.conversation.ask_registry import AskUserRegistry
 from app.domains.users import (
     UserAlreadyExistsError,
     UserData,
@@ -65,6 +67,7 @@ async def get_me(
 async def get_thread(
     current_user: Annotated[UserData, Depends(get_current_user)],
     repository: Annotated[UserRepository, Depends(get_user_repository)],
+    ask_registry: Annotated[AskUserRegistry, Depends(get_ask_registry)],
 ) -> ThreadResponse:
     thread = await repository.get_thread(current_user.id)
     itinerary = (
@@ -75,11 +78,19 @@ async def get_thread(
         if thread.itinerary is not None
         else None
     )
+    pending = thread.pending
+    if pending is not None and not ask_registry.is_waiting(current_user.id):
+        # 生きた待機が無い(プロセス再起動等でターンが死んでいた)。
+        # `pending` は返さず、DB 側も掃除する(§7・chat_sse.md §3.1)。
+        pending = None
+        clear = getattr(repository, "clear_pending_ask", None)
+        if clear is not None:
+            await clear(current_user.id)
     return ThreadResponse(
         messages=thread.messages,
         itinerary=itinerary,
         profile=ProfileResponse.model_validate(thread.profile),
-        pending=thread.pending,
+        pending=pending,
     )
 
 
