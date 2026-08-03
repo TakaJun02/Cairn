@@ -11,6 +11,7 @@ import {
   undoItinerary as requestItineraryUndo,
 } from '@/lib/api'
 import { buildChipAnswerPayload, buildFreeTextAnswerPayload } from '@/lib/askAnswer'
+import { decideSendTarget, pollUntilTurnSettles, submitAnswer } from '@/lib/chatAnswerFlow'
 import { createSseParser } from '@/lib/sse'
 
 // ask_user の回答待ち(chat_sse.md §1.4)。リロード後などライブな SSE
@@ -66,7 +67,21 @@ function normalizePending(pending) {
   }
 }
 
+// data_model.md §4.4: assistant meta.presented は「このターンで recommend が
+// 実行されたときだけ」順序つきで書かれる(2026-08-04、レビュー是正・裁定14)。
+// 旧 candidate_spot_ids/candidate_names(移行前の行のための後方互換)にも
+// フォールバックする。
 function restoredCandidates(meta = {}) {
+  if (Array.isArray(meta.presented) && meta.presented.length > 0) {
+    const items = [...meta.presented]
+      .sort((a, b) => (a?.rank ?? 0) - (b?.rank ?? 0))
+      .map((item) => ({
+        spot_id: item?.spot_id,
+        name_ja: item?.name_ja || item?.spot_id,
+        reason_materials: {},
+      }))
+    return { kind: 'candidates', phase: 'final', items }
+  }
   const ids = Array.isArray(meta.candidate_spot_ids) ? meta.candidate_spot_ids : []
   const names = Array.isArray(meta.candidate_names) ? meta.candidate_names : []
   if (ids.length === 0) return null
@@ -190,14 +205,20 @@ export const useChatStore = defineStore('chat', () => {
 
   async function sendMessage(userInput) {
     const content = String(userInput || '').trim()
-    if (!content || isLoading.value) return false
 
     // 質問フォーム表示中は、通常入力欄からの送信も /chat/answer に回す
     // (frontend_nav.md §2.3.1 の 5: 下の入力欄は塞がないが、回答待ちの間は
-    // その送信先を切り替える)。
-    if (currentPrompt.value) {
-      return sendAnswer(content)
-    }
+    // その送信先を切り替える)。`isLoading` の検査より**前**に判定する
+    // (2026-08-04、レビュー是正・裁定15a): 質問待ち中はターンがまだ実行中
+    // で `isLoading` が true のままなので、先に isLoading を見ると
+    // この分岐へ絶対に到達できず、質問中の通常入力が常に無視されていた。
+    const target = decideSendTarget({
+      content,
+      hasPendingPrompt: Boolean(currentPrompt.value),
+      isLoading: isLoading.value,
+    })
+    if (target === 'answer') return sendAnswer(content)
+    if (target !== 'send') return false
 
     isLoading.value = true
     messages.value.push({
@@ -313,6 +334,10 @@ export const useChatStore = defineStore('chat', () => {
    * ライブなストリームが読み進み中ならここでは何もしなくてよい(reader が
    * 続きを運ぶ)。無ければ(リロード後等)GET /thread をポーリングして
    * 取り直す。
+   *
+   * POST が成功して初めてフォームを消す(2026-08-04、レビュー是正・
+   * 裁定15b)。失敗時はフォームを復元し、再送できるようにする — ただし
+   * 409(表示中の質問がサーバー側で既に失効)はフォームを残さない。
    */
   async function sendAnswer(answerText, resolves = null) {
     const payload = resolves
@@ -320,63 +345,69 @@ export const useChatStore = defineStore('chat', () => {
       : buildFreeTextAnswerPayload(answerText)
     if (!payload || isAnswering.value) return false
 
-    messages.value.push({
-      id: clientId(),
-      content: payload.answer,
-      sender: 'user',
-      timestamp: new Date(),
-    })
-    // 送った時点でフォームを消す(サーバー側の pending も即時クリアされる。
-    // 23_ux_issues.md §6-8: 古い質問への回答送信を防ぐため、フォームは
-    // 常に「いま回答を待っている質問」だけを表示する)。
-    clearPrompt()
-
+    const previousPrompt = currentPrompt.value
     isAnswering.value = true
-    try {
-      await postChatAnswer(payload)
-      if (!isStreamActive) {
-        await waitForTurnToFinishThenRefresh()
-      }
-      return true
-    } catch (error) {
-      console.error('[ChatStore] Failed to send answer:', error)
-      const target = messages.value.findLast((value) => value.sender === 'ai')
-      if (target) {
-        target.error = error?.status === 409
-          ? 'この質問への回答受付は終了しました。もう一度お試しください。'
-          : (error?.message || '回答を送信できませんでした。')
-      }
-      return false
-    } finally {
-      isAnswering.value = false
-    }
+    const { ok } = await submitAnswer({
+      payload,
+      postChatAnswer,
+      onSuccess: async () => {
+        messages.value.push({
+          id: clientId(),
+          content: payload.answer,
+          sender: 'user',
+          timestamp: new Date(),
+        })
+        // 23_ux_issues.md §6-8: 古い質問への回答送信を防ぐため、フォームは
+        // 常に「いま回答を待っている質問」だけを表示する。
+        clearPrompt()
+        if (!isStreamActive) {
+          await waitForTurnToFinishThenRefresh()
+        }
+      },
+      onFailure: (error) => {
+        console.error('[ChatStore] Failed to send answer:', error)
+        // 409 はサーバー側で既に pending が失効している合図なので、
+        // フォームは復元せず消したままにする。それ以外の失敗
+        // (ネットワーク・5xx 等)はフォームを復元して再送できるようにする。
+        currentPrompt.value = error?.status === 409 ? null : previousPrompt
+        const target = messages.value.findLast((value) => value.sender === 'ai')
+        if (target) {
+          target.error = error?.status === 409
+            ? 'この質問への回答受付は終了しました。もう一度お試しください。'
+            : (error?.message || '回答を送信できませんでした。')
+        }
+      },
+    })
+    isAnswering.value = false
+    return ok
   }
 
   /**
    * ライブな SSE ストリームが無い状態(リロード後等)で回答したときの
    * フォールバック。GET /thread を「新しいターンの決着がつくまで」
    * ポーリングし、届いたらセッション全体を取り直す(chat_sse.md §1.5)。
+   * ポーリング中に新しい質問(pending)が現れたら、ターンの完了を待たずに
+   * それを表示する(2026-08-04、レビュー是正・裁定15c: 例 Q1 回答 → Q2)。
    */
   async function waitForTurnToFinishThenRefresh() {
     const messageCountBefore = messages.value.filter((value) => value.serverId != null).length
     isLoading.value = true
     try {
-      for (let attempt = 0; attempt < ANSWER_POLL_MAX_ATTEMPTS; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, ANSWER_POLL_INTERVAL_MS))
-        let session = null
-        try {
-          session = await getThread()
-        } catch (error) {
+      await pollUntilTurnSettles({
+        getThread,
+        messageCountBefore,
+        maxAttempts: ANSWER_POLL_MAX_ATTEMPTS,
+        intervalMs: ANSWER_POLL_INTERVAL_MS,
+        onPending: async (session) => {
+          await applySessionSnapshot(session)
+        },
+        onSettled: async (session) => {
+          await applySessionSnapshot(session)
+        },
+        onPollError: async (error) => {
           console.error('[ChatStore] Failed to poll thread after answer:', error)
-          continue
-        }
-        if (session?.pending) continue // まだ次の質問を待っている
-        const total = (session?.messages || []).length
-        if (total > messageCountBefore) {
-          applySessionSnapshot(session)
-          return
-        }
-      }
+        },
+      })
     } finally {
       isLoading.value = false
     }
