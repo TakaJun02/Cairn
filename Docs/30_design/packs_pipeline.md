@@ -154,7 +154,7 @@ stateDiagram-v2
 ### 3.4 ワーカー
 
 - `app` プロセス内の asyncio タスク(lifespan で起動)。**Celery / Redis は再導入しない**([ADR-0003](../adr/0003-pack-generation-jobs.md))
-- `queued` を 2 秒間隔でポーリング。**同時に走らせるジョブは 1 本**(研究規模。NFR-8)
+- `queued` を 2 秒間隔でポーリング。**同時に走らせるジョブは 1 本**(小規模運用。NFR-8)
 - **クラッシュ復帰**: 起動時に `state='running'` かつ `updated_at` が 10 分以上古い行を `queued` に戻す。ワーカーが 1 つなのでリース機構は要らない
 - 再開時、`pack_assets` の成功済み行はそのまま使う。**やり直しは失敗した行だけ**
 
@@ -496,7 +496,7 @@ app/jobs/
 | 経路を manifest に埋め込む | 400 KB のうち 122 KB が route だった([22 §B-11](../22_current_issues.md))。別ファイルにする |
 | 経路を `route_id` 参照だけにする | **観光フェーズで引けない。**オフラインが成立しない |
 | 進捗を SSE で流す | 分単位のジョブ。切断・再開の設計を別途持つことになる |
-| ジョブ基盤に Celery / Redis を再導入 | [ADR-0003](../adr/0003-pack-generation-jobs.md)。研究規模にオーバーキル |
+| ジョブ基盤に Celery / Redis を再導入 | [ADR-0003](../adr/0003-pack-generation-jobs.md)。この規模にオーバーキル |
 | 古いパックを自動削除 | 端末が持っている可能性がある |
 | 地図タイルをパックに焼く | 旅程を直すたびに数十 MB の再配布になる |
 

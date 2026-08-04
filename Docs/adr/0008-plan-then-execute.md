@@ -1,6 +1,6 @@
 # ADR-0008: エージェントの制御構造は一括プラン方式(Plan-then-Execute)にする
 
-- 状態: 承認 (2026-07-31、ユーザー判断)
+- 状態: **廃止 (superseded by [ADR-0019](0019-react-main-agent-subagents.md)、2026-08-04)**(旧: 承認 2026-07-31、ユーザー判断)
 - 日付: 2026-07-31
 - 関係: [ADR-0004](0004-conversation-pipeline.md) を**置き換えず、`act` の内側を詳細化する**
 

@@ -7,6 +7,29 @@ export function tileUrl(z, x, y) {
   return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/${z}/${y}/${x}`;
 }
 
+/** manifest.tiles の bbox と zoom 範囲から全タイル URL を生成する。 */
+export function tilesForBounds(tileManifest) {
+  const bbox = tileManifest?.bbox
+  const minZoom = Number(tileManifest?.min_zoom)
+  const maxZoom = Number(tileManifest?.max_zoom)
+  if (
+    !Array.isArray(bbox)
+    || bbox.length !== 4
+    || !bbox.every((value) => Number.isFinite(Number(value)))
+    || !Number.isInteger(minZoom)
+    || !Number.isInteger(maxZoom)
+    || minZoom < 0
+    || maxZoom < minZoom
+  ) return []
+
+  const [minLon, minLat, maxLon, maxLat] = bbox.map(Number)
+  const zooms = Array.from({ length: maxZoom - minZoom + 1 }, (_, index) => minZoom + index)
+  return tilesForRoute(
+    [[minLon, minLat], [maxLon, maxLat]],
+    { zooms, marginDeg: 0, maxTiles: Number.POSITIVE_INFINITY },
+  )
+}
+
 /**
  * ルート（polyline）を含むバウンディングボックスから必要なタイル一覧を返す。
  * @param {Array<Array<number>>} polyline - [[lon,lat], ...] or [[lat,lon], ...]

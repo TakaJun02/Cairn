@@ -1,36 +1,30 @@
 // src/lib/poi.js
-// 自然スポット（POI）と施設のメタデータを正規化して提供する
+// GET /spots で nav store に読み込んだ POI・施設を既存画面向けに正規化する
 
-import facilitiesCatalogRaw from '@/assets/facilities.json'
-import poisCatalogRaw from '@/assets/POI.json'
+import { useNavStore } from '@/stores/nav'
 
-export function fetchPois() {
-  const arr = Array.isArray(poisCatalogRaw) ? poisCatalogRaw
-    : (Array.isArray(poisCatalogRaw.items) ? poisCatalogRaw.items
-    : (Array.isArray(poisCatalogRaw.features) ? poisCatalogRaw.features : []))
-
-  const list = arr.map((item) => normalizePoi(item, { kind: 'spot' })).filter(Boolean)
-  return dedupeBySpotId(list)
+function catalogEntries() {
+  const navStore = useNavStore()
+  return (Array.isArray(navStore.spots) ? navStore.spots : [])
+    .map((item) => normalizePoi(item))
+    .filter(Boolean)
 }
 
-// 施設はビルド時にバンドルされるため同期で展開する
-const FACILITY_LIST = Array.isArray(facilitiesCatalogRaw)
-  ? facilitiesCatalogRaw.map((item) => normalizePoi(item, { kind: 'facility' })).filter(Boolean)
-  : []
+export function fetchPois() {
+  return dedupeBySpotId(catalogEntries().filter((item) => item.kind !== 'facility'))
+}
 
 export function getFacilities() {
-  // 呼び出し側で安全に使えるようコピーを返す
-  return FACILITY_LIST.map((item) => ({ ...item }))
+  return catalogEntries()
+    .filter((item) => item.kind === 'facility')
+    .map((item) => ({ ...item }))
 }
 
 export function fetchPoiCatalog({ includeFacilities = true } = {}) {
-  const spots = fetchPois()
-  if (!includeFacilities) {
-    return spots
-  }
-
-  const merged = dedupeBySpotId([...spots, ...FACILITY_LIST])
-  return merged
+  const entries = catalogEntries()
+  return dedupeBySpotId(
+    includeFacilities ? entries : entries.filter((item) => item.kind !== 'facility')
+  )
 }
 
 function dedupeBySpotId(entries) {

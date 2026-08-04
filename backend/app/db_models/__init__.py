@@ -1,0 +1,47 @@
+"""永続化モデルの公開面。"""
+
+from app.db_models.base import Base
+from app.db_models.models import (
+    AccessPoint,
+    Itinerary,
+    KnowledgeChunk,
+    KnowledgeDocument,
+    LoraDownlink,
+    Message,
+    PackAsset,
+    PackJob,
+    PreferenceKey,
+    Profile,
+    RealtimeSimulatorState,
+    Route,
+    Spot,
+    SpotApproach,
+    SpotRealtime,
+    TagVocabulary,
+    Thread,
+    TravelTime,
+    User,
+)
+
+__all__ = [
+    "AccessPoint",
+    "Base",
+    "Itinerary",
+    "KnowledgeChunk",
+    "KnowledgeDocument",
+    "LoraDownlink",
+    "Message",
+    "PackAsset",
+    "PackJob",
+    "PreferenceKey",
+    "Profile",
+    "RealtimeSimulatorState",
+    "Route",
+    "Spot",
+    "SpotApproach",
+    "SpotRealtime",
+    "TagVocabulary",
+    "Thread",
+    "TravelTime",
+    "User",
+]

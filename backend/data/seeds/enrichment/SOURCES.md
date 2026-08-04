@@ -4,17 +4,17 @@
 
 根拠は次の順に確認しました。
 
-1. `backend/worker/data/knowledge/ja/**` の対応MDと横断MD
+1. `backend/data/knowledge/ja/**` の対応MDと横断MD
 2. 入力の `osm_ids` を使ったOpenStreetMap element API / Overpass API
 3. 入力の `tags`・`description` と知識MDの施設種別からの推定
 
 公式サイトのWeb探索は行っていません。営業時間は、時刻または24時間利用が知識MDで明示された9件だけを文字列化しました。屋外の自然スポットはMDに「24時間」とあっても、指示書どおり `open_hours: null` / `open_hours_source: no_concept` としています。
 
-`md_slug` と現行ファイル名の対応には `backend/worker/data/knowledge/ja/faci_spot/rename_md.py` の対応表を使いました。`spot_016` と `spot_017` は同じ元MDを複製した特例です。
+`md_slug` と現行ファイル名の対応には、データ移行時の `rename_md.py` の対応表を使いました。`spot_016` と `spot_017` は同じ元MDを複製した特例です。
 
 ## POIごとに採用した知識MD
 
-表内のパスはすべて `backend/worker/data/knowledge/ja/` からの相対パスです。
+表内のパスはすべて `backend/data/knowledge/ja/` からの相対パスです。
 
 | spot_id | 直接対応MD | 補助的に使ったMD・注意 |
 | --- | --- | --- |

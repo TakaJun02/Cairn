@@ -9,15 +9,24 @@ import NavWindow from '@/components/NavWindow.vue'
 
 // New UI components
 import OC_ChatMessages from '@/components/OC_ChatMessages.vue';
+import OC_AskUserForm from '@/components/OC_AskUserForm.vue';
 import OC_ChatInput from '@/components/OC_ChatInput.vue';
 
 const userStore = useUserStore()
 const chatStore = useChatStore()
-const { messages, isLoading, isSessionLoaded } = storeToRefs(chatStore)
+const { messages, isLoading, isSessionLoaded, isUndoing, currentPrompt, isAnswering } = storeToRefs(chatStore)
 
 const messagesContainer = ref(null);
 
 const chatInputText = ref('');
+const isPromptDismissed = ref(false);
+
+const isAskUserFormVisible = computed(() => Boolean(currentPrompt.value) && !isPromptDismissed.value);
+
+// 質問フォーム表示中は下の通常入力欄を塞がない(frontend_nav.md §2.3.1 の
+// 5)。isLoading はターン全体(質問待ちの間も含む)を表すため、これで
+// そのまま「送信不可」にすると回答できなくなる。
+const isChatInputBlocked = computed(() => isLoading.value && !currentPrompt.value);
 
 // --- Dynamic placeholder for input ---
 const placeholderText = computed(() => {
@@ -62,10 +71,26 @@ function applySuggestion(fullText) {
 }
 // -------------------------------------
 
-async function handleSendMessage() {
-  if (!chatInputText.value.trim()) return;
-  await chatStore.sendMessage(chatInputText.value);
+async function handleSendMessage(message = chatInputText.value) {
+  if (!message.trim()) return;
+  await chatStore.sendMessage(message);
   // The input will be cleared by the child component via v-model update
+}
+
+function handlePromptOption(option) {
+  void chatStore.selectPromptOption(option)
+}
+
+function handlePromptAnswer(answer) {
+  void chatStore.sendAnswer(answer)
+}
+
+function handlePromptDismiss() {
+  isPromptDismissed.value = true
+}
+
+function handleUndo(messageId) {
+  void chatStore.undoItinerary(messageId)
 }
 
 // Function to scroll to the bottom of the messages container
@@ -80,6 +105,14 @@ const scrollToBottom = () => {
 // Watch for changes in the number of messages and scroll to bottom
 watch(() => messages.value.length, () => {
   scrollToBottom();
+});
+
+watch(() => messages.value.at(-1)?.content, () => {
+  scrollToBottom();
+});
+
+watch(currentPrompt, () => {
+  isPromptDismissed.value = false;
 });
 
 watch(isSessionLoaded, (isLoaded) => {
@@ -123,11 +156,18 @@ onMounted(() => {
   <div class="tw-relative tw-w-full tw-h-full tw-flex tw-flex-col bg-noise">
     <!-- Message List Area -->
     <div class="tw-flex-1 tw-overflow-y-auto tw-pb-28 tw-overscroll-y-contain tw-touch-action-pan-y" ref="messagesContainer">
-      <OC_ChatMessages :messages="messages" />
+      <OC_ChatMessages
+        :messages="messages"
+        :is-undoing="isUndoing"
+        @undo="handleUndo"
+      />
     </div>
 
     <!-- Floating Suggestion Cards -->
-    <div class="tw-absolute tw-bottom-[100px] sm:tw-bottom-[88px] tw-left-0 tw-w-full tw-z-10 tw-transition-all tw-touch-action-none">
+    <div
+      v-if="!isAskUserFormVisible"
+      class="tw-absolute tw-bottom-[100px] sm:tw-bottom-[88px] tw-left-0 tw-w-full tw-z-10 tw-transition-all tw-touch-action-none"
+    >
       <div class="no-scrollbar tw-flex tw-gap-3 tw-overflow-x-auto tw-px-4">
         <div
           v-for="suggestion in suggestionTemplates"
@@ -145,10 +185,19 @@ onMounted(() => {
 
     <!-- Input Area -->
     <div class="tw-shrink-0 tw-touch-action-none">
-      <OC_ChatInput 
-        v-model="chatInputText" 
-        @sendMessage="handleSendMessage" 
-        :is-sending="isLoading" 
+      <OC_AskUserForm
+        v-if="isAskUserFormVisible"
+        :prompt="currentPrompt"
+        :is-sending="isAnswering"
+        @select-option="handlePromptOption"
+        @answer="handlePromptAnswer"
+        @dismiss="handlePromptDismiss"
+      />
+      <OC_ChatInput
+        v-model="chatInputText"
+        @sendMessage="handleSendMessage"
+        @stop="chatStore.stopStreaming"
+        :is-sending="isChatInputBlocked"
         :placeholder="placeholderText"
       />
     </div>

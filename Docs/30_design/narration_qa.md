@@ -1,8 +1,8 @@
 # 知識検索サブエージェント / ナレッジベース設計
 
-- 状態: **決定稿 (2026-08-01)**
-- 前提: [ADR-0011](../adr/0011-knowledge-search-subagent.md)(Agent as a Tool として切り出す)/ [ADR-0012](../adr/0012-knowledge-retrieval-pgvector.md)(pgvector + Qwen3-Embedding-8B + 4 Tool)/ [agent_planning_phase.md](agent_planning_phase.md)(メインエージェント)/ [data_model.md](data_model.md)
-- 参考にした先行実装: **[TakaJun02/sarutahiko](https://github.com/TakaJun02/sarutahiko)**(同一研究室の別プロジェクト。`docs/AGENT_REACT.md` / `docs/KNOWLEDGE.md` / `backend/app/rag/`。**コードを直接読んで確認した**、2026-08-01)
+- 状態: **決定稿 (2026-08-01)** / **改訂 2026-08-04([ADR-0019](../adr/0019-react-main-agent-subagents.md): 内側 Tool に `ask_user` を追加、呼び出し元が ReAct メインエージェントに変わった。検索・停止条件・縮退の中身は不変)**
+- 前提: [ADR-0011](../adr/0011-knowledge-search-subagent.md)(Agent as a Tool として切り出す)/ [ADR-0012](../adr/0012-knowledge-retrieval-pgvector.md)(pgvector + Qwen3-Embedding-8B)/ [agent_react_architecture.md](agent_react_architecture.md)(メインエージェント)/ [data_model.md](data_model.md)
+- 参考にした先行実装: **[TakaJun02/sarutahiko](https://github.com/TakaJun02/sarutahiko)**(同じ開発元の別プロジェクト。`docs/AGENT_REACT.md` / `docs/KNOWLEDGE.md` / `backend/app/rag/`。**コードを直接読んで確認した**、2026-08-01)
 
 ---
 
@@ -10,7 +10,7 @@
 
 **「鶴間池ってどんな所?」「クマは出ますか」に、根拠を持って答える仕組み**を確定させる。
 
-メインエージェントから見ると Tool は 1 つ(`search_knowledge`)だが、その内側は**自分のコンテキストと 4 つの Tool を持って反復する独立したエージェント**である。
+メインエージェントから見ると Tool は 1 つ(`search_knowledge`)だが、その内側は**自分のコンテキストと 5 つの Tool を持って反復する独立したエージェント**である(2026-08-04: `ask_user` を追加)。
 
 **この文書で決めないもの**: ナレッジ MD の内容そのもの(既存 118 本を使う)、パック生成時のナレーション文面(`packs_pipeline.md`)、音声合成(`20_architecture.md §8`)。
 
@@ -19,7 +19,7 @@
 | | |
 | --- | --- |
 | **1 回引いて終わりにできない** | `##` で割ると `## 概要` が **115 ファイル**、`## アクセス` が **58 ファイル**に現れる(実測)。ほぼ同型のチャンクが競合するので、**引き直し・全文取得の反復が要る** |
-| **反復の中間状態がメインに置けない** | メインは 16,384 の中で入力 7,000 を使っている([agent_planning_phase.md §7](agent_planning_phase.md))。観測履歴・全文・Web 本文が積み上がる余地がない |
+| **反復の中間状態がメインに置けない** | メインは 16,384 の中で初周 4,500 + 手ごとに数百トークンを使う([agent_react_architecture.md §9](agent_react_architecture.md))。観測履歴・全文・Web 本文が積み上がる余地がない |
 | **検索の専門性が混ざる** | メインが「推薦か旅程編集か」と「どの検索戦略か」を同じプロンプトで判断することになる |
 
 詳細は [ADR-0011](../adr/0011-knowledge-search-subagent.md)。
@@ -30,8 +30,8 @@
 
 ```mermaid
 flowchart TB
-  subgraph MAIN["メインエージェント（agent_planning_phase.md）"]
-    U["understand"] --> V["validate_plan"] --> A["act"]
+  subgraph MAIN["メインエージェント（agent_react_architecture.md）"]
+    A["ReAct ループ<br/>thought + 一手"]
     A --> R["respond<br/>ユーザーに見える日本語を書く唯一の場所"]
   end
 
@@ -44,6 +44,8 @@ flowchart TB
     D -->|lexical_search| T2["字句一致検索<br/>正規化＋バリアント展開"]
     D -->|get_document| T3["全文取得<br/>LLM 呼び出しゼロ"]
     D -->|web_search| T4["Tavily<br/>CB つき・周辺機能"]
+    D -->|ask_user| ASK["UI 経由でユーザーに質問<br/>回答を待つ（HITL）"]
+    ASK -->|"回答 = 観測"| O
     T1 --> O["観測をコンパクト化<br/>全文は evidence store へ"]
     T2 --> O
     T3 --> O
@@ -54,8 +56,8 @@ flowchart TB
 
   classDef n fill:#1967d2,stroke:#0b47a1,color:#fff
   classDef s fill:#7b1fa2,stroke:#4a0072,color:#fff
-  class U,V,A,R n
-  class D,ANS s
+  class A,R n
+  class D,ANS,ASK s
 ```
 
 **メインから見た契約はこれだけである。**
@@ -68,7 +70,7 @@ search_knowledge(request: str) -> {
 }
 ```
 
-**`answer_ja` は `respond` のための素材であり、そのまま画面に流さない。**ユーザーに見える日本語を書くのは `respond` だけ([agent_planning_phase.md §8](agent_planning_phase.md))。サブエージェントを**第二の話者にしない**。
+**`answer_ja` は `respond` のための素材であり、そのまま画面に流さない。**ユーザーに見える日本語を書くのは `respond` だけ([agent_react_architecture.md §3.4](agent_react_architecture.md))。サブエージェントを**第二の話者にしない**。
 
 ---
 
@@ -80,6 +82,7 @@ search_knowledge(request: str) -> {
 | **`lexical_search`** | `{keywords: string[] 1..6}` | 決定的な字句一致(§5)。ヒットゼロならバリアント展開して再試行 | 同上 + 使ったキーワード(展開後を含む) | — |
 | **`get_document`** | `{doc_ids: string[] 1..2}` | 全チャンクを `chunk_index` 順に取得し evidence へ。**LLM 呼び出しゼロ** | 先頭 ~1,500 トークン + 「全 N チャンク取得済み(回答時に全文参照)」 | — |
 | **`web_search`** | `{queries: string[] 1..3}` | Tavily(§6)。**ドメイン制限なし** | タイトル・URL・抜粋。CB 開放時は「利用不可」観測 | — |
+| **`ask_user`** | `{kind, slot?/surface?, reason, options: 2..4}` | **UI 経由でユーザーに質問し、回答を待つ**(HITL。2026-08-04 追加、[ADR-0019](../adr/0019-react-main-agent-subagents.md))。ターンは中断しない。ガードレール(A1〜A7)はメイン・SA 共通([agent_react_architecture.md §10](agent_react_architecture.md)) | **ユーザーの答え**(観測として返り、**同じ反復の中で**続行する) | — |
 | **`answer`** | `{answer_ja, sources, coverage}` | 回答を返してメインへ戻る | —(terminal) | ✔ |
 
 ### 2.1 観測の設計 — ここが効く
@@ -125,10 +128,10 @@ search_knowledge(request: str) -> {
 
 ```
 メイン（16,384）           サブ（16,384・別コンテキスト）
-├ 固定命令・spot 語彙       ├ 固定命令・Tool メニュー
-├ profile / constraints     ├ request ＋ 添付文脈
+├ 固定命令・Tool 定義       ├ 固定命令・Tool メニュー
+├ profile / 旅程 / 制約     ├ request ＋ 添付文脈
 ├ 会話履歴                  ├ 行動ログ
-├ plan                      ├ 観測一覧          ← ここが伸びる
+├ このターンの軌跡          ├ 観測一覧          ← ここが伸びる
 └ search_knowledge の結果   └ evidence store
    ＝ answer_ja のみ（〜600）
 ```
@@ -241,7 +244,7 @@ Query: {クエリ本文}
   "args": {"doc_ids": ["faci_spot/spot_012"]} }
 ```
 
-`thought` は **SSE の実況(§9)** に使う。**メインの `understand` と同じく guided decoding で構造を強制する**([agent_planning_phase.md §3.2](agent_planning_phase.md) と同じ理由)。
+`thought` は **SSE の実況(§9)** に使う。**メインエージェントの周回と同じく guided decoding で構造を強制する**([agent_react_architecture.md §3.2](agent_react_architecture.md) と同じ理由)。`tool` の enum には `ask_user` も含まれる(§2)。soft 閾値(§3)を超えたら `ask_user` は選ばせない(まとめに入る局面で新たに聞かない)。
 
 ### 7.2 メインへの戻り値
 
@@ -266,11 +269,11 @@ Query: {クエリ本文}
 
 ## 8. スポット固有の質問は検索しない
 
-知識 MD 118 本のうち **60 本が `faci_spot`(スポット 1 件 1 本)** である。**どの POI の話かは `understand` がすでに解決している**([agent_planning_phase.md §3.3](agent_planning_phase.md) の照応解決)ので、検索する必要がない。
+知識 MD 118 本のうち **60 本が `faci_spot`(スポット 1 件 1 本)** である。**どの POI の話かはメインエージェントが `spot_name` で指定し、アダプタのコードが名寄せで `spot_id` に解決する**([agent_react_architecture.md §3.3](agent_react_architecture.md): メインは id を書かない)ので、検索する必要がない。
 
 ```
-understand が spot_id を解決済み
-  → act が search_knowledge を呼ぶときに、request に spot_id を添付
+メインが search_knowledge(request, spot_name="元滝伏流水") を呼ぶ
+  → アダプタが名寄せ辞書 + DB で spot_id に解決（できなければ ToolError で差し戻し）
   → サブエージェントのプロンプトに「対象スポットの文書 ID: faci_spot/spot_012」を先に入れておく
   → 1 手目から get_document を選べる（検索を経由しない）
 ```
@@ -288,19 +291,16 @@ understand が spot_id を解決済み
 
 ## 9. 実況(SSE)とレイテンシ
 
-**QA ターンは LLM 呼び出しが 2〜3 回固定ではなくなる。**これが [ADR-0011](../adr/0011-knowledge-search-subagent.md) の代償である。
-
-手当ては**待たせている間に何をしているかを見せること**である。`decide` の `thought` を素材に、SSE の `state` イベントを出す。
+**待たせている間に何をしているかを見せる。**`decide` の `thought` を素材に、SSE の `state:step` イベントを出す(2026-08-04 改訂: 旧 `searching` は `step` に統合された。[chat_sse.md §1.2](../40_api/chat_sse.md))。
 
 ```
-event: state {"kind":"searching","text":"鶴間池の資料を読んでいます"}
-event: state {"kind":"searching","text":"駐車場の記述を探しています"}
+event: state {"kind":"step","tool":"search_knowledge","status":"progress","label_ja":"鶴間池の資料を読んでいます"}
+event: state {"kind":"step","tool":"search_knowledge","status":"progress","label_ja":"駐車場の記述を探しています"}
 event: token {"text":"鶴間池は鳥海山北麓の……"}
 ```
 
 - **`thought` はサニタイズしてから出す。**不適なら定型文にフォールバックする(LLM 生成物をそのまま画面に出さない)
 - **系列は可変である。**フロントは回数に依存してはいけない
-- QA でないターン(推薦・旅程)は**従来どおり 2〜3 回**で、影響を受けない
 
 契約は [40_api/chat_sse.md](../40_api/chat_sse.md) に反映する。
 

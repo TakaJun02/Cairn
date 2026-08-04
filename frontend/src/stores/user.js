@@ -3,12 +3,22 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { loginUser, createUser as apiCreateUser } from '@/lib/api' // `createUser` が衝突するのでエイリアス
 import router from '@/router' // Import router instance
+import { useNavStore } from '@/stores/nav'
 
 export const useUserStore = defineStore('user', () => {
   // State
   const user = ref(JSON.parse(sessionStorage.getItem('user') || 'null'))
   const isLoggedIn = computed(() => !!user.value)
   const userName = computed(() => user.value?.user_name || '')
+  const token = computed(() => user.value?.token || '')
+
+  async function _loadSpots() {
+    try {
+      await useNavStore().fetchSpots({ force: true })
+    } catch (error) {
+      console.error('Failed to load spots:', error)
+    }
+  }
 
   // Private helper
   function _setUser(userData) {
@@ -25,6 +35,7 @@ export const useUserStore = defineStore('user', () => {
     try {
       const userData = await loginUser(username)
       _setUser(userData)
+      await _loadSpots()
       return { success: true }
     } catch (error) {
       console.error('Login failed:', error)
@@ -36,8 +47,9 @@ export const useUserStore = defineStore('user', () => {
   async function register(username, language = 'ja') {
     try {
       // 登録成功後、そのままログイン状態とする
-      const userData = await apiCreateUser(username, language)
-      _setUser(userData)
+      const userData = await apiCreateUser(username)
+      _setUser({ ...userData, language })
+      await _loadSpots()
       return { success: true }
     } catch (error) {
       console.error('Registration failed:', error)
@@ -55,6 +67,7 @@ export const useUserStore = defineStore('user', () => {
     user,
     isLoggedIn,
     userName,
+    token,
     login,
     register,
     logout,

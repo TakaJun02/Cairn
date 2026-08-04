@@ -4,6 +4,7 @@
 - 日付: 2026-07-30(初版 2026-07-29。00_project.md の再定義(粒度粗め・スコープ確認)に追従して改訂)/ 承認 2026-07-31
 - **改訂 2026-08-01(Phase 2 の設計確定を反映)**: §5(パックのアセットと成果物)/ §6(経路をレッグ単位・door-to-door に。保留だった `car_to_trailhead` を決着)/ §7(パック用ナレーションの素材)/ §8(voice の ffmpeg 依存を落とす)/ §9(`static` に 2 テーブル追加)/ §14(Phase 2 の設計文書が決定稿)。根拠は [ADR-0013](adr/0013-leg-route-door-to-door.md) / [ADR-0014](adr/0014-osrm-area-extract.md) / [ADR-0015](adr/0015-pack-asset-composition.md)
 - **改訂 2026-08-01(Phase 3・4 の設計確定を反映)**: §8(LoRa は端末駆動・1 通で全スポット。[ADR-0016](adr/0016-lora-terminal-driven-batch.md))/ **§10(フロントエンドは差分改修に限る。`NavView` 分割と SW 作り直しを撤回。[ADR-0017](adr/0017-frontend-incremental-change.md)、ユーザー指示)** / §14(Phase 3・4 の完了条件)。**これで全 Phase の設計文書が揃った**
+- **改訂 2026-08-04(対話エージェントの作り替えを反映)**: §4(一括プラン方式 → **ReAct メインエージェント + サブエージェント構成**。[ADR-0019](adr/0019-react-main-agent-subagents.md)、ユーザー指示。詳細は [30_design/agent_react_architecture.md](30_design/agent_react_architecture.md))
 - 前提文書: [00_project.md](00_project.md)(目的) / [10_requirements.md](10_requirements.md)(要求) / [22_current_issues.md](22_current_issues.md)(現行の問題の根拠)
 - 主要決定の記録: [adr/](adr/)
 
@@ -44,7 +45,7 @@ graph TB
 
     subgraph "app コンテナ (FastAPI ×1プロセス)"
         API["api層: ルータ+スキーマ(契約の単一定義)<br>/api/v1/*  + /packs 静的配信"]
-        DOM["domains: conversation / recommendation /<br>geo / narration / voice / packs / realtime / users"]
+        DOM["domains: conversation / recommendation / itinerary /<br>geo / knowledge / narration / voice / packs /<br>realtime / users / catalog"]
         JOBS["jobs: asyncioワーカー<br>(パック生成の実行)"]
         MQTT["realtime: 状態ストア+シミュレータ(ダミー)<br>+ MQTT uplink購読 / downlink配信"]
         API --> DOM
@@ -94,33 +95,41 @@ backend/
 ├── alembic/                  # DBマイグレーション
 ├── app/
 │   ├── main.py               # FastAPI組み立て(ルータ登録・lifespan: MQTT/ジョブワーカー起動)
-│   ├── cli.py                # 管理コマンド(init-db / seed / validate-knowledge)
+│   ├── cli.py                # 管理コマンド 18 種(init-db / seed / build-geo / build-travel-times /
+│   │                         #   index-knowledge / export-openapi / rt-* / gc-packs ほか)
 │   ├── core/
 │   │   ├── config.py         # Settings (pydantic-settings)。環境変数を読むのはここだけ
 │   │   ├── db.py             # async engine / セッション管理(単一)
 │   │   ├── llm.py            # 生成クライアント(OpenAI互換, async, リトライ, モデル依存後処理の一元化)
 │   │   └── logging.py        # 構造化ログ + request_id
 │   ├── api/
+│   │   ├── auth.py           # Bearer トークンの検証(依存性注入)
+│   │   ├── sse.py            # SSE の組み立てとバッファリング
 │   │   ├── schemas/          # ★ 契約の単一定義(フロントとの境界。ここ以外で外部向け型を定義しない)
-│   │   └── routers/          # chat / users / routes / packs / jobs / realtime / health
+│   │   └── routers/          # health / users / chat / itinerary / spots / routes / packs / realtime
+│   │                         #   ※ jobs は独立ルータではなく packs.py が持つ
+│   ├── db_models/            # SQLAlchemy モデル(base.py / models.py)
 │   ├── domains/
+│   │   ├── catalog/          # spots(POI+施設 43 件)の読み出し
 │   │   ├── users/            # ユーザー・スレッド管理
 │   │   ├── conversation/     # ターンパイプライン・plan検証/実行・ガードレール・プロンプト・文脈構築
-│   │   ├── recommendation/   # POI推薦(戦略は差し替え可能に)・名寄せ(別名/序数)辞書
+│   │   ├── recommendation/   # POI推薦(決定的スコアラ + LLMリランク)
 │   │   ├── itinerary/        # 旅程の構成: ILSソルバー・述語ペナルティレジストリ・編集操作(ADR-0005)
-│   │   ├── geo/              # OSRM経路探索 + 沿道POI(PostGIS)+ route永続化
-│   │   ├── narration/        # 知識検索サブエージェント（§7）+ ナレーション生成プロンプト
+│   │   ├── geo/              # OSRM経路探索 + 沿道POI(PostGIS)+ 移動時間行列 + route永続化
+│   │   ├── knowledge/        # 知識ドキュメントの索引化と埋め込み(pgvector)
+│   │   ├── narration/        # 知識検索サブエージェント(search/)+ パック原稿生成(pack_text)
 │   │   ├── voice/            # TTSポート(gTTS実装。将来XTTS差し替え可)
 │   │   ├── packs/            # パック生成ジョブのオーケストレーション・manifest
 │   │   └── realtime/         # 状態ストア・シミュレータ(ダミー)・downlink配信・uplink ingest
-│   └── jobs/                 # ジョブランナー(ポーリングループ・並列度制御・再開)
+│   └── jobs/                 # ジョブランナー(worker.py。ポーリングループ・stale 復帰)
 ├── tests/
 │   ├── unit/  contract/  integration/  smoke/
 └── data/
-    ├── knowledge/            # 多言語知識MD(現行を移設)
+    ├── knowledge/            # 多言語知識MD
     ├── seeds/                # POI.json / facilities.json / access_points.geojson(投入元の単一ソース)
-    ├── processed/            # 学習成果物(persona_model.pkl 等)+ 再現手順README
+    ├── scenarios/            # 対話シナリオ台本(テスト用)
     └── map/                  # OSRMデータ(gitignore。取得手順は 50_operations)
+                              # ※ processed/ は作られていない(学習成果物を持たないため)
 ```
 
 **依存ルール**(import方向。逆流禁止):
@@ -128,7 +137,12 @@ backend/
 ```
 api/routers → api/schemas → domains → core
 jobs → domains → core
-domains間: conversation → recommendation/itinerary/narration/realtime、itinerary → geo、packs → geo/narration/voice のように一方向のみ許可。循環禁止
+domains間は一方向のみ許可。循環禁止。**実装の実測(2026-08-03)**:
+  conversation → geo / itinerary / narration / recommendation
+  packs        → geo / itinerary / narration / voice
+  narration    → knowledge
+  realtime     → packs
+  catalog / users / itinerary / recommendation / geo / knowledge / voice は他ドメインに依存しない(葉)
   ※ conversation は「道具を呼ぶ側」。recommendation/itinerary は conversation を知らない(ADR-0008)
 ```
 
@@ -139,34 +153,33 @@ domains間: conversation → recommendation/itinerary/narration/realtime、itine
 
 ## 4. 対話ターンの設計(conversation)
 
-**LangGraphは廃止**し、型付きのプレーン非同期パイプラインにする([ADR-0004](adr/0004-conversation-pipeline.md))。`act` の内側は**一括プラン方式(Plan-then-Execute)**([ADR-0008](adr/0008-plan-then-execute.md))。
+**LangGraphは廃止**し、型付きのプレーン非同期パイプラインにする([ADR-0004](adr/0004-conversation-pipeline.md))。エージェントの制御構造は **ReAct メインエージェント + 役割別サブエージェント**([ADR-0019](adr/0019-react-main-agent-subagents.md)。**2026-08-04 改訂**: 旧・一括プラン方式 = ADR-0008 は廃止)。
 
-> **詳細設計は [30_design/agent_planning_phase.md](30_design/agent_planning_phase.md) にある。**本節は全体構成の中での位置づけを示すだけで、道具カタログ・出力スキーマ・ガードレール・SSE契約・コンテキスト予算・縮退設計はそちらが正。エージェント内部の構造(ノード 6 / Tool 5 / 部品)は同文書の Part II、`understand` ノードの詳細解説は [30_design/understand_node.md](30_design/understand_node.md)。
+> **詳細設計は [30_design/agent_react_architecture.md](30_design/agent_react_architecture.md) にある。**本節は全体構成の中での位置づけを示すだけで、Tool カタログ・出力スキーマ・ガードレール・SSE契約・コンテキスト予算・縮退設計はそちらが正。
 
 ```
 POST /api/v1/chat (SSE)
-  ├─ 1. load_context      : ユーザー+スレッド+直近履歴を1クエリ群で取得(現行の同一ユーザー4回SELECTを1回に)
-  ├─ 2. understand        : LLM 1回(JSONモード) — intent + **plan(道具の列, 最大3手)**
-  │                         + プロファイル差分 + 制約(述語) + スコア補正 + unmodeled + 照応解決
-  │                         (現行の「プロファイル抽出」「意図解析」の2呼び出しを統合)
-  ├─ 3. act               : planを検証(P1〜P8)→ state:plan を先出し → 道具を順に実行
-  │                         道具は5つ: recommend / plan_itinerary / edit_itinerary / search_knowledge / ask_user
-  │                         手の間の受け渡しは**ステップ参照 `$N`** をコードが解決(LLM呼び出しなし)
-  │                         推薦: 決定的候補 → provisional送出 → LLMリランク → final
-  │                         旅程: ソルバー(TOPTW/ILS) → provisional送出 → 解の選択 → final
-  │                         **追加LLM呼び出しはplan全体で1回まで**(`search_knowledge` は自身の予算で回るため対象外)
-  ├─ 4. respond           : LLM 1回 — 応答生成を SSE でトークンストリーミング
-  └─ 5. persist           : プロファイル・旅程・会話を**1トランザクション**でコミット
+  ├─ 1. load_context     : ユーザー+スレッド+履歴(LLM要約+直近2ターン生)をDBから再構築
+  ├─ 2. update_profile   : LLM 1回 — プロフィール差分+スコア補正。差分がなければ何も書かない
+  ├─ 3. main_agent       : ReActループ — LLMが毎周 thought+一手(手数上限8+コンテキスト予算70/85%)
+  │                        Toolは6つ: recommend / plan_itinerary / edit_itinerary / search_knowledge / ask_user / done
+  │                          recommend        → レコメンドSA(自然言語指示 → filter翻訳 → 既存の二段推薦)
+  │                          plan/edit        → 旅程計画SA(完全ワークフロー: 名寄せ → ILS×3 → 解選択 → OSRM → 整形)
+  │                          search_knowledge → 知識検索SA(自身の予算で反復。ADR-0011)
+  │                          ask_user         → UI経由で質問し回答を待つ(HITL)。回答は同一ターン内で
+  │                                             呼び出し元エージェントのactにツール結果として返る
+  │                        メインは spot_id を扱わない(POIは名前空間。id解決はSAのコードが名寄せで行う)
+  ├─ 4. respond          : LLM 1回 — done の後、ユーザー向け日本語を SSE でトークンストリーミング
+  └─ 5. persist          : プロファイル・旅程・会話を**1トランザクション**でコミット+履歴要約の更新(done送出後)
 ```
 
-- **LLM呼び出しは1ターン2〜3回**(現行はLLM 3〜8回+埋め込み2回+Chroma 2回の直列)。**例外は知識検索が走るターン**で、`search_knowledge` サブエージェントが自身の予算で反復するため可変になる([ADR-0011](adr/0011-knowledge-search-subagent.md))。実況を `state` イベントで出して体感を保つ。**道具を何個使っても増えない**のが一括プラン方式を採った理由([ADR-0008](adr/0008-plan-then-execute.md))。推薦リランクまたは旅程の解選択が走るターンだけ3回になる。**カードと地図は provisional 送出で先に描画されるため体感レイテンシへの影響は小さい**([30_design/recommendation_planning.md](30_design/recommendation_planning.md) §3.4)。`ask_user` ターンは2回のまま([ADR-0007](adr/0007-preference-elicitation.md))
-- **長期記憶(過去セッション横断のベクトル検索)は引き続きスコープ外**([00_project.md](00_project.md) 2026-07-30 確認)。会話の文脈は直近履歴+永続プロファイルで構築する([30_design/agent_planning_phase.md §7.2](30_design/agent_planning_phase.md))。**知識ベース検索でベクトルを使うのは別の話**であり(2026-08-01、[ADR-0012](adr/0012-knowledge-retrieval-pgvector.md))、会話履歴は埋め込まない
-- 状態は毎ターンDBから再構築する。`MemorySaver`(プロセス内チェックポイント)は廃止し、22 §3-5 のメモリ無限成長・再起動消失を構造的に解消
+- **LLM呼び出しは1ターン可変**(単純な推薦で6回前後。[agent_react_architecture.md §9](30_design/agent_react_architecture.md))。回数固定を捨てて「結果を見て次を決める」を買った([ADR-0019](adr/0019-react-main-agent-subagents.md)。**ターン所要時間の増加は受容済み** — 2026-08-04 ユーザー判断)。体感は `state:step` の実況と provisional 先出し(推薦・旅程)、`respond` のストリーミングで保つ
+- **長期記憶(過去セッション横断のベクトル検索)は引き続きスコープ外**([00_project.md](00_project.md) 2026-07-30 確認)。会話の文脈は「LLM要約+直近2ターン生」+永続プロファイルで構築する([agent_react_architecture.md §8](30_design/agent_react_architecture.md))。**知識ベース検索でベクトルを使うのは別の話**であり(2026-08-01、[ADR-0012](adr/0012-knowledge-retrieval-pgvector.md))、会話履歴は埋め込まない
+- 状態は毎ターンDBから再構築する。`MemorySaver`(プロセス内チェックポイント)は廃止し、22 §3-5 のメモリ無限成長・再起動消失を構造的に解消。**プロセス内に持つのはターン内の状態だけ**(`ask_user` の回答待ちを含む — ターンをまたがない)
 - スキーマ: `threads(thread_id, user_id, ...)` / `messages(thread_id, role, content, ...)`。**session_id固定バグ(22 §3-2)と履歴のスレッド混入(22 §3-3)をデータモデルで解消**(全ユーザー横断のベクトル検索(22 §3-4)は機能ごと廃止)
-- intent解析失敗は「chitchatに偽装」せず、`understand_failed` としてログに出した上でフォールバック応答する(P5: 縮退の明示)
 - 名寄せ辞書(別名・序数)・プロフィール正規化は `recommendation/` と `conversation/` 配下の独立モジュールに分離し、`agent.py` 1397行(22 §3-1)を解体する(多言語スコープ外化により簡繁変換テーブル等は削除)
 
-SSEイベント仕様: `token`(応答本文の断片) / `state`(plan・推薦・旅程・質問・プロファイルの更新) / `done`(turn_id・縮退の有無) / `error`(縮退の明示)。**UIの状態はすべて `state` 由来とし、ストリーム本文のパースで状態を作らない。**ペイロードの定義は [30_design/agent_planning_phase.md §6](30_design/agent_planning_phase.md)。
+SSEイベント仕様: `token`(応答本文の断片) / `state`(step・推薦・旅程・質問・プロファイルの更新) / `done`(turn_id・縮退の有無) / `error`(縮退の明示)。**UIの状態はすべて `state` 由来とし、ストリーム本文のパースで状態を作らない。**ペイロードの定義は [40_api/chat_sse.md](40_api/chat_sse.md)。
 
 ## 5. ガイダンスパック生成(packs)
 
@@ -185,7 +198,7 @@ GET  /packs/{pack_id}/manifest.json             → 完成後の成果物(appが
 - **ジョブモデル**: `pack_jobs(id, pack_id, state, params, created_at, ...)` + `pack_assets(pack_id, spot_id, variant, narration_state, audio_state, error, ...)`
   - state: `queued → running → ready | partial | failed`。**アセット単位の部分成功**を第一級で扱う(現行はTTS 1件失敗で全体500+孤児ファイル: 22 §2-6)
   - 冪等性: 同一 `(route_id, langs, options)` の再要求は既存ジョブ/パックを返す(現行のuuid乱発によるディスク積み上げを解消: 22 §2-7)
-  - 実行は `app` 内のasyncioワーカー。**Celery/Redisは再導入しない**(研究規模に不要、過去に廃止済み)
+  - 実行は `app` 内のasyncioワーカー。**Celery/Redisは再導入しない**(この規模に不要、過去に廃止済み)
 - **並列度**: ナレーション生成は `asyncio.gather` + Semaphore(既定8。vLLMの継続バッチングに委ねる)、TTSはSemaphore(既定3)+指数バックオフ。spot単位の失敗クールダウン連鎖(22 §2-6)は廃止。**両者はパイプラインで回す**(原稿が全部できるのを待たない)
 - **variant(状況)の一元化**(**2026-08-01 改訂: [ADR-0015](adr/0015-pack-asset-composition.md)**): `Variant = base | weather_cloudy | weather_rain | congestion_mid | congestion_high` を `api/schemas` の enum 1箇所で定義。アセットキーは `(spot_id, variant)`(言語は日本語のみ)。**排他ではなく base + overlay の合成**とし、天気と混雑を独立した軸として重ねられるようにする。「沿道POIは本編のみ」という現行の暗黙ルールは **`pack_assets.role`(visit / pass_by)**で表現する(22 §5-5 の7箇所散在を解消)
 - **成果物は `manifest.json` + `route.geojson` + `audio/*.mp3`**(**2026-08-01 具体化**)。テキスト本文はmanifestに含め、`Asset.text` 欠落(22 §5-2)を解消する。**経路は manifest に埋め込まず別ファイルにする** —— 現行は400KB中122KBがrouteの重複(22 §B-11)だったが、`route_id` 参照だけにすると**観光フェーズで引けない**ため、パック内のファイルとして持つ。**再生規則(`playback_rules`)と近接判定の半径も manifest に載せ**、フロントとサーバーが別々の定数を持たないようにする(22 §12-7)
@@ -217,7 +230,7 @@ GET  /packs/{pack_id}/manifest.json             → 完成後の成果物(appが
 
 **パック用ナレーションは知識検索サブエージェントを使わない。**`faci_spot/spot_NNN.md` が 43 件すべてと 1:1 で対応しているので検索が要らず、1 パック 25〜80 アセットのバッチに反復検索は載らない。安全・季節の事実は `spots` の enrichment 列からコードが組み立てて渡す。
 
-- 知識MDはGit管理のファイルのまま(研究上、差分管理できる利点が大きい)。ただし**起動時/シード時にインデックスを構築して整合性を検証**する: **`spot_id` から引ける**ようにし(`knowledge_documents.spot_id`。**旧 `md_slug` は死んでいるので使わない** — [30_design/data_model.md §1.2](30_design/data_model.md))、どこからも参照されない孤児MD(現行60件中17件: 22 §6-5)を `python -m app.cli validate-knowledge` で報告する。ランタイム対象は `ja/` のみ(en/zh のMDはデータとして残すが、検証・生成の対象外)
+- 知識MDはGit管理のファイルのまま(差分管理できる利点が大きい)。ただし**起動時/シード時にインデックスを構築して整合性を検証**する: **`spot_id` から引ける**ようにし(`knowledge_documents.spot_id`。**旧 `md_slug` は死んでいるので使わない** — [30_design/data_model.md §1.2](30_design/data_model.md))、どこからも参照されない孤児MD(現行60件中17件: 22 §6-5)を `python -m app.cli validate-knowledge` で報告する。ランタイム対象は `ja/` のみ(en/zh のMDはデータとして残すが、検証・生成の対象外)
 - プロンプトは状況を**パラメータ化した単一テンプレート**に統合(現行の「言語×状況」6テンプレート全文コピー問題(22 §F-11)は、多言語スコープ外化と合わせて消滅)。状況別プロンプトにも知識コンテキストを渡す(現行は無視: 22 §F-12)
 - `<think>`タグ除去などモデル依存の後処理は `core/llm.py` に一元化(現行はプロンプト文言の正規表現コピーが散在: 22 §F-8)
 - 生成結果の検証(空文字・拒否応答・長さ逸脱)をTTSに流す前に行う
@@ -263,7 +276,7 @@ PostgreSQL 16 ×1台(`postgis/postgis` イメージ)。[ADR-0002](adr/0002-singl
 
 | Method/Path | 内容 |
 | --- | --- |
-| `POST /api/v1/users`, `POST /api/v1/login`, `GET /api/v1/users/{name}/session` | 現行踏襲(研究用簡易認証) |
+| `POST /api/v1/users`, `POST /api/v1/login`, `GET /api/v1/users/{name}/session` | 現行踏襲(簡易認証) |
 | `POST /api/v1/chat` | SSE(§4) |
 | `POST /api/v1/routes`, `GET /api/v1/routes/{id}` | 経路探索+永続化(§6) |
 | `POST /api/v1/packs`, `GET /api/v1/jobs/{id}` | パック生成ジョブ(§5) |
@@ -285,14 +298,32 @@ PostgreSQL 16 ×1台(`postgis/postgis` イメージ)。[ADR-0002](adr/0002-singl
 
 - `app/core/config.py` の `Settings`(pydantic-settings)に全設定を集約。**環境変数名はここに書かれたものだけが正**(大文字小文字ゆれの同義キー: 22 §8-2 は廃止)
 - `.env.example` を追跡し、全キーに説明を付ける。`.env` は追跡外のまま。**現状の `.gitignore` は `.env*` で `.env.example` も無視してしまうので `!.env.example` を足す**(2026-08-01 発見)
+
+**設定を 3 層に分ける**(**2026-08-03 決定**、公開を前提とした整理)。`.env` に全設定を並べると、公開時に「秘密かどうか」と「環境依存かどうか」が判別できなくなる。置き場所を役割で決める:
+
+| 層 | 何を置くか | 例 |
+| --- | --- | --- |
+| **`.env`**(追跡外) | **秘密**と**人によって値が変わるもの**だけ | `POSTGRES_PASSWORD` / `TAVILY_API_KEY` / `RT_MQTT_PASS` / IP を含む URL(`INFERENCE_SERVER` / `EMBEDDING_SERVER`)/ `INFERENCE_MODEL` |
+| **`docker-compose.yml`** の `environment:` | **接続先のトポロジ**(どのコンテナがどこに居るか。compose の構成が決めるので人によらない)と**プロジェクトの定数** | `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_DB` / `POSTGRES_USER` / `OSRM_CAR_URL` / `OSRM_FOOT_URL` / `PACKS_ROOT` |
+| **`Settings` の既定値** | **チューニング値**(全員同じでよく、変えたい人だけ `.env` で上書きする) | `OSRM_*` の並列度・タイムアウト・再試行、`GEO_*` の閾値、`CHAT_SSE_HEARTBEAT_SEC`、`RECOMMENDATION_RERANK_ENABLED` |
+
+- **`.env.example` と `Settings` の 1 対 1 対応は要求しない**(この整理で撤回)。`.env.example` は「必須」「任意」の 2 節に絞り、既定値で足りるキーはコメントで存在だけ示す。**キー名の正が `Settings` である点は変わらない**
+- **`POSTGRES_DB` / `POSTGRES_USER` は `.env` で扱わず、`guidance` に固定する**(**2026-08-03 決定**)。秘密でも環境依存でもないうえ、**initdb 時にボリュームへ焼き付いて後から変えられない**ため、`.env` で上書きできること自体が罠になる(値を変えると DB 側は変わらず接続だけ失う)。compose と `Settings` の既定値の両方に同じ `guidance` を書き、上書き経路を持たせない
+  - この開発機のボリュームは旧名 `static_db` で初期化されていたので、**2026-08-03 に `ALTER DATABASE` / `ALTER ROLE` でリネームして `guidance` に揃えた**。パスワードは SCRAM-SHA-256 のため名前変更の影響を受けない(md5 だと消去される)
+- `POSTGRES_PASSWORD` は compose で `${POSTGRES_PASSWORD:?...}` にし、**未設定なら起動前にエラーで止める**(空パスワードで postgres が黙って初期化失敗するのを避ける)
+- `db` サービスに `env_file` を渡さない。**DB コンテナが Tavily キーや MQTT 資格情報を持つ理由がない**
 - composeからホスト固有値を排除: `/var/www/packs` と `mkdir -p /home/junta_takahashi/...`(22 §8-4)は named volume `packs_data` に置き換え
 - タイムアウトは「外側 ≥ 内側」を`Settings`内の導出で保証(現行のGateway 180s < LLM 600s 矛盾: 22 §2-2)
 - **OSRMデータは鳥海山エリアのbboxに切り出し、生成を `scripts/build_osrm.sh` にする**(**2026-08-01、[ADR-0014](adr/0014-osrm-area-extract.md)**)。現状は全国版32GBで取得手順も未文書(22 §8-6)。切り出すと1GB未満・生成10分になり、NFR-2が実際に満たせる。手順は [50_operations/osrm.md](50_operations/osrm.md)
 - Dockerfileは本体/初期化を統合しマルチステージ化。依存は `pyproject.toml` で本体/dev分離(22 §14-4)
+- **compose ではコードをイメージに焼かずマウントする**(**2026-08-03 決定**)。`app` は `./backend:/app/backend`、`frontend` は `./frontend:/app/frontend`。**イメージが持つのは依存関係だけ**になり、再ビルドが要るのは `pyproject.toml` / `package.json` を変えたときに限られる
+  - `app` は `--reload --reload-dir /app/backend/app` で起動する。ホスト側の編集がそのまま反映される(2026-08-03 実測: WatchFiles が bind mount 越しの変更を検知)
+  - マウントが `pip install .` 済みの `app` パッケージを覆うよう、`PYTHONPATH=/app/backend` を明示する
+  - `Dockerfile.app` のコード `COPY` は残す(compose を介さず単体で動かせる状態を保つため)。compose 起動時はマウントが常に優先される
 
 ## 12. 可観測性
 
-> **2026-08-01 改訂: 実験計測をスコープから外した。**NFR-7(計測可能性)を要求から削除し、`turn_metrics` / `unmodeled_log` テーブルと `export-metrics` CLI を廃止した。**研究データを DB に貯めて取り出す機能は作らない。**
+> **2026-08-01 改訂: 実験計測をスコープから外した。**NFR-7(計測可能性)を要求から削除し、`turn_metrics` / `unmodeled_log` テーブルと `export-metrics` CLI を廃止した。**計測データを DB に貯めて取り出す機能は作らない。**
 
 - 構造化ログ(JSON, stdout)。request_id をミドルウェアで採番しドメイン層まで伝播。`print` と `basicConfig` 副作用(22 §9)を全廃
 - デバイスUUID別ログファイル(FDリーク+パス注入: 22 §6-6)は廃止。リクエストログはサイズ制限つきの要約のみ
@@ -344,7 +375,7 @@ FR-1(推薦)・FR-2(プランニング)の手段は**現行方式を仮移植せ
 | 選択肢 | 不採用の理由 |
 | --- | --- |
 | マイクロサービス構成を維持して修繕 | 独立デプロイ・独立スケールの要求が存在しない(NFR-8)。1人開発では境界維持コストが変更容易性(NFR-1)を直接損なう。詳細: ADR-0001 |
-| Celery/Redis再導入(ジョブ基盤) | 研究規模にオーバーキル。過去に一度廃止済み。DBジョブテーブル+asyncioで要件を満たす。詳細: ADR-0003 |
+| Celery/Redis再導入(ジョブ基盤) | この規模にオーバーキル。過去に一度廃止済み。DBジョブテーブル+asyncioで要件を満たす。詳細: ADR-0003 |
 | LangGraph継続(薄く保つ) | 現行グラフは実質線形+分岐1つで、フレームワークの利得よりチェックポインタ誤用等の事故面が大きい。実験でグラフ構造が本当に必要になったら再導入を妨げない設計にする。詳細: ADR-0004 |
 | ChromaDB継続 | 会話長期記憶1コレクションのためだけの追加コンテナ+依存。長期記憶自体をスコープ外とした(00_project)ため機能ごと廃止。再導入時も同一DBへのpgvector拡張で足りる。詳細: ADR-0002 |
 | 別言語/別フレームワークへの全面書き換え | FastAPI/Vueは要求を満たしており、ドメインロジック(推薦・名寄せ・プロンプト)は資産として移植する。書き換えの利得がない |

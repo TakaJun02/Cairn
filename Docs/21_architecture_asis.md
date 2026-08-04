@@ -15,7 +15,7 @@
 | 用途 | .env キー | 例 | 備考 |
 | --- | --- | --- | --- |
 | テキスト生成 | `Inference_server` | `http://127.0.0.1:8000/v1` | コンテナ内からは `http://host.docker.internal:8000/v1` に上書き（compose の `environment`） |
-| 埋め込み | `Embedding_server` | `http://172.28.208.107:8001/v1` | 別マシンのvLLM。LAN IPのためコンテナからもそのまま到達可能 |
+| 埋め込み | `Embedding_server` | `http://<LAN の別マシン>:8001/v1` | 別マシンのvLLM。LAN IPのためコンテナからもそのまま到達可能（実アドレスは `.env` のみに置く） |
 
 モデル名は `INFERENCE_MODEL` / `EMBEDDING_MODEL` 未指定時、各サーバの `GET /v1/models` から自動検出する。
 

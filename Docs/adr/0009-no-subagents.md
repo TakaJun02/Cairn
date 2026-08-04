@@ -1,6 +1,6 @@
 # ADR-0009: 旅程計画エージェントにサブエージェントを持たせない
 
-- 状態: 承認 (2026-07-31) / **適用範囲を限定 (2026-08-01、[ADR-0011](0011-knowledge-search-subagent.md))**
+- 状態: **廃止 (superseded by [ADR-0019](0019-react-main-agent-subagents.md)、2026-08-04)**(旧: 承認 2026-07-31 / 適用範囲を限定 2026-08-01、[ADR-0011](0011-knowledge-search-subagent.md))
 - 日付: 2026-07-31 / 改訂 2026-08-01
 - 関係: [ADR-0008](0008-plan-then-execute.md)(一括プラン方式)の帰結を明文化するもの。置き換えではない
 

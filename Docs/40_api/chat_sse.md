@@ -1,7 +1,7 @@
 # API 契約 — チャット SSE と REST
 
-- 状態: **決定稿 (2026-08-01)** / **改訂 2026-08-01(Phase 2 設計を反映: §3 のエンドポイント表と §5.4 の冪等キー)**
-- 前提: [20_architecture.md §10](../20_architecture.md) / [agent_planning_phase.md §6](../30_design/agent_planning_phase.md)(SSE イベントの原案)/ [data_model.md](../30_design/data_model.md) / [ADR-0003](../adr/0003-pack-generation-jobs.md)(パック生成をジョブに)/ [ADR-0006](../adr/0006-recommendation-hybrid.md)(provisional → final の 2 段送出)
+- 状態: **決定稿 (2026-08-01)** / 改訂 2026-08-01(Phase 2 設計を反映: §3 のエンドポイント表と §5.4 の冪等キー)/ **改訂 2026-08-04([ADR-0019](../adr/0019-react-main-agent-subagents.md) ReAct 構成への作り替えを反映: `state:plan` 廃止・`state:step` 新設・`searching` の統合・`error.stage` の語彙・**`ask_user` の HITL 化(質問はターン途中・回答は `POST /api/v1/chat/answer` 新設)**)**
+- 前提: [20_architecture.md §10](../20_architecture.md) / [agent_react_architecture.md §11](../30_design/agent_react_architecture.md)(SSE イベントの原案)/ [data_model.md](../30_design/data_model.md) / [ADR-0003](../adr/0003-pack-generation-jobs.md)(パック生成をジョブに)/ [ADR-0006](../adr/0006-recommendation-hybrid.md)(provisional → final の 2 段送出)
 
 ---
 
@@ -72,18 +72,24 @@ event: done    { ... }        # 必ず 1 回、最後に
 
 | `kind` | いつ | ペイロード |
 | --- | --- | --- |
-| `plan` | `validate_plan` 直後 | `{"steps":[{"id":1,"tool":"recommend"}]}` |
+| **`step`** | **メインエージェントが手を実行するとき**(開始・実況・完了。0 回以上・可変。[ADR-0019](../adr/0019-react-main-agent-subagents.md)) | `{"tool":"recommend","status":"started"\|"progress"\|"finished","label_ja":"おすすめを探しています"}` |
 | `candidates` | `recommend` 実行時。**2 回**(provisional → final) | `{"phase":"provisional"\|"final","items":[{"spot_id","name_ja","reason_materials":{...}}]}` |
-| `itinerary` | 旅程が作られた/変わったとき。**2 回**(provisional → final) | `{"phase":..,"version":4,"itinerary":{...},"diff":{...},"concessions":[...]}` |
-| `ask_user` | `act` の `ask_user`(選好の聞き取り) | `{"slot":"mobility","options":["あまり歩きたくない","30分程度なら","登山もしたい"]}` |
-| **`clarify`** | **`understand` の聞き返し**([ADR-0010](../adr/0010-understand-bounded-agent.md)) | `{"surface":"2番目のやつ","options":[{"label":"鶴間池","value":"spot_012"}]}` |
-| `profile` | `profile_delta` が反映されたとき | `{"profile":{...}}` |
-| **`searching`** | **知識検索サブエージェントの反復中。0 回以上・可変**([ADR-0011](../adr/0011-knowledge-search-subagent.md)) | `{"text":"鶴間池の資料を読んでいます"}` |
+| `itinerary` | 旅程が作られた/変わったとき。**2 回**(provisional → final)。**1 ターンに複数回の書き換えがあれば、その回数だけ出る**(ADR-0019) | `{"phase":..,"version":4,"itinerary":{...},"diff":{...},"concessions":[...],"assumptions":["日付は明日と仮定"]}` |
+| `ask_user` | **`ask_user` Tool を `kind:"preference"` で実行**(選好の聞き取り)。**ターンの途中で出る**(§1.4) | `{"slot":"mobility","reason":"歩ける距離を知りたい","options":["あまり歩きたくない","30分程度なら","登山もしたい"]}` |
+| **`clarify`** | **`ask_user` Tool を `kind:"clarify"` で実行**(発話の聞き返し)。**ターンの途中で出る**(§1.4) | `{"surface":"2番目のやつ","reason":"候補が 2 つある","options":[{"label":"鶴間池","value":"spot_012"}]}` |
+| `profile` | `profile_delta` が反映されたとき。**差分が空のターンは送らない**(ADR-0019) | `{"profile":{...}}` |
 
-> **`clarify` は [agent_planning_phase.md §6](../30_design/agent_planning_phase.md) の一覧に無かった。**ADR-0010 で `understand` に聞き返しを持たせた際、SSE 側への反映が漏れていた。**本文書で追加する。**`ask_user` と別 kind にするのは、UI の扱いが違うため — `ask_user` は選好のスロットを埋めるチップ、`clarify` は**曖昧だった表層形をその場で置き換えるチップ**である。
+> **`state:plan` は廃止した**(2026-08-04、[ADR-0019](../adr/0019-react-main-agent-subagents.md))。一括プラン方式をやめたため「これからやる手の列」は存在しない。進捗の実況は **`step`** が担う。**旧 `searching`(知識検索の実況)も `step` に統合した** — `{"tool":"search_knowledge","status":"progress","label_ja":"鶴間池の資料を読んでいます"}` の形で 0 回以上出る。
+
+> **`ask_user` と `clarify` は同じ 1 つの Tool から出る。**Tool の `kind` 引数がそのまま `state` の kind になる。**別 kind に保つのは UI の扱いが違うため** — `ask_user` は選好のスロットを埋めるチップ、`clarify` は**曖昧だった表層形をその場で置き換えるチップ**である。どのエージェント(メイン / レコメンド SA / 知識検索 SA)が聞いても、フォームの表示・操作は同じでよい。
+
+> **`reason` を必ず含める**(2026-08-03 追加)。**専用フォームが表示する問いの本文である**([frontend_nav.md §2.3.2](../30_design/frontend_nav.md))。含めないと、クライアントは slot ごとの固定文を持つしかなくなり、**問いと選択肢が食い違う**(実機で発生)。`GET /thread` の `pending` にも同じく含める。
+
 
 - **`phase: provisional` → `final` の 2 段送出**が [ADR-0006](../adr/0006-recommendation-hybrid.md) 形-2 の実体。**カードと地図は provisional の時点で描画する。**同じ `kind` が 2 回来ることをクライアントは前提にする
 - `provisional` が来て `final` が来ないことがある(リランクが縮退したとき)。**その場合は `provisional` をそのまま確定として扱う。**判別は `error{code:"rerank_degraded"}` で行う
+- **`itinerary`(final)の `route_id` は送出時点で解決可能**(2026-08-04 追加、[ADR-0020](../adr/0020-routes-early-commit.md))。`itinerary.days[].items[].leg_from_prev.route_id` が指す行は、イベント送出前に commit 済みであり、直後の `GET /api/v1/routes/{route_id}` は 200 を返す。これはサーバー側の契約である(クライアントの 404 再試行は防御にすぎない)
+- **`assumptions`**(2026-08-04 追加): その版の旅程が依って立つ**未確認の前提**(日付・起点など)の日本語短文リスト。空配列なら前提なし。UI はこれが非空のとき「仮の前提あり」を表示する([frontend_nav.md §2.4](../30_design/frontend_nav.md))。undo/redo・`GET /api/v1/itinerary` の応答にも同じフィールドが載る(版に紐づいて永続化される)
 
 #### `token` — 応答本文
 
@@ -105,7 +111,7 @@ event: done    { ... }        # 必ず 1 回、最後に
 | `true` | **動いたが品質が落ちた。**結果は届く | 控えめな注記。処理は続く |
 | `false` | **失敗した。**この後 `done` が来て終わる | エラー表示 |
 
-`stage` は `understand` / `validate_plan` / `act` / `respond` / `persist`。`code` は `40_api/` の enum 1 箇所で定義する。
+`stage` は `load_context` / `update_profile` / `main_agent` / `recommend` / `plan_itinerary` / `edit_itinerary` / `search_knowledge` / `respond` / `persist`(2026-08-04 改訂: ステップ名と Tool 名)。`code` は `40_api/` の enum 1 箇所で定義する。
 
 #### `done` — 終端
 
@@ -127,50 +133,71 @@ sequenceDiagram
     C->>A: POST /api/v1/chat {"message": "..."}
     A-->>C: 200 text/event-stream
 
-    Note over A: N1 load_context（DB から状態を再構築）
-    A->>L: understand（1 回）
-    L-->>A: JSON（action / plan / 抽出）
-    A-->>C: event: state {kind:"plan"}
+    Note over A: ① load_context（DB から状態を再構築）
+    A->>L: ② update_profile（1 回）
+    A-->>C: event: state {kind:"profile"}（差分があるときだけ）
 
-    Note over A: N3 validate_plan（P1〜P8）
-    A->>S: recommend → 候補
+    Note over A: ③ メインエージェント（ReAct ループ）
+    A->>L: 1 周目（thought + 一手）
+    A-->>C: event: state {kind:"step", tool:"recommend", status:"started"}
+    A->>S: レコメンド SA → 候補
     A-->>C: event: state {kind:"candidates", phase:"provisional"}
     A->>L: リランク（縮退可）
     A-->>C: event: state {kind:"candidates", phase:"final"}
-    A->>S: plan_itinerary（ILS）
+    A-->>C: event: state {kind:"step", tool:"recommend", status:"finished"}
+    A->>L: 2 周目（結果を見て次の一手）
+    A-->>C: event: state {kind:"step", tool:"plan_itinerary", status:"started"}
+    A->>S: 旅程計画 SA（ILS + OSRM）
     A-->>C: event: state {kind:"itinerary", phase:"final"}
+    A-->>C: event: state {kind:"step", tool:"plan_itinerary", status:"finished"}
+    A->>L: 3 周目 → done
 
-    A->>L: respond（ストリーミング）
+    A->>L: ④ respond（ストリーミング）
     loop トークンごと
         L-->>A: 断片
         A-->>C: event: token
     end
 
-    Note over A: N6 persist（1 トランザクション・必ず走る）
+    Note over A: ⑤ persist（1 トランザクション・必ず走る）
     A-->>C: event: done
 ```
 
-### 1.4 聞き返し(`clarify`)のターン
+### 1.4 質問(`ask_user` / `clarify`)— Human in the Loop(2026-08-04 全面改訂)
 
-`understand` が `ask_user` を選んだターンは **`validate_plan` と `act` を飛ばす**([agent_planning_phase.md §15.6](../30_design/agent_planning_phase.md) の辺 E6)。
+**`ask_user` は結果を返す通常のツールであり、ターンを中断しない**([ADR-0019](../adr/0019-react-main-agent-subagents.md)、ユーザー指示)。エージェント(メイン / レコメンド SA / 知識検索 SA)が質問を選ぶと、**ストリームを開いたまま** `state:ask_user` / `state:clarify` が出てフォームが表示され、ユーザーの回答が**同じターンのエージェントにツール実行結果として返り、ストリームが続きを流す**。
+
+`kind` は Tool の引数がそのまま対応する — **`preference` なら `state:ask_user`、`clarify` なら `state:clarify`。**
 
 ```
+event: state   {"kind":"step","tool":"recommend","status":"started",...}
 event: state   {"kind":"clarify","surface":"2番目のやつ",
                 "options":[{"label":"鶴間池","value":"spot_012"},
                            {"label":"元滝伏流水","value":"spot_007"}]}
-event: token   {"text":"「2番目」は鶴間池と元滝伏流水のどちらでしょうか。"}
+: keep-alive                     ← 回答待ちの間もストリームは開いたまま
+（ユーザーが回答: POST /api/v1/chat/answer）
+event: state   {"kind":"step","tool":"ask_user","status":"finished"}
+event: state   {"kind":"candidates","phase":"provisional",...}   ← 同じターンが続く
+...
+event: token   {"text":"..."}
 event: done    {"turn_id":"...","message_id":89,"degraded":false}
 ```
 
-**`plan` イベントも `candidates` イベントも出ない。**クライアントは `state` が `clarify` だけだったターンを「質問だけのターン」として描く。
-
-**チップを選んだときは、通常の `POST /chat` として送る。**専用エンドポイントを作らない。
+**回答は専用エンドポイント `POST /api/v1/chat/answer` で送る**(2026-08-04 新設。§3)。質問フォーム表示中は、チップも自由入力もこのエンドポイントに送る(通常の `POST /chat` は実行中ターンがある間 409 のまま = §1.7)。
 
 ```jsonc
-{"message": "鶴間池", "resolves": {"surface": "2番目のやつ", "value": "spot_012"}}
+POST /api/v1/chat/answer
+{"answer": "鶴間池", "resolves": {"surface": "2番目のやつ", "value": "spot_012"}}
+→ 204 No Content（回答を待つターンが無ければ 409）
 ```
 
-`resolves` は任意フィールドで、**チップ経由のときだけ付く**。サーバーは `threads.pending_clarification` と突き合わせて照合し、一致すれば曖昧さが解けた状態で `understand` を回す。**自由入力で答えても動く**(G5・FR-3.2)が、その場合は `resolves` が無いので `understand` が文脈から解く。
+- `resolves` は任意フィールドで、**チップ経由のときだけ付く**。サーバーは表示中の質問(`threads.pending_ask`)と照合し、`ask_user` の実行結果 `{answer, answered_by: "chip"|"free_text"}` に組み立てて**待っているエージェントの act に返す**([agent_react_architecture.md §7](../30_design/agent_react_architecture.md))
+- **自由入力で答えても動く**(FR-3.2)。`resolves` が無ければ `answered_by: "free_text"`
+- **タイムアウトは 10 分。**回答が来なければツール結果は `answered_by: "timeout"` になり、エージェントは仮定を明示して進めるか `done` でまとめる(ストリームはその後 `token` → `done` で通常どおり終わる)
+- レスポンスが 204 なのは、**イベントはすべて元の SSE ストリームに流れる**からである。回答用の第二のストリームは作らない
+
+**質問はターンの途中で何度でも出うる**(上限 2 回/ターン。[agent_react_architecture.md §10 R4](../30_design/agent_react_architecture.md))。`candidates` が出たあとに質問が来て、回答後にまた `itinerary` が出る、という系列をクライアントは前提にする。
+
+> **`pending`(§3.1)が唯一の真実である。**`GET /thread` の `pending` は「いま回答を待っている質問」だけを返す(回答受領・ターン終了で消える。**ターンが死んでいたら返さない**)。`pending` が `null` なのにチップを残すと、古い問いに答えたつもりの送信が発生する([23_ux_issues.md §6-8](../23_ux_issues.md) で実際に観測している)。失効後の `POST /chat/answer` は 409 で拒否され、クライアントは通常の発話として送り直す。
 
 ### 1.5 決定: 再接続による途中再開は実装しない
 
@@ -182,9 +209,10 @@ event: done    {"turn_id":"...","message_id":89,"degraded":false}
 
 | | 挙動 |
 | --- | --- |
-| **サーバー** | **ターンは最後まで走り切る。**`persist` は必ず実行される([agent_planning_phase.md §16.6](../30_design/agent_planning_phase.md))ので、結果は DB に入る |
+| **サーバー** | **ターンは最後まで走り切る。**`persist` は必ず実行される([agent_react_architecture.md §13](../30_design/agent_react_architecture.md))ので、結果は DB に入る |
 | **クライアント** | 再接続時に **`GET /api/v1/thread` でスレッドを取り直す** |
 | **ユーザーから見ると** | 画面が更新され、答えが出ている |
+| **質問待ち中に切れた** | **待機は続く**(タイムアウト 10 分まで。§1.4)。リロード後は `GET /thread` の `pending` でフォームが戻り、`POST /chat/answer` で回答すれば**同じターンが続きから動く**(ただしイベントの続きは受け取れないので、終了後に `GET /thread` で取り直す) |
 
 **これが成立するのは 1 ユーザー 1 スレッドだからである。**「どのスレッドを取り直すか」に曖昧さがない([data_model.md §4.2](../30_design/data_model.md))。
 
@@ -200,11 +228,12 @@ event: done    {"turn_id":"...","message_id":89,"degraded":false}
 
 | 中断された時点 | サーバーの挙動 |
 | --- | --- |
-| `understand` / `respond` の**LLM ストリーミング中** | **打ち切る。**そこまでのトークンを `messages.status='partial'` として保存 |
+| **LLM 呼び出し中**(メインエージェントの周回・`respond` のストリーミング) | **打ち切る。**そこまでのトークンを `messages.status='partial'` として保存 |
 | **Tool の実行中**(ソルバー・OSRM) | **完了させる。**途中で止めると部分的に矛盾した状態ができる |
+| **`ask_user` の回答待ち中** | **待機は続く。**サーバーは「停止ボタンの切断」と「リロードの切断」を区別できないため(§1.5)、切断を回答待ちの中止とみなさない。回答が来なければタイムアウトで閉じる |
 | `persist` 中 | 止めない(トランザクション) |
 
-**「切ったら全部捨てる」にしない理由**は、[agent_planning_phase.md §16.6](../30_design/agent_planning_phase.md) の不変条件 —— **ユーザーが `state` で見たものは必ず保存されている** —— を守るためである。旅程カードが画面に出た後で停止ボタンを押したら旅程が消えていた、という挙動は取らない。
+**「切ったら全部捨てる」にしない理由**は、[agent_react_architecture.md §13](../30_design/agent_react_architecture.md) の不変条件 —— **ユーザーが `state` で見たものは必ず保存されている** —— を守るためである。旅程カードが画面に出た後で停止ボタンを押したら旅程が消えていた、という挙動は取らない。
 
 ### 1.7 エラーはどこに出るか
 
@@ -232,12 +261,12 @@ flowchart LR
 
 ### 2.1 なぜ専用 REST を作るのか
 
-undo の入口は 2 つある([agent_planning_phase.md §4.2](../30_design/agent_planning_phase.md))。**どちらも同じ「`is_current` を移す」処理に落ちる**が、経路が違う。
+undo の入口は 2 つある([agent_react_architecture.md §5](../30_design/agent_react_architecture.md))。**どちらも同じ「`is_current` を移す」処理に落ちる**が、経路が違う。
 
 | 入口 | 経路 | LLM |
 | --- | --- | --- |
 | **差分カードの [元に戻す] ボタン** | **本節の REST** | **通さない** |
-| 自然言語「さっきのに戻して」 | `POST /chat` → `understand` → `edit_itinerary` の `revert` op | `understand` のみ |
+| 自然言語「さっきのに戻して」 | `POST /chat` → メインエージェント → `edit_itinerary` の `revert` op | メインの周回のみ |
 
 **ボタンから LLM を通さないのは、undo が確実性を要する操作だからである。**「元に戻す」を押したのに意図の解釈が挟まる設計は取らない。
 
@@ -274,6 +303,7 @@ GET /api/v1/itinerary        → 現在の版（同じスキーマ）
 | `GET` | `/api/v1/me` | ユーザー + プロファイル | |
 | `GET` | **`/api/v1/thread`** | **スレッドの復元。**メッセージ・現在の旅程・プロファイルを 1 回で返す | §3.1 |
 | `POST` | **`/api/v1/chat`** | **SSE** | §1 |
+| `POST` | **`/api/v1/chat/answer`** | **`ask_user` への回答**(HITL)。204。イベントは元のストリームに流れる | §1.4 |
 | `GET` | `/api/v1/itinerary` | 現在の版 | §2 |
 | `POST` | `/api/v1/itinerary/undo` / `redo` | 版を移す | §2 |
 | `GET` | `/api/v1/spots` | POI・施設の一覧 | §3.2 |
@@ -306,14 +336,15 @@ GET /api/v1/itinerary        → 現在の版（同じスキーマ）
                  "meta": {}, "created_at": "..."} ],
   "itinerary": {"kind":"itinerary","phase":"final","version":4,"itinerary":{...}},
   "profile": {...},
-  "pending": {"kind": "clarify", "surface": "2番目のやつ", "options": [...]}
+  "pending": {"kind": "clarify", "surface": "2番目のやつ", "options": [...],
+              "reason": "..."}   // いま回答を待っている質問（無ければ null。§1.4）
 }
 ```
 
 **リロードでも再接続でも、このエンドポイント 1 回で画面が完全に戻る。**§1.5 の「切れたら取り直す」がこれに依存している。
 
 - `meta` をそのまま返すのは、**カードと地図を再描画するため**([data_model.md §4.4](../30_design/data_model.md))。`meta.presented` から推薦カードを、`meta.itinerary_version` から旅程を復元する
-- `pending` は `threads.pending_clarification` が生きているときだけ入る。**リロードしても質問のチップが消えない**
+- `pending` は**回答待ちのターンが実際に生きているときだけ**入る(サーバーが待機の生存を確認して返す。プロセス再起動等でターンが死んでいたら `pending_ask` を掃除して `null`)。**リロードしても質問のフォームが復元され、回答すればターンが続きから動く。**逆に `pending` が `null` ならクライアントはフォームを消すこと(§1.4)
 - メッセージはページングしない(1 スレッドが数十件の規模)
 
 ### 3.2 `GET /api/v1/spots` — フロント側のデータコピーを廃止する
@@ -346,9 +377,9 @@ If-None-Match: "..."
 
 ---
 
-## 4. 認証 — 研究用の最小形
+## 4. 認証 — 最小形
 
-FR-5.1 は「研究用の簡易なユーザー登録・識別」しか要求していない。ただし **1 ユーザー 1 スレッドにした以上、「誰なのか」をサーバーが特定できないと `GET /api/v1/thread` が成立しない。**
+FR-5.1 は「簡易なユーザー登録・識別」しか要求していない。ただし **1 ユーザー 1 スレッドにした以上、「誰なのか」をサーバーが特定できないと `GET /api/v1/thread` が成立しない。**
 
 **決定: ログイン時に不透明なトークンを発行し、`Authorization: Bearer <token>` で送る。**
 
@@ -359,9 +390,9 @@ POST /api/v1/login  {"user_name": "p01"}
 
 | 決めたこと | 理由 |
 | --- | --- |
-| **パスにユーザー名を含めない** | 現行の `GET /users/{name}/session` は**他人の名前を入れれば他人の会話が読める**。実験参加者のデータが混ざる事故を、URL の形の段階で防ぐ |
-| **パスワードは持たない** | 要求にない。研究参加者の識別が目的 |
-| **トークンは失効しない**(1 ユーザー 1 本) | 実験期間中に再ログインを強いる意味がない |
+| **パスにユーザー名を含めない** | 現行の `GET /users/{name}/session` は**他人の名前を入れれば他人の会話が読める**。利用者のデータが混ざる事故を、URL の形の段階で防ぐ |
+| **パスワードは持たない** | 要求にない。利用者の識別が目的 |
+| **トークンは失効しない**(1 ユーザー 1 本) | 再ログインを強いる意味がない |
 
 **[data_model.md §4.1](../30_design/data_model.md) に `api_token` 列を追加した(反映済み)。**同文書の執筆時に見落としていた列である。
 
@@ -391,7 +422,7 @@ api/schemas/*.py  ──[FastAPI]──▶ openapi.json ──[openapi-typescrip
 | --- | --- |
 | リバースプロキシ | 内側より長く。**SSE はバッファさせない**(§1.1) |
 | `POST /chat` 全体 | LLM + ソルバーの合計より長く |
-| LLM 1 回 | `understand` は短め、`respond` はストリーミングなので実質ハートビート依存 |
+| LLM 1 回 | エージェントの周回・`update_profile` は短め、`respond` はストリーミングなので実質ハートビート依存 |
 | ソルバー | 打ち切ったら貪欲解を返す(`error{degraded:true}`) |
 
 **SSE は「無音のまま長時間開く」ことがある**ので、タイムアウトの設定だけでは足りない。§1.5 のハートビートと組で守る。
@@ -422,7 +453,7 @@ api/schemas/*.py  ──[FastAPI]──▶ openapi.json ──[openapi-typescrip
 | 4 | **キャンセル時、LLM は打ち切るが Tool は完了させる** | 部分的に矛盾した状態を作らない。「見たものは保存されている」を守る |
 | 5 | **ストリーム開始後の失敗は HTTP 200 のまま `error` + `done`** | SSE の構造的制約。クライアントは 200 でも失敗しうる前提で書く |
 | 6 | **同時ターンは 409 で拒否** | 同じスレッド状態を 2 ターンが書き換えると壊れる |
-| 7 | **`state` に `kind:"clarify"` を追加** | ADR-0010 の反映漏れ。`ask_user` とは UI の扱いが違う |
+| 7 | **`state` に `kind:"clarify"` を追加** | `ask_user` とは UI の扱いが違う。**2026-08-03: 両 kind とも `ask_user` Tool の `kind` 引数から出る**([ADR-0018](../adr/0018-ask-user-resumable-tool.md)) |
 | 8 | **`done` を必ず送る**(エラー時も) | 「終わった」と「切れた」をクライアントが判別できるように |
 | 9 | **undo/redo は専用 REST。LLM を通さない** | 確実性を要する操作に意図の解釈を挟まない |
 | 10 | **undo は `expected_current_version` で楽観ロック** | 二重クリック・古い画面からの操作を弾く |

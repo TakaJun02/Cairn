@@ -1,5 +1,5 @@
 // public/sw.js
-// v2 — packs(音声)のRange対応 + OSMタイルのオフライン対応
+// v2 — packs(音声)のRange対応 + 地図タイルのオフライン対応
 self.addEventListener('install', (event) => {
   event.waitUntil(precacheStaticAssets());
   self.skipWaiting();
@@ -11,13 +11,11 @@ const TILES_CACHE  = 'tiles-v1';
 const RUNTIME      = 'runtime';
 const STATIC_ASSETS = ['/sound.mp3'];
 
-// タイルの許可ホスト（OSM公式）
+// lib/tiles.js が使う ArcGIS World Street Map
 const TILE_HOSTS = [
-  'tile.openstreetmap.org',
-  'a.tile.openstreetmap.org',
-  'b.tile.openstreetmap.org',
-  'c.tile.openstreetmap.org',
+  'server.arcgisonline.com',
 ];
+const TILE_PATH_PREFIX = '/ArcGIS/rest/services/World_Street_Map/MapServer/tile/';
 
 const EMPTY_TILE_PNG = (() => {
   // 透明1x1 PNG（tileサイズとは無関係・ブラウザ側で拡大される）
@@ -162,11 +160,11 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // OSMタイル（クロスオリジン）— キャッシュ or 透過タイルでフォールバック
+  // ArcGISタイル（クロスオリジン）— キャッシュ or 透過タイルでフォールバック
   if (req.method === 'GET'
       && req.destination === 'image'
       && TILE_HOSTS.includes(url.host)
-      && url.pathname.endsWith('.png')) {
+      && url.pathname.startsWith(TILE_PATH_PREFIX)) {
     event.respondWith(handleTiles(req));
     return;
   }

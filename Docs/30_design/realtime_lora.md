@@ -184,7 +184,7 @@ uplink 受信
 ```
 
 - **デコードした値を検証してから使う。**現行は base64 の中身を無検証で DB の upsert キーにしていた([22 §6-10](../22_current_issues.md))
-- `device_id` とユーザーの対応は `app.users` に `lora_device_id text UNIQUE` を足して持つ(研究規模なので端末は数台)
+- `device_id` とユーザーの対応は `app.users` に `lora_device_id text UNIQUE` を足して持つ(端末は数台の規模)
 
 ---
 
@@ -307,5 +307,5 @@ POST /api/v1/realtime/spots/{spot_id}       # 1 点だけ手で設定
 | 1 | 端末の自動要求間隔(90 分)と 1 日の自制回数(8 回) |
 | 2 | 最短送信間隔(5 分) |
 | 3 | シミュレータの `--speed` の既定値 |
-| 4 | `device_id` とユーザーの紐づけ手順(研究用に手作業でよい) |
+| 4 | `device_id` とユーザーの紐づけ手順(手作業でよい) |
 | 5 | f_port の値(現行の `2` を踏襲する) |

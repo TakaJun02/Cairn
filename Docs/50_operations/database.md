@@ -40,17 +40,17 @@ docker build -t guidance-postgres:16-3.4-pgvector -f docker/postgres/Dockerfile 
 
 ```yaml
 db:
+  image: guidance-postgres:16-3.4-pgvector
   build:
     context: ./docker/postgres
-  env_file: [.env]
   environment:
-    POSTGRES_DB:       ${POSTGRES_DB}
-    POSTGRES_USER:     ${POSTGRES_USER}
-    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    POSTGRES_DB:       guidance
+    POSTGRES_USER:     guidance
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD を .env に設定してください（.env.example 参照）}
   volumes: [pgdata:/var/lib/postgresql/data]
   ports: ["5432:5432"]
   healthcheck:
-    test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+    test: ["CMD-SHELL", "pg_isready -U guidance -d guidance"]
     interval: 5s
     timeout: 5s
     retries: 20
@@ -58,6 +58,28 @@ db:
 
 - **DB は 1 台だけ**([ADR-0002](../adr/0002-single-postgres.md))。旧構成の `static-db` / `app-db` / `chromadb` は廃止する
 - **初期化コンテナ(`static-db-init` / `app-db-init`)も廃止**し、`python -m app.cli` に統合する(§3)
+- **`env_file` は渡さない**([20_architecture.md §11](../20_architecture.md))。DB コンテナに要るのは上の 3 つだけで、Tavily キーや MQTT 資格情報を持つ理由がない
+- **DB 名・ユーザー名は `guidance` に固定する。`.env` では扱わない**([20_architecture.md §11](../20_architecture.md))。この 3 つはすべて **initdb(`pgdata` の初回作成)時にだけ効く**ので、既存ボリュームがある状態で書き換えても DB 側は変わらず、接続できなくなるだけである。`.env` に置くと「変えられる」ように見えてしまうため、compose と `Settings` の両方に定数として書く
+- **`POSTGRES_PASSWORD` だけは `.env`**(秘密のため)。initdb 済みのボリュームに対しては同様に無効なので、変えるなら §4 の `down -v` か `ALTER ROLE ... PASSWORD` を使う
+
+### 名前を変えたくなったとき（既存ボリュームを保ったまま）
+
+`down -v` はデータを失う。**メタデータのリネームで済む**。
+
+```bash
+docker compose stop app                     # 接続を切る（DB のリネームには接続 0 が要る）
+docker compose exec db psql -U <旧名> -d postgres \
+  -c "CREATE ROLE tmp_rename SUPERUSER LOGIN PASSWORD 'tmp';"   # 自分自身は改名できないため
+docker compose exec db env PGPASSWORD=tmp psql -U tmp_rename -h 127.0.0.1 -d postgres \
+  -c "ALTER DATABASE <旧名> RENAME TO guidance;" \
+  -c "ALTER ROLE     <旧名> RENAME TO guidance;"
+docker compose exec db psql -U guidance -h 127.0.0.1 -d guidance -c "DROP ROLE tmp_rename;"
+docker compose up -d
+```
+
+- **セッションユーザ自身はリネームできない**(`session user cannot be renamed`)ので一時スーパーユーザを経由する
+- **パスワードは SCRAM-SHA-256 なら保持される。md5 だと消去される**(md5 はロール名をソルトに使うため)。PostgreSQL 16 の既定は SCRAM なので通常は問題ない。`SHOW password_encryption;` で確認できる
+- 2026-08-03 にこの手順で `static_db` → `guidance` を実施済み(旧構成の名前が残っていたため)。app のデータ・埋め込み・派生データはすべて保持された
 
 ---
 
