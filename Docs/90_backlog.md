@@ -11,9 +11,8 @@
 > - **テスト**: バックエンド 339 passed / DB 統合込み +10 / フロント 26 passed。migration 0004 適用済み
 > - **実機確認済みシナリオ**: HITL(質問→チップ回答→**同一ターン継続**→候補5件)/ 旅程作成(仮定の明示)/ 編集+diff / 自然言語 undo(時刻完全復元)/ QA(ナレッジ根拠)/ 編集系発話のプロフィール更新
 > - **実機で発見し修正した問題**: ① xgrammar の guided decoding が「配列要素内の number」直後に空白無限ループ(実機再現済み)→ update_profile は guided 失敗時に非 guided フォールバック ② respond クローズドワールド検査が起点施設名を誤検知 → 軌跡テキストの名前を許可語彙に
-> - **残る既知問題(本作り替えのスコープ外・未解決のまま)**: [23_ux_issues.md](23_ux_issues.md) §1-2〜1-5(routes 404 競合で地図の経路復元が失敗。コンソールエラーとして再現)/ §2-1 系(ILS が編集時に未指定スポットを入れ替える。diff には正直に出る)/ §3〜§6 の UI 問題
-> - **監視項目**: `main_agent` の `constraints.add[].weight`(minimum のみの number-in-array)も同じ xgrammar 不具合を踏み得る(簡易再現あり)。症状が出たら update_profile と同じフォールバックを適用する
-> - **文書の後追い**: [24_architecture_as_built.md](24_architecture_as_built.md) の再執筆(新実装との照合)が未着手。agent_react_architecture.md への「guided 失敗時フォールバック」の footnote 追記も検討
+> - **残る既知問題・監視項目は [25_known_issues.md](25_known_issues.md) が正**(2026-08-04 新設。routes 404 競合 / ILS の編集時入れ替え / xgrammar の number-in-array 監視 / UI 残存分 / 認証の仕様判断、を集約)
+> - **文書の後追いは完了(2026-08-04)**: [24_architecture_as_built.md](24_architecture_as_built.md) を ReAct 構成で再執筆(照合済み・食い違い 5 件は同書 §7)。agent_react_architecture.md §2 に guided フォールバックの実装補足を追記。[23_ux_issues.md](23_ux_issues.md) は凍結し 25 へ引き継ぎ
 >
 > ---
 >
