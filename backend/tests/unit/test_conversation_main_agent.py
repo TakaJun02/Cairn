@@ -528,8 +528,128 @@ async def test_tool_error_non_recoverable_aborts_loop() -> None:
     assert len(client.calls) == 2
     assert state.trajectory[0].error["recoverable"] is False
     error_events = [event for event in sink.events if event.event == "error"]
+    # 2026-08-04、レビュー是正(M-1): stage は SSE 契約(chat_sse.md
+    # ErrorStage)の語彙内なら落ちた Tool 名(ここでは "recommend")を
+    # そのまま残す。語彙外へ一律 "main_agent" に落とすと、語彙内 Tool の
+    # stage 情報を不要に失っていた(旧是正の過剰対応)。
     assert error_events[0].data["stage"] == "recommend"
     assert error_events[0].data["degraded"] is False
+
+
+async def test_tool_error_non_recoverable_ask_user_stage_falls_back_to_main_agent() -> None:
+    """M-1: "ask_user" は SSE 契約の ErrorStage 語彙に無いため、非回復の
+
+    ToolError で打ち切るときだけ stage は "main_agent" へフォールバックする
+    (語彙内の Tool は Tool 名をそのまま残す。上の
+    `test_tool_error_non_recoverable_aborts_loop` と対になる回帰テスト)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    tools.ask_queue = [
+        ToolError(
+            code=ToolErrorCode.INTERNAL,
+            message_ja="質問の送出に失敗しました。",
+            recoverable=False,
+        )
+    ]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="preference",
+                    slot="mobility",
+                    reason="どのくらい歩けますか",
+                ),
+            ),
+        ]
+    )
+    sink = MemoryEventSink()
+
+    await run_main_agent(state, tools=tools, client=client, event_sink=sink)
+
+    assert [call[0] for call in tools.calls] == ["ask_user"]
+    assert state.trajectory[0].error["recoverable"] is False
+    error_events = [event for event in sink.events if event.event == "error"]
+    assert error_events[0].data["stage"] == "main_agent"
+    assert error_events[0].data["degraded"] is False
+
+
+async def test_dispatch_recommend_args_validation_error_is_recoverable_and_continues() -> None:
+    """M-2: `_dispatch` の包括 except の手前で `ValidationError` を捕捉し、
+
+    どの Tool でも recoverable=true の観測として差し戻す(guided スキーマが
+    通常防ぐ型不一致でも、ターンを打ち切らない)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    tools.search_queue = [_search_result()]
+    client = ScriptedMainAgentClient(
+        [
+            # instruction が str ではなく int(型不一致)。
+            _turn_json("recommend", {"instruction": 123}),
+            _turn_json("search_knowledge", {"request": "由来", "spot_name": None}),
+            _turn_json("done", {}),
+        ]
+    )
+    sink = MemoryEventSink()
+
+    await run_main_agent(state, tools=tools, client=client, event_sink=sink)
+
+    # recommend は Tool 本体まで到達せず(args 検証で落ちる)、
+    # search_knowledge は通常どおり実行される。
+    assert [call[0] for call in tools.calls] == ["search_knowledge"]
+    assert state.trajectory[0].tool == "recommend"
+    assert state.trajectory[0].error is not None
+    assert state.trajectory[0].error["recoverable"] is True
+    assert "recommend の引数が契約に違反しています" in state.trajectory[0].observation
+    assert "最も妥当な解釈で引数を直して再実行してください" in state.trajectory[0].observation
+    assert state.executed_tool_count == 1  # search_knowledge のみ(recommend は数えない)
+    error_events = [event for event in sink.events if event.event == "error"]
+    assert error_events == []  # recoverable=true はループを打ち切らない
+
+
+async def test_ask_user_invalid_kind_slot_combination_is_recoverable_and_continues() -> None:
+    """欠陥1(25 §1-6): guided スキーマが防いでも、契約違反の生 args が来た
+
+    場合に備え `_dispatch_ask_user` は `AskUserArgs` の ValidationError を
+    recoverable=true の ToolError として観測に差し戻す。以前は `_dispatch`
+    の包括 except が recoverable=false の INTERNAL に変換し、ループを
+    打ち切っていた(このテストはその回帰を防ぐ)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                # kind=clarify なのに slot が非 null(排他違反)。
+                _ask_user_action(kind="clarify", slot="mobility", surface="鶴間池"),
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+    sink = MemoryEventSink()
+
+    await run_main_agent(state, tools=tools, client=client, event_sink=sink)
+
+    # ask_execution/ask_registry へは一切到達しない(検証で落ちるため)。
+    assert tools.calls == []
+    assert state.trajectory[0].tool == "ask_user"
+    assert state.trajectory[0].error is not None
+    assert state.trajectory[0].error["recoverable"] is True
+    assert "契約に違反しています" in state.trajectory[0].observation
+    assert "最も妥当な解釈を採って進めてください" in state.trajectory[0].observation
+    # ループは打ち切られず done まで到達する。
+    assert state.main_agent_turns == 2
+    # L-3(2026-08-04、レビュー是正): 実行されなかった手は R1(§3.5)の
+    # 手数上限に数えない(A4/A6 の他の早期リターンと同じ扱い)。
+    assert state.executed_tool_count == 0
+    error_events = [event for event in sink.events if event.event == "error"]
+    assert error_events == []
 
 
 async def test_state_step_fires_started_then_finished_and_never_plan() -> None:

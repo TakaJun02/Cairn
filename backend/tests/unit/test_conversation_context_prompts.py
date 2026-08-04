@@ -8,6 +8,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
+from pydantic import ValidationError
+
 from app.domains.conversation.context import load_context
 from app.domains.conversation.prompts import (
     MAIN_AGENT_SYSTEM_PROMPT,
@@ -25,7 +28,7 @@ from app.domains.conversation.state import (
     SpotFact,
     TurnState,
 )
-from app.domains.conversation.types import ResponseMode, TrajectoryStep
+from app.domains.conversation.types import AskUserArgs, ResponseMode, TrajectoryStep, slot_values
 from app.domains.itinerary.types import Itinerary
 
 
@@ -273,6 +276,88 @@ def test_main_agent_guided_schema_plan_itinerary_branch_has_candidate_spots() ->
     assert properties["candidate_spots"]["type"] == "array"
     assert properties["candidate_spots"]["items"] == {"type": "string", "minLength": 1}
     assert "candidate_spots" in plan_branch["properties"]["args"]["required"]
+
+
+def test_main_agent_guided_schema_ask_user_branch_is_exclusive_by_kind() -> None:
+    """欠陥1(25 §1-6): `ask_user` 分岐は `kind` ごとの anyOf で
+
+    `slot`/`surface` の排他をスキーマ側で強制する(平坦スキーマだと
+    `kind="clarify"` に `slot` 非 null を LLM が書けてしまい、
+    `AskUserArgs.model_validate` の ValidationError がターンを落としていた)。
+    """
+
+    schema = main_agent_guided_schema(["c_001"])
+    branches = schema["properties"]["action"]["anyOf"]
+    ask_user_branch = next(
+        branch for branch in branches if branch["properties"]["tool"]["enum"] == ["ask_user"]
+    )
+    args_branches = ask_user_branch["properties"]["args"]["anyOf"]
+    assert len(args_branches) == 2
+
+    preference_branch = next(
+        branch
+        for branch in args_branches
+        if branch["properties"]["kind"]["enum"] == ["preference"]
+    )
+    clarify_branch = next(
+        branch for branch in args_branches if branch["properties"]["kind"]["enum"] == ["clarify"]
+    )
+
+    # preference: slot は enum(null 不可)、surface は null 固定。
+    assert preference_branch["properties"]["slot"]["type"] == "string"
+    assert "enum" in preference_branch["properties"]["slot"]
+    assert preference_branch["properties"]["surface"] == {"type": "null"}
+    assert preference_branch["additionalProperties"] is False
+
+    # clarify: slot は null 固定、surface は非空 string。
+    assert clarify_branch["properties"]["slot"] == {"type": "null"}
+    assert clarify_branch["properties"]["surface"]["type"] == "string"
+    assert clarify_branch["properties"]["surface"]["minLength"] == 1
+    assert clarify_branch["additionalProperties"] is False
+
+    for branch in args_branches:
+        assert set(branch["required"]) == {"kind", "slot", "surface", "reason", "options"}
+
+    # L-5(2026-08-04、レビュー是正): "reason"/"options" は分岐間で共有オブジェ
+    # クトにしない(片方を書き換えるともう片方まで変わる不変条件違反を防ぐ)。
+    assert preference_branch["properties"]["options"] is not clarify_branch["properties"]["options"]
+    assert preference_branch["properties"]["reason"] is not clarify_branch["properties"]["reason"]
+
+
+def test_main_agent_guided_schema_ask_user_branches_match_ask_user_args_pydantic() -> None:
+    """L-4: スキーマの各分岐の最小インスタンスが `AskUserArgs` の検証を通り、
+
+    分岐を交差させた組み合わせ(clarify なのに slot 非 null)は
+    `ValidationError` になることを確認する(スキーマ⇔pydantic の整合)。
+    """
+
+    preference_instance = {
+        "kind": "preference",
+        "slot": slot_values()[0],
+        "surface": None,
+        "reason": "確認させてください",
+        "options": [
+            {"label": "はい", "value": "yes"},
+            {"label": "いいえ", "value": "no"},
+        ],
+    }
+    clarify_instance = {
+        "kind": "clarify",
+        "slot": None,
+        "surface": "2番目のやつ",
+        "reason": "候補が 2 つあります",
+        "options": [
+            {"label": "鶴間池", "value": "spot_001"},
+            {"label": "元滝伏流水", "value": "spot_002"},
+        ],
+    }
+
+    AskUserArgs.model_validate(preference_instance)
+    AskUserArgs.model_validate(clarify_instance)
+
+    crossed = {**clarify_instance, "slot": slot_values()[0]}
+    with pytest.raises(ValidationError):
+        AskUserArgs.model_validate(crossed)
 
 
 def test_main_agent_done_only_schema_only_allows_done() -> None:

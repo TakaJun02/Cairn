@@ -41,7 +41,13 @@ from pydantic import ValidationError
 
 from app.core.llm import GenerationError
 from app.domains.conversation.ask_execution import execute_ask_user
-from app.domains.conversation.events import EventSinkLike, emit, error_event, state_event
+from app.domains.conversation.events import (
+    EventSinkLike,
+    emit,
+    error_event,
+    resolve_error_stage,
+    state_event,
+)
 from app.domains.conversation.guards import (
     MAX_ASK_STREAK,
     MAX_ASK_USER_PER_TURN,
@@ -296,10 +302,17 @@ async def run_main_agent(
         if executed:
             executed_count += 1
         if error_payload is not None and not error_payload.get("recoverable", True):
+            # stage は SSE 契約(chat_sse.md)の ErrorStage 語彙に合わせる。
+            # 語彙内の Tool 名(recommend/plan_itinerary/edit_itinerary/
+            # search_knowledge)はそのまま stage に残す。語彙外の Tool 名
+            # ("ask_user"。2026-08-04 実機再現、[25 §1-6])だけ
+            # `resolve_error_stage` が "main_agent" へフォールバックする
+            # (2026-08-04、レビュー是正 M-1。以前は常に "main_agent" へ
+            # 落としており、語彙内 Tool の stage 情報を不要に失っていた)。
             await emit(
                 event_sink,
                 error_event(
-                    stage=tool,
+                    stage=resolve_error_stage(tool),
                     code=str(error_payload.get("code", "internal")),
                     degraded=False,
                     message=str(error_payload.get("message_ja", "")),
@@ -385,7 +398,9 @@ async def _dispatch(
     (2026-08-04、レビュー是正・裁定18)。`ask_user` 以外は Tool が
     ディスパッチされた時点で必ず何か実行されるため常に `True`。`ask_user`
     だけはガード(R4/A1〜A6)で実行されないことがあるため、
-    `_dispatch_ask_user` の判定をそのまま伝える。
+    `_dispatch_ask_user` の判定をそのまま伝える。`args` の契約違反
+    (`ValidationError`。M-2)で落ちた場合は、どの Tool でも実行されて
+    いないので `False` になる。
     """
 
     try:
@@ -409,6 +424,24 @@ async def _dispatch(
             return await _dispatch_ask_user(
                 state, tools, raw_args, step_id, client=client, event_sink=event_sink
             )
+    except ValidationError as exc:
+        # M-2(2026-08-04、レビュー是正): 各 Tool の args 契約違反(型不一致・
+        # 必須項目欠落等)は、guided スキーマが通常防ぐが、フォールバック
+        # 応答等で契約違反の生 args が来た場合に備え、どの Tool でも
+        # recoverable=true の観測として差し戻す(設計は「Tool の失敗は結果で
+        # 差し戻し、次の一手で対処する」)。`_dispatch_ask_user` 内の個別
+        # try/except(より具体的な message_ja)はこれより先に評価されるため、
+        # ここには重複して届かない。
+        error = ToolError(
+            code=ToolErrorCode.INTERNAL,
+            message_ja=(
+                f"{tool} の引数が契約に違反しています: {str(exc)[:240]}。"
+                "最も妥当な解釈で引数を直して再実行してください。"
+            ),
+            recoverable=True,
+            details={"error_type": type(exc).__name__},
+        )
+        return error.message_ja, _error_payload(error), False
     except Exception as exc:  # noqa: BLE001 - Tool 実装からの漏れも結果へ閉じる(C6)
         logger.exception("main_agent_dispatch_failed", extra={"tool": tool})
         error = ToolError(
@@ -605,9 +638,31 @@ async def _dispatch_ask_user(
     `kind=clarify` の `options[].value` はスポット**名**で書かれる。ここで
     名前 → spot_id を解決してから `ask_execution.execute_ask_user` へ渡す。
     1 つでも解決できなければ質問そのものを実行しない(A4)。
+
+    `AskUserArgs.model_validate` の `ValidationError`(`kind` と `slot`/
+    `surface` の排他違反等)は、guided スキーマの anyOf 分岐(§14・
+    `prompts._ask_user_args_schema`)で通常は防がれるが、フォールバック応答
+    やモックなど契約違反の生 args が来た場合に備え、ここで捕捉して
+    recoverable=true の `ToolError` を観測として差し戻す(2026-08-04
+    実機再現、[25 §1-6])。旧実装はここで例外を投げっぱなしにし、呼び出し元
+    `_dispatch` の包括 except(C6)が recoverable=false の INTERNAL に変換して
+    ターンを打ち切っていた(設計は「Tool の失敗は結果で差し戻し、次の一手で
+    対処する」— recoverable のはず)。
     """
 
-    parsed = AskUserArgs.model_validate(raw_args)
+    try:
+        parsed = AskUserArgs.model_validate(raw_args)
+    except ValidationError as exc:
+        error = ToolError(
+            code=ToolErrorCode.INTERNAL,
+            message_ja=(
+                f"ask_user の引数が契約に違反しています: {str(exc)[:240]}。"
+                "最も妥当な解釈を採って進めてください。"
+            ),
+            recoverable=True,
+            details={"error_type": type(exc).__name__},
+        )
+        return error.message_ja, _error_payload(error), False
     if parsed.kind == "clarify":
         context = _name_context(state)
         # A6(2026-08-04、レビュー是正・裁定17。最小実装): `surface` 自体が

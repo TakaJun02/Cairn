@@ -476,12 +476,25 @@ def _ask_user_option_schema() -> dict[str, Any]:
 
 
 def _ask_user_args_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "kind": {"type": "string", "enum": ["preference", "clarify"]},
-            "slot": {"anyOf": [{"type": "null"}, {"type": "string", "enum": slot_values()}]},
-            "surface": _nullable_string(min_length=1),
+    """`kind` ごとの anyOf 分岐で `slot`/`surface` の排他をスキーマ側で強制する。
+
+    2026-08-04 実機再現([25 §1-6](../../../../Docs/25_known_issues.md)):
+    旧スキーマは `kind`/`slot`/`surface` を独立フィールドとして許す平坦な
+    構成だったため、LLM が `kind="clarify"` に `slot` 非 null を書ける組み
+    合わせを guided decoding が生成し得た。`AskUserArgs.model_validate` の
+    ValidationError が `_dispatch` の包括 except で recoverable=false の
+    INTERNAL に化けてターン全体を落としていた。メインループの Tool 分岐
+    (`main_agent_guided_schema`)と同じ「kind ごとに anyOf で分ける」
+    パターンで、生成時点から不正な組み合わせを排除する(§14 の型定義
+    `AskUserArgs.validate_kind_shape` が正)。
+    """
+
+    def _common_properties() -> dict[str, Any]:
+        # 2026-08-04、レビュー是正(L-5): 呼ぶたびに新しい dict を返す。
+        # 呼び出し元で 1 回だけ作って `**` で両分岐に展開すると、"options"
+        # (と入れ子の `_ask_user_option_schema()`)が両分岐で同一オブジェクト
+        # になり、片方を書き換えるともう片方まで変わってしまう。
+        return {
             "reason": {"type": "string", "minLength": 1},
             "options": {
                 "type": "array",
@@ -489,10 +502,31 @@ def _ask_user_args_schema() -> dict[str, Any]:
                 "minItems": 2,
                 "maxItems": 4,
             },
+        }
+
+    preference_branch = {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["preference"]},
+            "slot": {"type": "string", "enum": slot_values()},
+            "surface": {"type": "null"},
+            **_common_properties(),
         },
         "required": ["kind", "slot", "surface", "reason", "options"],
         "additionalProperties": False,
     }
+    clarify_branch = {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["clarify"]},
+            "slot": {"type": "null"},
+            "surface": {"type": "string", "minLength": 1},
+            **_common_properties(),
+        },
+        "required": ["kind", "slot", "surface", "reason", "options"],
+        "additionalProperties": False,
+    }
+    return {"anyOf": [preference_branch, clarify_branch]}
 
 
 def _constraint_add_schema() -> dict[str, Any]:

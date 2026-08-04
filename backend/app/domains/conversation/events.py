@@ -82,6 +82,19 @@ _VALID_ERROR_STAGES: frozenset[str] = frozenset(get_args(ErrorStage))
 _FALLBACK_ERROR_STAGE: ErrorStage = "main_agent"
 
 
+def resolve_error_stage(candidate: str) -> str:
+    """`candidate` を `ErrorStage` の語彙に正規化する小ヘルパ。
+
+    2026-08-04、レビュー是正(M-1): `main_agent.py` のようにループ打ち切り時
+    「失敗した Tool 名を stage に使いたいが、Tool 名の一部(`ask_user`)は
+    語彙に無い」場面で使う。語彙集合(`_VALID_ERROR_STAGES`)は
+    `error_event` と共有し、ここで二重定義しない。語彙内ならそのまま返し
+    (Tool 名を保つ)、語彙外なら `main_agent` へフォールバックする。
+    """
+
+    return candidate if candidate in _VALID_ERROR_STAGES else _FALLBACK_ERROR_STAGE
+
+
 def error_event(
     *,
     stage: str,
@@ -101,9 +114,13 @@ def error_event(
     """
 
     if stage not in _VALID_ERROR_STAGES:
+        # `extra` のキーは LogRecord の予約名(`message`/`asctime` 等)を避ける
+        # (2026-08-04 実機再現、[25 §1-6])。`message` を使うと
+        # `Logger.makeRecord` が `KeyError("Attempt to overwrite 'message' in
+        # LogRecord")` を投げ、この防御自体がターンを落としていた。
         logger.warning(
             "invalid_error_stage",
-            extra={"stage": stage, "code": code, "message": message},
+            extra={"stage": stage, "code": code, "error_message": message},
         )
         stage = _FALLBACK_ERROR_STAGE
     return ConversationEvent(
