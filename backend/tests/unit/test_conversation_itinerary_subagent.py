@@ -224,6 +224,85 @@ async def test_plan_itinerary_passes_notes_as_selection_hint() -> None:
     assert call["use_specialist"] is True
 
 
+async def test_plan_itinerary_forwards_assumptions_to_tool_args() -> None:
+    """ADR-0021: plan_itinerary.assumptions がそのまま Tool 引数へ渡る。"""
+
+    state = _state()
+    tools = FakeItineraryTools()
+    tools.plan_queue = [_plan_result(spot_ids=["spot_a"])]
+
+    await run_plan_itinerary(
+        state,
+        tools,
+        {
+            "days": [
+                {
+                    "date": "2026-08-10",
+                    "start": "09:00",
+                    "end": "17:00",
+                    "origin_name": None,
+                    "destination_name": None,
+                }
+            ],
+            "must_visit": [],
+            "constraints": None,
+            "notes": None,
+            "assumptions": ["日付は明日と仮定"],
+        },
+        step_id=1,
+    )
+
+    assert tools.plan_calls[0]["args"].assumptions == ["日付は明日と仮定"]
+
+
+async def test_edit_itinerary_forwards_allow_refill_and_assumptions_to_tool_args() -> None:
+    """ADR-0021: edit_itinerary.allow_refill/assumptions がそのまま Tool 引数へ渡る。"""
+
+    state = _state(itinerary=_existing_itinerary(constraints=[]))
+    tools = FakeItineraryTools()
+    tools.edit_queue = [_edit_result(spot_ids=["spot_a"])]
+
+    await run_edit_itinerary(
+        state,
+        tools,
+        {
+            "ops": [{"op": "remove", "targets": ["地点エー"]}],
+            "constraints": None,
+            "notes": None,
+            "allow_refill": True,
+            "assumptions": ["起点は道の駅のまま"],
+        },
+        step_id=1,
+    )
+
+    call = tools.edit_calls[0]
+    assert call["args"].allow_refill is True
+    assert call["args"].assumptions == ["起点は道の駅のまま"]
+
+
+async def test_edit_itinerary_defaults_allow_refill_false_and_assumptions_none() -> None:
+    """既定は allow_refill=False・assumptions=None(基の版からコピー)。"""
+
+    state = _state(itinerary=_existing_itinerary(constraints=[]))
+    tools = FakeItineraryTools()
+    tools.edit_queue = [_edit_result(spot_ids=["spot_a"])]
+
+    await run_edit_itinerary(
+        state,
+        tools,
+        {
+            "ops": [{"op": "remove", "targets": ["地点エー"]}],
+            "constraints": None,
+            "notes": None,
+        },
+        step_id=1,
+    )
+
+    call = tools.edit_calls[0]
+    assert call["args"].allow_refill is False
+    assert call["args"].assumptions is None
+
+
 def _existing_itinerary(*, constraints: list[dict[str, Any]]) -> ItineraryState:
     itinerary = Itinerary.model_validate(_itinerary_payload(1, spot_ids=["spot_a"]))
     return ItineraryState(itinerary=itinerary, constraints=constraints, parent_version=None)
@@ -474,6 +553,98 @@ async def test_plan_itinerary_returns_reference_unresolved_when_no_days() -> Non
     assert error is not None
     assert error["code"] == ToolErrorCode.REFERENCE_UNRESOLVED.value
     assert tools.plan_calls == []
+
+
+async def test_plan_itinerary_returns_precondition_unmet_when_origin_is_unspecified() -> None:
+    """2026-08-04([25 §1-4]の是正・ADR-0021 実装): メインが origin_name を
+
+    渡さず、既存旅程の起点(state.default_origin_spot_id)も無いときは、
+    勝手に施設を選ばず precondition_unmet を返す。
+    """
+
+    spots = _spots()
+    state = TurnState(
+        turn_id="turn",
+        thread_id=1,
+        user_id=7,
+        utterance="旅程を作って",
+        profile=ProfileState(),
+        spot_id_vocab=list(spots),
+        spot_names={key: value.name_ja for key, value in spots.items()},
+        spot_catalog=spots,
+        default_origin_spot_id=None,
+    )
+    tools = FakeItineraryTools()
+
+    digest, error = await run_plan_itinerary(
+        state,
+        tools,
+        {
+            "days": [
+                {
+                    "date": "2026-08-10",
+                    "start": "09:00",
+                    "end": "17:00",
+                    "origin_name": None,
+                    "destination_name": None,
+                }
+            ],
+            "must_visit": [],
+            "constraints": None,
+            "notes": None,
+        },
+        step_id=1,
+    )
+
+    assert error is not None
+    assert error["code"] == ToolErrorCode.PRECONDITION_UNMET.value
+    assert error["recoverable"] is True
+    assert tools.plan_calls == []
+    assert "起点" in error["message_ja"]
+
+
+async def test_plan_itinerary_succeeds_with_explicit_origin_name_even_without_default() -> None:
+    """origin_name が明示されていれば、default_origin_spot_id が無くても成立する。"""
+
+    spots = _spots()
+    state = TurnState(
+        turn_id="turn",
+        thread_id=1,
+        user_id=7,
+        utterance="旅程を作って",
+        profile=ProfileState(),
+        spot_id_vocab=list(spots),
+        spot_names={key: value.name_ja for key, value in spots.items()},
+        spot_catalog=spots,
+        default_origin_spot_id=None,
+    )
+    tools = FakeItineraryTools()
+    tools.plan_queue = [_plan_result(spot_ids=["spot_a"])]
+
+    digest, error = await run_plan_itinerary(
+        state,
+        tools,
+        {
+            "days": [
+                {
+                    "date": "2026-08-10",
+                    "start": "09:00",
+                    "end": "17:00",
+                    "origin_name": "道の駅",
+                    "destination_name": None,
+                }
+            ],
+            "must_visit": [],
+            "constraints": None,
+            "notes": None,
+        },
+        step_id=1,
+    )
+
+    assert error is None
+    call = tools.plan_calls[0]
+    assert call["args"].days[0]["origin"] == {"kind": "facility", "id": "spot_origin"}
+    assert call["args"].days[0]["destination"] == {"kind": "facility", "id": "spot_origin"}
 
 
 async def test_tool_error_from_edit_itinerary_is_returned_without_mutating_state() -> None:

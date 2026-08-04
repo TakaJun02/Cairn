@@ -146,6 +146,17 @@ class SolverInput:
     required_spot_ids: frozenset[str] = frozenset()
     excluded_spot_ids: frozenset[str] = frozenset()
     protected_spot_ids: frozenset[str] = frozenset()
+    # 削除保護専用(2026-08-04、ADR-0021 レビュー是正・C-1)。
+    # `protected_spot_ids` は既存 ops(move/replace/set_stay/set_time 等)由来の
+    # 削除保護と共用のため、`_two_opt`/`_or_opt` の並び替え制限には使わない
+    # (使うと「全項目 locked 扱い」と同じ過剰制約になる)。編集ターンの既定
+    # (集合固定・allow_refill=False)は ops 適用後の全訪問をここに入れる。
+    removal_protected_spot_ids: frozenset[str] = frozenset()
+    # 挿入プールの制限(2026-08-04、ADR-0021)。None = 制限なし(既定・従来
+    # 挙動)。空集合を渡すと `_greedy_fill` は新規スポットを一切挿入しない
+    # (編集ターンの既定「集合固定」。`_insert_requirements` の必須挿入は
+    # この制限の対象外 — ops による明示追加は常に反映される)。
+    insertion_pool: frozenset[str] | None = None
     stay_overrides: Mapping[str, int] = field(default_factory=dict)
     config: SolverConfig = field(default_factory=SolverConfig)
 
@@ -163,12 +174,24 @@ def default_utility(_: PlanningSpot) -> float:
     return 1.0
 
 
-def solve_itinerary(data: SolverInput) -> SolverResult:
-    """A=目的関数最良、B=低重複、C=1件減らしたゆったり版を返す。"""
+def solve_itinerary(data: SolverInput, *, alternatives: bool = True) -> SolverResult:
+    """A=目的関数最良、B=低重複、C=1件減らしたゆったり版を返す。
+
+    `alternatives=False`(編集ターンの既定「集合固定」。ADR-0021)のときは
+    解 A だけを計算し、B(2 回目の ILS)・C(緩和解)の生成を省略して
+    同じ解を 3 スロットに詰めて返す。呼び出し側(`ItineraryService`)は
+    `solutions[0]` だけを使い、解選択 LLM も呼ばない。
+    """
 
     _validate_solver_input(data)
     base_seed = data.config.seed
     solution_a, score_a, iterations_a = _solve_one(data, random.Random(base_seed))
+    if not alternatives:
+        return SolverResult(
+            solutions=(solution_a, solution_a, solution_a),
+            scores=(score_a, score_a, score_a),
+            iterations_run=(iterations_a, 0),
+        )
     overlap = frozenset(itinerary_spot_ids(solution_a))
     solution_b, score_b, iterations_b = _solve_one(
         data,
@@ -398,7 +421,7 @@ def _make_feasible(routes: list[list[str]], data: SolverInput) -> list[list[str]
             (day_index, position, spot_id)
             for day_index, route in enumerate(candidate)
             for position, spot_id in enumerate(route)
-            if spot_id not in _fixed_spot_ids(data)
+            if spot_id not in _removal_protected_spot_ids(data)
         ]
         if not removable:
             locked = _locked_spot_ids(data)
@@ -460,13 +483,18 @@ def _greedy_fill(
 ) -> list[list[str]]:
     candidate = _copy_routes(routes)
     while True:
-        available = sorted(
+        available_set = (
             set(data.spots)
             - set(_flatten_routes(candidate))
             - set(data.excluded_spot_ids)
             - set(temporarily_excluded)
             - _endpoint_ids(data)
         )
+        if data.insertion_pool is not None:
+            # ADR-0021: 編集ターンの既定(集合固定)では挿入プールが空集合に
+            # なり、ここで新規スポットの候補が常にゼロになる。
+            available_set &= set(data.insertion_pool)
+        available = sorted(available_set)
         insertion = _best_insertion(
             candidate,
             available,
@@ -535,7 +563,7 @@ def _shake(
     routes: list[list[str]], data: SolverInput, rng: random.Random
 ) -> tuple[list[list[str]], frozenset[str]]:
     candidate = _copy_routes(routes)
-    fixed = _fixed_spot_ids(data)
+    fixed = _removal_protected_spot_ids(data)
     choices: list[tuple[int, int, int]] = []
     for day_index, route in enumerate(candidate):
         for length in range(data.config.shake_min, data.config.shake_max + 1):
@@ -784,7 +812,10 @@ def _schedule_with_mode(
 def _relaxed_solution(solution_a: Itinerary, data: SolverInput) -> Itinerary:
     routes = [[item.spot_id for item in day.items] for day in solution_a.days]
     removable = [
-        spot_id for route in routes for spot_id in route if spot_id not in _fixed_spot_ids(data)
+        spot_id
+        for route in routes
+        for spot_id in route
+        if spot_id not in _removal_protected_spot_ids(data)
     ]
     if not removable:
         return _with_concessions(solution_a.model_copy(deep=True), data)
@@ -1027,7 +1058,32 @@ def _validate_solver_input(data: SolverInput) -> None:
 
 
 def _fixed_spot_ids(data: SolverInput) -> set[str]:
-    return _locked_spot_ids(data) | set(data.protected_spot_ids)
+    """並び替え(2-opt / or-opt)を止める集合。
+
+    2026-08-04 レビュー是正(Critical・C-1): `locked` だけを見る。
+    `protected_spot_ids`/`removal_protected_spot_ids` は削除保護専用であり、
+    並び替えまで止めると ADR-0021 が明示的に却下した「全項目 locked 扱い」と
+    同じ挙動になる(採らなかった案)。並びの再調整は `locked` の相対順序
+    保持だけで表現する。
+    """
+
+    return _locked_spot_ids(data)
+
+
+def _removal_protected_spot_ids(data: SolverInput) -> set[str]:
+    """削除(shake の除去・実行可能化の第一段・緩和解の間引き)から保護する集合。
+
+    2026-08-04 レビュー是正(Critical・C-1): `locked`(相対順序も固定)に加え、
+    `protected_spot_ids`(ops が触れた項目の削除保護。既存の ops.py 由来)と
+    `removal_protected_spot_ids`(ADR-0021 の集合固定編集で ops 適用後の
+    全訪問を保護)を合わせる。並び替え(`_fixed_spot_ids`)とは別物。
+    """
+
+    return (
+        _locked_spot_ids(data)
+        | set(data.protected_spot_ids)
+        | set(data.removal_protected_spot_ids)
+    )
 
 
 def _locked_spot_ids(data: SolverInput) -> set[str]:

@@ -67,6 +67,8 @@ def format_itinerary_digest(
             lines.append("譲歩:")
             for concession in itinerary.concessions:
                 lines.append(f"  ・{concession.message_ja}")
+        if itinerary.assumptions:
+            lines.append("仮の前提: " + "、".join(itinerary.assumptions))
 
     if diff is not None and (diff.added or diff.removed or diff.moved or diff.retimed):
         lines.append("今回の変更:")

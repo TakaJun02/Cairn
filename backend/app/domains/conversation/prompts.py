@@ -45,6 +45,7 @@ MAIN_AGENT_MAX_MUST_VISIT = 8
 MAIN_AGENT_MAX_OPS = 8
 MAIN_AGENT_MAX_CONSTRAINTS_ADD = 8
 MAIN_AGENT_MAX_CONSTRAINTS_REMOVE = 8
+MAIN_AGENT_MAX_ASSUMPTIONS = 6
 
 
 UPDATE_PROFILE_SYSTEM_PROMPT = f"""あなたは鳥海山観光ガイダンスの
@@ -117,14 +118,20 @@ Tool(action.tool)は次の 6 つです。1 周につき 1 つだけ選びます�
   件数(k=5)はコードが固定するので書きません。
 - plan_itinerary: 旅程がまだ無いときに新規作成する。
   args = {{"days":[{{"date":"YYYY-MM-DD","start":"HH:MM","end":"HH:MM",
-  "origin_name":スポット名 または null,"destination_name":スポット名 または null}}],
+  "origin_name":スポット名 または null(**会話に根拠(ユーザーが言った宿・
+  地点)があれば必ず書く。無ければ null のままにする** — null で
+  precondition_unmet が返ったら下の境界の手順に従う),
+  "destination_name":スポット名 または null}}],
   "must_visit":[スポット名,...],
   "constraints":{{"add":[{{"pred":述語,"args":object,"weight":数値,
   "source_text":根拠になった発話}}],"remove":[制約id,...]}} または null,
-  "notes":文字列 または null}}
+  "notes":文字列 または null,
+  "assumptions":[確認していない前提の日本語短文,...](無ければ空配列)}}
 - edit_itinerary: 既にある旅程を書き換える。
   args = {{"ops":[...(下記)],"constraints":plan_itinerary と同じ形 または null,
-  "notes":文字列 または null}}
+  "notes":文字列 または null,
+  "allow_refill":真偽値(既定 false。下記の判断基準を参照),
+  "assumptions":[文字列,...] または null(null なら基の版からそのままコピー)}}
 - search_knowledge: 由来・歴史・注意事項などを調べる。
   args = {{"request":自然文,"spot_name":スポット名 または null}}
 - ask_user: ユーザーに聞き返す(取り違えが目視できない場面だけ)。
@@ -148,10 +155,13 @@ Tool(action.tool)は次の 6 つです。1 周につき 1 つだけ選びます�
 - 直前までの軌跡(⑤)を見て、既に得た情報を無駄にせず次の一手を決めます。
   同じ Tool を同じ引数でもう一度選ばないでください(実行されません)。
 - ask_user は「聞かないと取り違えが起きる」場面だけに使います(候補が複数の
-  同名地点に解ける・破壊的操作の解釈が割れる等)。日付・時刻・起点などが
-  薄いだけなら、最も妥当な仮定を置いて進めてください(置いた仮定は Tool の
-  結果に現れ、最後の応答で必ず説明されます)。ask_user は 1 ターンに 2 回まで
-  です。同じ slot・同じ曖昧さを 2 回聞いてはいけません。
+  同名地点に解ける・破壊的操作の解釈が割れる等)。**日付・時刻**が薄いだけ
+  なら、最も妥当な仮定を置いて進めてください(置いた仮定は Tool の結果に
+  現れ、最後の応答で必ず説明されます)。**起点は別扱いです**: 会話に根拠
+  (ユーザーが言った宿・地点)があればそれを使い、根拠が無ければ**仮定せず
+  ask_user で聞いてください**(下の plan_itinerary の項も参照)。
+  ask_user は 1 ターンに 2 回までです。同じ slot・同じ曖昧さを 2 回聞いては
+  いけません。
 - constraints はあなたが直接書きます。述語(pred)は次の 17 種のどれかです:
   {_PRED_VOCABULARY}
   args の中身は述語ごとに異なります(例: require/exclude/first/last は
@@ -164,6 +174,24 @@ Tool(action.tool)は次の 6 つです。1 周につき 1 つだけ選びます�
   set_time(target, arrive?, depart?) / revert(to_version?)。
   自然言語の「元に戻して」は ops=[{{"op":"revert"}}] の 1 手にします
   (他の op と混ぜません)。
+- edit_itinerary.allow_refill は既定 false です。false のときソルバーは
+  ops で指定した変更だけを行い、訪問集合(誰を訪れるか)は変えません。
+  ユーザーが「代わりにどこか入れて」「空いた時間に何か足して」「もっと良い
+  組み合わせにして」のように**補充・入れ替えを明示的に求めたとき**だけ
+  true にしてください。「外して」だけの依頼(補充を求めていない)は
+  false のままにします。
+- plan_itinerary.assumptions には、日付・起点など**ユーザーに確認していない
+  前提**を日本語短文で必ず列挙してください(例:「日付は明日と仮定」
+  「起点は直前に話題に出た宿泊施設と仮定」)。何も仮定していなければ
+  空配列にします。
+  edit_itinerary.assumptions は既定で前の版からそのままコピーされるので、
+  ユーザーが日付や起点を新たに明示するなど**前提が解消されたときだけ**、
+  新しい内容(または解消済みなら空配列)を書いて置き換えてください。
+- plan_itinerary で起点が未指定のエラー(precondition_unmet、「起点が未指定
+  です」)が返ったら、まず ask_user で起点を尋ねてください。聞かない/聞け
+  ない場合は、会話に出た地点名を origin_name に明示して plan_itinerary を
+  再実行し、その仮定を assumptions に書いてください。起点を勝手に選んだ
+  まま黙って進めてはいけません。
 - 十分な情報が揃ったら done を選んでターンを終えてください。
 """
 
@@ -493,6 +521,25 @@ def _nullable_constraints_schema(constraint_ids: list[str] | None) -> dict[str, 
     return {"anyOf": [{"type": "null"}, _constraint_ops_schema(constraint_ids)]}
 
 
+def _assumptions_schema() -> dict[str, Any]:
+    """未確認の前提(日付・起点等)の日本語短文リスト(2026-08-04 追加。
+
+    Docs/30_design/agent_react_architecture.md §5)。
+    """
+
+    return {
+        "type": "array",
+        "items": {"type": "string", "minLength": 1},
+        "maxItems": MAIN_AGENT_MAX_ASSUMPTIONS,
+    }
+
+
+def _nullable_assumptions_schema() -> dict[str, Any]:
+    """`edit_itinerary.assumptions`: null = 基の版からそのままコピー。"""
+
+    return {"anyOf": [{"type": "null"}, _assumptions_schema()]}
+
+
 def _plan_day_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -525,8 +572,9 @@ def _plan_itinerary_args_schema(constraint_ids: list[str] | None) -> dict[str, A
             },
             "constraints": _nullable_constraints_schema(constraint_ids),
             "notes": _nullable_string(),
+            "assumptions": _assumptions_schema(),
         },
-        "required": ["days", "must_visit", "constraints", "notes"],
+        "required": ["days", "must_visit", "constraints", "notes", "assumptions"],
         "additionalProperties": False,
     }
 
@@ -617,8 +665,10 @@ def _edit_itinerary_args_schema(constraint_ids: list[str] | None) -> dict[str, A
             },
             "constraints": _nullable_constraints_schema(constraint_ids),
             "notes": _nullable_string(),
+            "allow_refill": {"type": "boolean"},
+            "assumptions": _nullable_assumptions_schema(),
         },
-        "required": ["ops", "constraints", "notes"],
+        "required": ["ops", "constraints", "notes", "allow_refill", "assumptions"],
         "additionalProperties": False,
     }
 

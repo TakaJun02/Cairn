@@ -137,6 +137,7 @@ def _itinerary_state(
                 concession.model_dump(mode="json")
                 for concession in version.itinerary.concessions
             ],
+            "assumptions": list(version.itinerary.assumptions),
         }
     )
 

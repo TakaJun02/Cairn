@@ -128,11 +128,17 @@ def _normalize_surface(value: str) -> str:
 
 
 def _default_origin(snapshot: ContextSnapshot) -> str | None:
+    """既存旅程の 1 日目の起点だけを既定値にする(2026-08-04、[25 §1-4]の是正)。
+
+    旧実装は既存旅程が無いとき facility 種別のソート順先頭
+    (`min(snapshot.spots)` へのフォールバックまで)を暗黙の既定起点として
+    返しており、確認していない起点基準の所要時間・旅程が黙って作られていた
+    (Docs/30_design/recommendation_planning.md §3.3、Docs/30_design/
+    agent_react_architecture.md §5)。**フォールバックは削除する**: 既存旅程
+    が無ければ `None` を返し、起点はユーザーに確認するか会話から得た地点名を
+    明示させる。
+    """
+
     if snapshot.itinerary is not None and snapshot.itinerary.itinerary.days:
         return snapshot.itinerary.itinerary.days[0].origin.spot_id
-    facilities = sorted(
-        spot_id for spot_id, value in snapshot.spots.items() if value.kind == "facility"
-    )
-    if facilities:
-        return facilities[0]
-    return min(snapshot.spots, default=None)
+    return None

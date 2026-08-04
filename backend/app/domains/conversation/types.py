@@ -189,10 +189,21 @@ class RecommendArgs(ConversationModel):
 class PlanItineraryArgs(ConversationModel):
     days: list[dict[str, Any]] = Field(default_factory=list)
     must_visit: list[str] = Field(default_factory=list)
+    # 未確認の前提(日付・起点等)。レコメンド SA の assumptions と同型
+    # (2026-08-04 追加。クローズドワールド原則の明示的な例外 —
+    # Docs/30_design/agent_react_architecture.md §5・§14、
+    # Docs/40_api/chat_sse.md §1.2)。
+    assumptions: list[str] = Field(default_factory=list)
 
 
 class EditItineraryArgs(ConversationModel):
     ops: list[dict[str, Any]] = Field(default_factory=list)
+    # 既定 false。true のときだけ従来どおりフル ILS + A/B/C + LLM 選択を行う
+    # (ADR-0021)。
+    allow_refill: bool = False
+    # None = 基の版からそのままコピー。リストを与えたら置換する
+    # (Docs/30_design/agent_react_architecture.md §5・§14)。
+    assumptions: list[str] | None = None
 
 
 class SearchKnowledgeArgs(ConversationModel):
@@ -293,6 +304,9 @@ class MainPlanItineraryArgs(ConversationModel):
     must_visit: list[str] = Field(default_factory=list)
     constraints: MainConstraintOps | None = None
     notes: str | None = None
+    # 未確認の前提(日付・起点等)を日本語短文で列挙する(2026-08-04 追加。
+    # Docs/30_design/agent_react_architecture.md §5)。
+    assumptions: list[str] = Field(default_factory=list)
 
 
 class MainEditItineraryArgs(ConversationModel):
@@ -306,6 +320,14 @@ class MainEditItineraryArgs(ConversationModel):
     ops: list[dict[str, Any]] = Field(default_factory=list)
     constraints: MainConstraintOps | None = None
     notes: str | None = None
+    # 既定 false。ユーザーが「代わりにどこか入れて」「空いた時間に何か
+    # 足して」のように補充・入れ替えを明示的に求めたときだけ true にする
+    # (ADR-0021)。false のときソルバーは訪問集合を変えず並び・時刻の
+    # 再調整のみ行う。
+    allow_refill: bool = False
+    # None = 基の版からそのままコピー。前提が解消されたときだけメインが
+    # リストを与えて置換する(Docs/30_design/agent_react_architecture.md §5)。
+    assumptions: list[str] | None = None
 
 
 class MainSearchKnowledgeArgs(ConversationModel):

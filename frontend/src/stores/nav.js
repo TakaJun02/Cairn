@@ -6,6 +6,7 @@ import {
   loadStoredOfflinePack,
   verifyOfflinePack,
 } from '../lib/offlinePack.js'
+import { fetchRouteWithRetry, partitionSettledRoutes } from '../lib/routeRetry.js'
 
 import { getDeviceUUID } from '../lib/uuid.js'
 
@@ -184,8 +185,16 @@ export const useNavStore = defineStore('nav', () => {
     if (routeIds.length === 0 || existingRoute) return
 
     try {
-      const routes = await Promise.all(routeIds.map((routeId) => api.getRoute(routeId)))
+      // ADR-0020: サーバー契約上は commit 済みのはずだが、防御として
+      // 404 のときだけ短い再試行を行う(frontend_nav.md §3 表 #6)。
+      // 2026-08-04(レビュー是正・M-5): `Promise.all` ではなく
+      // `Promise.allSettled` を使い、1 本の失敗で成功した他レッグの描画
+      // まで消さない。欠けたレッグは経路縮退(route_degraded)と同じ扱い。
+      const settled = await Promise.allSettled(
+        routeIds.map((routeId) => fetchRouteWithRetry(routeId, { getRoute: api.getRoute }))
+      )
       if (applySequence !== itineraryApplySequence) return
+      const { routes, failures } = partitionSettledRoutes(routeIds, settled)
       plan.value = {
         ...plan.value,
         route: {
@@ -194,6 +203,12 @@ export const useNavStore = defineStore('nav', () => {
         },
         segments: routes.flatMap((route) => route.segments || []),
         legs: routes,
+      }
+      if (failures.length) {
+        for (const failure of failures) {
+          console.error('[NavStore] Failed to restore a route leg:', failure.routeId, failure.error)
+        }
+        error.value = `一部の経路(${failures.length}件)を読み込めませんでした`
       }
     } catch (routeError) {
       if (applySequence !== itineraryApplySequence) return

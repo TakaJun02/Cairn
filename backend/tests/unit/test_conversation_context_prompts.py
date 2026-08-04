@@ -19,12 +19,14 @@ from app.domains.conversation.prompts import (
 from app.domains.conversation.state import (
     ContextSnapshot,
     DegradedState,
+    ItineraryState,
     MessageState,
     ProfileState,
     SpotFact,
     TurnState,
 )
 from app.domains.conversation.types import ResponseMode, TrajectoryStep
+from app.domains.itinerary.types import Itinerary
 
 
 def _message(seq: int, role: str, content: str) -> MessageState:
@@ -81,7 +83,14 @@ class _SnapshotRepository:
         return self.snapshot
 
 
-async def test_load_context_builds_spot_vocabulary_and_default_origin() -> None:
+async def test_load_context_builds_spot_vocabulary_no_default_origin_without_itinerary() -> None:
+    """既存旅程が無ければ `default_origin_spot_id` は `None`(2026-08-04、
+
+    [25 §1-4] の是正)。旧実装は facility 種別のソート順先頭・
+    `min(snapshot.spots)` へフォールバックしており、未確認の起点基準で
+    所要時間・旅程が黙って作られていた。
+    """
+
     spot = _spot()
     snapshot = ContextSnapshot(
         thread_id=1,
@@ -107,11 +116,56 @@ async def test_load_context_builds_spot_vocabulary_and_default_origin() -> None:
     )
 
     assert state.spot_id_vocab == ["spot_001"]
-    assert state.default_origin_spot_id == "spot_001"
+    assert state.default_origin_spot_id is None
     assert state.tag_vocabulary == ["自然", "滝"]
     # 段2で `ask_user` の中断・復帰路は廃止したため、tool_results 相当の
     # 復帰処理は存在しない(TurnState に該当フィールドも無い)。
     assert not hasattr(state, "tool_results")
+
+
+async def test_load_context_default_origin_uses_existing_itinerary_day_one_origin() -> None:
+    """既存旅程があれば、その 1 日目の origin を既定起点として使う(維持する挙動)。"""
+
+    spot = _spot()
+    itinerary = Itinerary.model_validate(
+        {
+            "days": [
+                {
+                    "date": "2026-08-10",
+                    "start_min": 540,
+                    "end_min": 1020,
+                    "origin": {"kind": "spot", "spot_id": "spot_001"},
+                    "destination": {"kind": "spot", "spot_id": "spot_001"},
+                    "items": [],
+                }
+            ],
+            "version": 1,
+        }
+    )
+    snapshot = ContextSnapshot(
+        thread_id=1,
+        profile=ProfileState(),
+        itinerary=ItineraryState(itinerary=itinerary, constraints=[], parent_version=None),
+        messages=[],
+        last_candidates=[],
+        presented_spot_ids=[],
+        asked_slots=[],
+        ask_streak=0,
+        pending_ask=None,
+        resolved_ambiguities=[],
+        pending_constraints=[],
+        realtime={},
+        spots={spot.spot_id: spot},
+        tag_vocabulary=[],
+    )
+
+    state = await load_context(
+        _SnapshotRepository(snapshot),
+        user_id=1,
+        utterance="続きを教えて",
+    )
+
+    assert state.default_origin_spot_id == "spot_001"
 
 
 def test_main_agent_context_order_and_utterance_is_last() -> None:

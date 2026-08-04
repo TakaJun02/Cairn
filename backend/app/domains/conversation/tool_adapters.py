@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
+from app.core.db import session_scope
 from app.core.llm import GenerationClient
 from app.domains.conversation.ask_registry import (
     DEFAULT_ASK_TIMEOUT_SEC,
@@ -42,9 +44,9 @@ from app.domains.conversation.types import (
     ToolResult,
     constraint_to_mapping,
 )
-from app.domains.geo.osrm import OSRMClient
+from app.domains.geo.osrm import OSRMClient, read_osrm_build
 from app.domains.geo.repo import GeoRepository
-from app.domains.geo.routes import RouteService
+from app.domains.geo.routes import PendingRoute, RouteService, fetch_route_segments
 from app.domains.itinerary.repo import ItineraryRepository
 from app.domains.itinerary.service import (
     ItineraryService,
@@ -78,6 +80,9 @@ from app.domains.recommendation.types import (
 
 SearchRunner = Callable[..., Awaitable[SearchResult | SearchToolError]]
 PendingAskWriter = Callable[..., Awaitable[None]]
+# ADR-0020: route の永続化専用の一時 session を開くファクトリ。既定は
+# `session_scope`(専用の短寿命 session・即時 commit)。テストで差し替える。
+RouteSessionScopeFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 
 class ToolAdapters:
@@ -98,6 +103,7 @@ class ToolAdapters:
         ask_registry: AskUserRegistry | None = None,
         ask_timeout_sec: float = DEFAULT_ASK_TIMEOUT_SEC,
         pending_ask_writer: PendingAskWriter | None = None,
+        route_session_scope: RouteSessionScopeFactory | None = None,
     ) -> None:
         self.session = session
         self.event_sink = event_sink
@@ -114,6 +120,12 @@ class ToolAdapters:
         self.user_id = user_id
         self.ask_registry = ask_registry or AskUserRegistry()
         self.ask_timeout_sec = ask_timeout_sec
+        # ADR-0020: route の永続化はターンの session(self.session)を使わず、
+        # レッグごとに専用の一時 session で即時 commit する。既定は
+        # `session_scope`(実 DB)。テストは差し替えてよい。
+        self.route_session_scope: RouteSessionScopeFactory = (
+            route_session_scope or (lambda: session_scope(self.settings))
+        )
         self.pending_ask_writer = pending_ask_writer or write_pending_ask_now
 
     async def recommend(
@@ -226,6 +238,7 @@ class ToolAdapters:
                     constraints=[constraint_to_mapping(value) for value in constraints],
                     utilities=utilities,
                     selection_text=selection_text,
+                    assumptions=args.assumptions,
                 ),
                 selector=selector,
                 provisional_sink=provisional_sink,
@@ -270,8 +283,11 @@ class ToolAdapters:
     ) -> ToolResult | ToolError:
         is_revert = any(value.get("op") == "revert" for value in args.ops)
         provisional_sink = self._provisional_itinerary_sink()
+        # ADR-0021: 集合固定(allow_refill=False)では解の多様化と LLM 選択を
+        # 省略するため、選択に使う LLM selector 自体を作らない
+        # (`use_specialist` を False にする)。
         selector = self._itinerary_selector(
-            use_specialist=use_specialist and not is_revert,
+            use_specialist=use_specialist and args.allow_refill and not is_revert,
             selection_text=selection_text,
         )
         try:
@@ -284,6 +300,8 @@ class ToolAdapters:
                     constraints_remove=constraints_remove,
                     utilities=utilities,
                     selection_text=selection_text,
+                    allow_refill=args.allow_refill,
+                    assumptions=args.assumptions,
                 ),
                 selector=selector,
                 provisional_sink=provisional_sink,
@@ -485,15 +503,20 @@ class ToolAdapters:
         initialization_failed = False
         async with OSRMClient(self.settings) as osrm:
             try:
-                route_service = RouteService(
-                    GeoRepository(self.session),
-                    osrm,
-                    self.settings,
-                )
+                # BUILD ファイルが読めるかだけを事前確認する(以前は使い捨ての
+                # RouteService を構築して確かめていたが、ADR-0020 でレッグごと
+                # に専用 session を開くようになったため、ここでは軽い事前検査
+                # だけ行い、実際の RouteService はレッグ単位で作る)。
+                osrm_build = read_osrm_build()
             except Exception:  # noqa: BLE001 - BUILD 不在なら route なしで局所縮退
                 initialization_failed = True
             else:
-                provider = _FallbackRouteProvider(route_service)
+                provider = _FallbackRouteProvider(
+                    settings=self.settings,
+                    osrm=osrm,
+                    osrm_build=osrm_build,
+                    session_scope=self.route_session_scope,
+                )
                 # Tool 本体は必ず 1 回だけ実行する。
                 # ここでの例外は呼び出し元が
                 # ToolError へ変換し、二重実行しない。
@@ -593,6 +616,10 @@ class ToolAdapters:
         diff: dict[str, Any],
         concessions: list[Any],
     ) -> None:
+        # `assumptions` は `Itinerary` に既に載っている(itinerary/types.py)。
+        # chat_sse.md §1.2 の契約どおり、state:itinerary のトップレベルにも
+        # そのまま複製する(2026-08-04 追加。provisional/final とも。
+        # Docs/30_design/agent_react_architecture.md §5)。
         await emit(
             self.event_sink,
             state_event(
@@ -602,14 +629,56 @@ class ToolAdapters:
                 itinerary=itinerary,
                 diff=diff,
                 concessions=concessions,
+                assumptions=itinerary.get("assumptions", []),
             ),
         )
 
 
+# 2026-08-04 レビュー是正(High・H-1): レッグ取得の並列度を絞る定数。
+# 既定プールは size 5 + overflow 10 = 同時 15 接続で、進行中ターン 1 本が
+# 主 session を常時占有するため、無制限並列(12 レッグ一斉)では同時 2 ターン
+# で飽和する(NFR-8「同時〜数十」に足りない)。設定化はしない
+# (ADR-0020「注意」)。
+ROUTE_LEG_CONCURRENCY = 4
+
+
 class _FallbackRouteProvider:
-    def __init__(self, service: RouteService) -> None:
-        self.service = service
+    """レッグごとに route を取得・永続化する(ADR-0020)。
+
+    `_attach_route_ids`(itinerary/service.py)は全レッグを `asyncio.gather`
+    で並列に呼ぶため、AsyncSession を使い回さず、レッグごとに専用の
+    短寿命 session を開いてその場で commit する。これにより
+    `state:itinerary`(final)送出の時点で、そこに載る全 `route_id` が
+    commit 済みであることが保証される(SSE 契約。chat_sse.md §1.2)。
+
+    2026-08-04 レビュー是正(High・H-1): DB session は「キャッシュ照会」と
+    「保存」だけを包み、OSRM への HTTP 往復(最大 `osrm_leg_timeout_sec`
+    秒)は session の外で行う(`RouteService.lookup_or_prepare` →
+    `fetch_route_segments`(session なし)→ `RouteService.save` の 3 段)。
+    さらに `asyncio.Semaphore` でレッグの並列度を絞り、DB 接続と OSRM
+    リクエストの双方が無制限に膨らまないようにする。
+    """
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        osrm: OSRMClient,
+        osrm_build: str,
+        session_scope: RouteSessionScopeFactory,
+        concurrency: int = ROUTE_LEG_CONCURRENCY,
+        repository_factory: Callable[[AsyncSession], Any] = GeoRepository,
+    ) -> None:
+        self.settings = settings
+        self.osrm = osrm
+        self.osrm_build = osrm_build
+        self.session_scope = session_scope
         self.degraded = False
+        self._semaphore = asyncio.Semaphore(concurrency)
+        # テスト用の差し替え口(M-1): 既定は実 DB を叩く `GeoRepository`。
+        # `RouteRepository` プロトコルを満たす fake を注入すれば、DB を
+        # 使わずに commit タイミングだけを検証できる。
+        self._repository_factory = repository_factory
 
     async def route_id_for_leg(
         self,
@@ -619,11 +688,40 @@ class _FallbackRouteProvider:
     ) -> str | None:
         del mode  # RouteService が car/foot の接近を一つの route にまとめる。
         try:
-            route = await self.service.get_or_create(
-                {"spot_id": source},
-                {"spot_id": target},
-            )
-            return str(route.route_id)
+            async with self._semaphore:
+                # 段1: 照会(DB のみ)。`session_scope` の契約: with を正常に
+                # 抜けたら commit する(`app.core.db.session_scope` と同じ
+                # 契約。テストで差し替えるときもこの契約を満たす)。
+                async with self.session_scope() as lookup_session:
+                    lookup_service = RouteService(
+                        self._repository_factory(lookup_session),
+                        self.osrm,
+                        self.settings,
+                        osrm_build=self.osrm_build,
+                    )
+                    pending = await lookup_service.lookup_or_prepare(
+                        {"spot_id": source},
+                        {"spot_id": target},
+                    )
+                if not isinstance(pending, PendingRoute):
+                    # 冪等キャッシュにヒット済み。OSRM も追加の session も不要。
+                    return str(pending.route_id)
+
+                # 段2: OSRM への HTTP 往復。DB session は一切握らない。
+                assembled = await fetch_route_segments(
+                    self.osrm, pending, settings=self.settings
+                )
+
+                # 段3: 保存(DB のみ)。commit 完了後にのみ route_id を返す。
+                async with self.session_scope() as save_session:
+                    save_service = RouteService(
+                        self._repository_factory(save_session),
+                        self.osrm,
+                        self.settings,
+                        osrm_build=self.osrm_build,
+                    )
+                    saved = await save_service.save(pending, assembled)
+                return str(saved.route_id)
         # 移動時間行列は既にあるため局所縮退できる。
         except Exception:  # noqa: BLE001
             self.degraded = True

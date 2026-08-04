@@ -77,6 +77,23 @@ async def run_plan_itinerary(
         origin_id = _resolve_endpoint(
             name_context, day.origin_name, state.default_origin_spot_id, dropped, ambiguous
         )
+        if origin_id is None:
+            # 2026-08-04([25 §1-4]の是正。Docs/30_design/
+            # agent_react_architecture.md §5): メインが origin_name を渡さず、
+            # 既存旅程の起点(state.default_origin_spot_id)も無いときは、
+            # 勝手に施設を選ばず precondition_unmet を返す。メインエージェント
+            # は ask_user で聞くか、会話から得た地点名を明示して再実行する
+            # (その仮定は assumptions に書く)。
+            error = ToolError(
+                code=ToolErrorCode.PRECONDITION_UNMET,
+                message_ja=(
+                    "起点が未指定です。ユーザーに尋ねるか、会話に出た地点名を"
+                    "origin に指定してください(仮定した場合は assumptions に"
+                    "書くこと)"
+                ),
+                recoverable=True,
+            )
+            return error.message_ja, _error_payload(error)
         destination_id = _resolve_endpoint(
             name_context, day.destination_name, origin_id, dropped, ambiguous
         )
@@ -123,7 +140,11 @@ async def run_plan_itinerary(
     result = await tools.plan_itinerary(
         step_id=step_id,
         user_id=state.user_id,
-        args=PlanItineraryArgs(days=days, must_visit=must_visit_outcome.resolved),
+        args=PlanItineraryArgs(
+            days=days,
+            must_visit=must_visit_outcome.resolved,
+            assumptions=parsed.assumptions,
+        ),
         constraints=constraints,
         selection_text=selection_text,
         recommendation_context=context,
@@ -204,7 +225,11 @@ async def run_edit_itinerary(
     result = await tools.edit_itinerary(
         step_id=step_id,
         user_id=state.user_id,
-        args=EditItineraryArgs(ops=resolved_ops),
+        args=EditItineraryArgs(
+            ops=resolved_ops,
+            allow_refill=parsed.allow_refill,
+            assumptions=parsed.assumptions,
+        ),
         constraints=constraints,
         constraints_remove=valid_remove,
         selection_text=selection_text,

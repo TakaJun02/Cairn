@@ -98,6 +98,12 @@ class ItineraryState(ApiModel):
     itinerary: dict[str, Any]
     diff: ItineraryDiff = Field(default_factory=ItineraryDiff)
     concessions: list[dict[str, Any]] = Field(default_factory=list)
+    # 未確認の前提(日付・起点等)。空配列なら前提なし(2026-08-04 追加。
+    # クローズドワールド原則の明示的な例外 —
+    # [agent_react_architecture.md §5](../../../../Docs/30_design/agent_react_architecture.md))。
+    # undo/redo・GET /api/v1/itinerary の応答にも同じフィールド
+    # が載る([chat_sse.md §1.2](../../../../Docs/40_api/chat_sse.md))。
+    assumptions: list[str] = Field(default_factory=list)
 
 
 class AskUserState(ApiModel):

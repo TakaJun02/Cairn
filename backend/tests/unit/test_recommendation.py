@@ -369,6 +369,31 @@ async def test_reason_materials_use_realtime_and_db_travel_time_without_inventio
     assert by_id["spot_006"].congestion == "unknown"
 
 
+async def test_travel_time_text_is_empty_without_a_grounded_origin() -> None:
+    """2026-08-04([25 §1-4]の是正): 起点(previous_spot_id/base_spot_id)が
+
+    どちらも無いとき、`repo.load_data(None)` が呼ばれ移動時間を計算しない
+    (`travel_minutes={}`)ので、`travel_time_text` はどの候補でも空文字に
+    なる(未確認の起点基準で所要時間を捏造しない)。
+    """
+
+    repository = MemoryRecommendationRepository()
+    service = RecommendationService(
+        repository,
+        settings=_settings(False),
+        today_provider=lambda: date(2026, 7, 1),
+    )
+
+    result = await service.recommend(
+        RecommendRequest(k=8),
+        context=_context(travel_date=date(2026, 7, 1)),
+    )
+
+    assert repository.origins == [None]
+    assert result.candidates
+    assert all(value.reason_materials.travel_time_text == "" for value in result.candidates)
+
+
 async def test_itinerary_utility_adapter_replaces_uniform_default_for_all_spots() -> None:
     repository = MemoryRecommendationRepository()
     service = RecommendationService(

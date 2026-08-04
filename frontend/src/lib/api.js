@@ -104,8 +104,17 @@ export async function createRoute(from, to) {
 }
 
 export async function getRoute(routeId) {
+  // ADR-0020: `state:itinerary`(final)送出時点で route は commit 済みの
+  // はず(サーバー側の契約)。それでも 404 が来た場合に備え、呼び出し側
+  // (stores/nav.js)が「404 のときだけ」短い再試行を行えるよう、投げる
+  // Error には必ず HTTP status を持たせる(`apiFetch` が非 2xx を投げる際に
+  // 既に `error.status` を付けるが、ここでも明示して契約を保証する)。
   const { status, body } = await apiFetch(`/routes/${encodeURIComponent(routeId)}`)
-  if (status !== 200) throw new Error(`unexpected status ${status}`)
+  if (status !== 200) {
+    const error = new Error(`unexpected status ${status}`)
+    error.status = status
+    throw error
+  }
   return body
 }
 

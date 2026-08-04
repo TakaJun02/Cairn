@@ -38,6 +38,16 @@ function normalizeItineraryState(state) {
     itinerary: state?.itinerary || { days: [] },
     diff: state?.diff || emptyDiff(),
     concessions: state?.concessions || state?.itinerary?.concessions || [],
+    // 未確認の前提(2026-08-04 追加)。state:itinerary(final/provisional)・
+    // undo/redo・GET /api/v1/itinerary はトップレベルに `assumptions` を持つ
+    // (tool_adapters.py `_emit_itinerary_state` / api/routers/itinerary.py
+    // `_itinerary_state`。`ItineraryState` スキーマ)。**GET /thread だけは
+    // スキーマが異なる**(`CurrentItineraryResponse` はトップレベルに
+    // `assumptions` を持たず、`itinerary` 本体の中にしか無い)。
+    // 2026-08-04 レビュー是正(L-6): 以前のコメントは「GET /thread も同じ
+    // スキーマ」と誤記していた。実際はこの後段のフォールバック
+    // (`state?.itinerary?.assumptions`)が GET /thread のケースを拾う。
+    assumptions: state?.assumptions || state?.itinerary?.assumptions || [],
   }
 }
 

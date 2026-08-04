@@ -57,6 +57,22 @@ class AssembledRoute:
     geojson: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class PendingRoute:
+    """`get_or_create` の 3 段分割の受け渡し値(2026-08-04 レビュー是正・H-1)。
+
+    段1(`RouteService.lookup_or_prepare`。DB のみ)がキャッシュ miss のときに
+    返す。段2(`fetch_route_segments`。OSRM への HTTP 往復。DB session を
+    一切握らない)へそのまま渡し、その結果を段3(`RouteService.save`。DB のみ)
+    で永続化する。
+    """
+
+    params_hash: str
+    params: dict[str, Any]
+    source: ResolvedEndpoint
+    target: ResolvedEndpoint
+
+
 def normalize_route_params(
     from_endpoint: Mapping[str, Any],
     to_endpoint: Mapping[str, Any],
@@ -152,6 +168,48 @@ def assemble_route(
     )
 
 
+async def fetch_route_segments(
+    osrm: OSRMClient,
+    pending: PendingRoute,
+    *,
+    settings: Settings,
+) -> AssembledRoute:
+    """段2(2026-08-04 レビュー是正・H-1): OSRM への HTTP 往復だけを行う。
+
+    DB session を一切引数に取らない・保持しない。`_FallbackRouteProvider`
+    はこの呼び出しの前後で DB session を閉じておくことで、最大 20 秒
+    (`osrm_leg_timeout_sec`)かかりうる外部 I/O の間 DB 接続を握り続けない
+    ようにする。
+    """
+
+    requests: list[tuple[Profile, tuple[Coordinate, Coordinate]]] = []
+    if pending.source.needs_walk:
+        requests.append(("foot", (pending.source.spot_coordinate, pending.source.car_node)))
+    requests.append(("car", (pending.source.car_node, pending.target.car_node)))
+    if pending.target.needs_walk:
+        requests.append(("foot", (pending.target.car_node, pending.target.spot_coordinate)))
+
+    async def fetch_segment(
+        mode: Profile,
+        coordinates: tuple[Coordinate, Coordinate],
+    ) -> tuple[Profile, RouteResult]:
+        return mode, await osrm.route(mode, list(coordinates))
+
+    try:
+        async with asyncio.timeout(settings.osrm_leg_timeout_sec):
+            routed_segments = await asyncio.gather(
+                *(fetch_segment(mode, coordinates) for mode, coordinates in requests)
+            )
+    except TimeoutError as exc:
+        raise RouteBuildError(
+            f"レッグ経路が {settings.osrm_leg_timeout_sec:g} 秒で完了しませんでした"
+        ) from exc
+    return assemble_route(
+        list(routed_segments),
+        geojson_precision=settings.geo_geojson_precision,
+    )
+
+
 class RouteService:
     """route API と将来の旅程 Tool が共有するレッグ取得サービス。"""
 
@@ -173,6 +231,34 @@ class RouteService:
         from_endpoint: Mapping[str, Any],
         to_endpoint: Mapping[str, Any],
     ) -> RouteRecord:
+        """3 段(照会 → OSRM → 保存)を一括で行う。
+
+        `POST /api/v1/routes` のような単発リクエスト(1 session をリクエスト
+        全体で使ってよい文脈)はこちらを使う。ターンの一時 session を
+        レッグごとに開閉する `_FallbackRouteProvider`(tool_adapters.py。
+        ADR-0020/H-1)は、DB session を OSRM の HTTP 往復中は握らないために
+        `lookup_or_prepare` / `fetch_route_segments` / `save` を個別に呼ぶ。
+        """
+
+        pending_or_record = await self.lookup_or_prepare(from_endpoint, to_endpoint)
+        if not isinstance(pending_or_record, PendingRoute):
+            return pending_or_record
+        assembled = await fetch_route_segments(
+            self._osrm, pending_or_record, settings=self._settings
+        )
+        return await self.save(pending_or_record, assembled)
+
+    async def lookup_or_prepare(
+        self,
+        from_endpoint: Mapping[str, Any],
+        to_endpoint: Mapping[str, Any],
+    ) -> RouteRecord | PendingRoute:
+        """段1(H-1): 冪等キャッシュの照会と端点解決(DB のみ・短時間)。
+
+        ヒットすれば `RouteRecord` を返す。miss なら OSRM に渡す材料
+        (`PendingRoute`)を返す。
+        """
+
         params = normalize_route_params(
             from_endpoint,
             to_endpoint,
@@ -186,36 +272,14 @@ class RouteService:
 
         source = await self._resolve_endpoint(params["from"])
         target = await self._resolve_endpoint(params["to"])
-        requests: list[tuple[Profile, tuple[Coordinate, Coordinate]]] = []
-        if source.needs_walk:
-            requests.append(("foot", (source.spot_coordinate, source.car_node)))
-        requests.append(("car", (source.car_node, target.car_node)))
-        if target.needs_walk:
-            requests.append(("foot", (target.car_node, target.spot_coordinate)))
+        return PendingRoute(params_hash=params_hash, params=params, source=source, target=target)
 
-        async def fetch_segment(
-            mode: Profile,
-            coordinates: tuple[Coordinate, Coordinate],
-        ) -> tuple[Profile, RouteResult]:
-            return mode, await self._osrm.route(mode, list(coordinates))
+    async def save(self, pending: PendingRoute, assembled: AssembledRoute) -> RouteRecord:
+        """段3(H-1): 永続化だけを行う(DB のみ・短時間)。"""
 
-        try:
-            async with asyncio.timeout(self._settings.osrm_leg_timeout_sec):
-                routed_segments = await asyncio.gather(
-                    *(fetch_segment(mode, coordinates) for mode, coordinates in requests)
-                )
-        except TimeoutError as exc:
-            raise RouteBuildError(
-                "レッグ経路が "
-                f"{self._settings.osrm_leg_timeout_sec:g} 秒で完了しませんでした"
-            ) from exc
-        assembled = assemble_route(
-            list(routed_segments),
-            geojson_precision=self._settings.geo_geojson_precision,
-        )
         return await self._repository.save_route(
-            params_hash=params_hash,
-            params=params,
+            params_hash=pending.params_hash,
+            params=pending.params,
             mode_summary=assembled.mode_summary,
             distance_m=assembled.distance_m,
             duration_sec=assembled.duration_sec,

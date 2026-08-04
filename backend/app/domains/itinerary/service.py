@@ -95,6 +95,7 @@ class ItineraryService:
         utilities: UtilityInput | None = None,
         selection_text: str = "",
         created_by_message_id: int | None = None,
+        assumptions: Sequence[str] = (),
     ) -> PlanItineraryResult | ToolError:
         if await self.repository.get_current(user_id) is not None:
             return ToolError(
@@ -145,9 +146,12 @@ class ItineraryService:
                 config=self.solver_config,
             )
             solved = solve_itinerary(solver_input)
+            resolved_assumptions = list(assumptions)
             await _emit_provisional(
                 self.provisional_sink,
-                solved.solutions[0].model_copy(update={"version": 1}, deep=True),
+                solved.solutions[0].model_copy(
+                    update={"version": 1, "assumptions": resolved_assumptions}, deep=True
+                ),
                 Diff(),
             )
             (
@@ -158,6 +162,9 @@ class ItineraryService:
                 solved.solutions,
                 selection_text,
                 selector=self.selector,
+            )
+            selected = selected.model_copy(
+                update={"assumptions": resolved_assumptions}, deep=True
             )
         except ValueError as exc:
             return _reference_error(exc)
@@ -206,6 +213,8 @@ class ItineraryService:
         utilities: UtilityInput | None = None,
         selection_text: str = "",
         created_by_message_id: int | None = None,
+        allow_refill: bool = False,
+        assumptions: Sequence[str] | None = None,
     ) -> EditItineraryResult | ToolError:
         current = await self.repository.get_current(user_id)
         if current is None:
@@ -301,6 +310,20 @@ class ItineraryService:
             *added.constraints,
             *operation_constraints.constraints,
         ]
+        # ADR-0021: 編集ターンの既定(allow_refill=False)は訪問集合を
+        # ops 適用後のまま固定する。ops 適用後の全訪問を
+        # `removal_protected_spot_ids`(削除保護専用。2026-08-04 レビュー
+        # 是正・C-1)へ入れて shake / 実行可能化フォールバックの除去対象から
+        # 外し、insertion_pool を空にして新規スポットの挿入候補をゼロにする。
+        # `protected_spot_ids`(ops が触れた項目由来の削除保護)は
+        # allow_refill に関わらずそのまま渡す — こちらを流用すると
+        # `_two_opt`/`_or_opt` の並び替えまで止まってしまう(採らなかった案
+        # 「全項目 locked 扱い」と同じ過剰制約になっていた実装バグ)。
+        # ソルバーがやるのは並び・時刻の再調整と経路の引き直しだけになる。
+        # allow_refill=True のときは従来どおりフル ILS(制限なし)。
+        post_ops_spot_ids = frozenset(itinerary_spot_ids(applied.itinerary))
+        removal_protected_spot_ids = frozenset() if allow_refill else post_ops_spot_ids
+        insertion_pool: frozenset[str] | None = None if allow_refill else frozenset()
         solver_input = SolverInput(
             days=tuple(_days_from_itinerary(applied.itinerary)),
             spots=planning.spots,
@@ -312,12 +335,19 @@ class ItineraryService:
             required_spot_ids=applied.required_spot_ids,
             excluded_spot_ids=applied.excluded_spot_ids,
             protected_spot_ids=applied.protected_spot_ids,
+            removal_protected_spot_ids=removal_protected_spot_ids,
+            insertion_pool=insertion_pool,
             stay_overrides=applied.stay_overrides,
             config=self.solver_config,
         )
-        solved = solve_itinerary(solver_input)
+        # 集合固定(allow_refill=False)では解 A/B/C の生成そのものを省略し
+        # (`alternatives=False`)、単一解を返す。
+        solved = solve_itinerary(solver_input, alternatives=allow_refill)
+        resolved_assumptions = (
+            list(assumptions) if assumptions is not None else list(current.itinerary.assumptions)
+        )
         provisional = solved.solutions[0].model_copy(
-            update={"version": current.version + 1},
+            update={"version": current.version + 1, "assumptions": resolved_assumptions},
             deep=True,
         )
         await _emit_provisional(
@@ -325,15 +355,24 @@ class ItineraryService:
             provisional,
             calculate_diff(current.itinerary, provisional),
         )
-        (
-            selected,
-            alternatives,
-            selection_used,
-        ) = await _select_solution_with_alternatives(
-            solved.solutions,
-            selection_text,
-            selector=self.selector,
-        )
+        if allow_refill:
+            (
+                selected,
+                alternatives,
+                selection_used,
+            ) = await _select_solution_with_alternatives(
+                solved.solutions,
+                selection_text,
+                selector=self.selector,
+            )
+        else:
+            # ADR-0021: 集合固定では解の多様化と LLM 選択(§4.4 経路3)を
+            # 省略し、解 A をそのまま単一解として使う(編集ターンの LLM
+            # 呼び出しが 1 回減る)。
+            selected = solved.solutions[0]
+            alternatives = []
+            selection_used = False
+        selected = selected.model_copy(update={"assumptions": resolved_assumptions}, deep=True)
         if self.route_provider is not None:
             selected = await _attach_route_ids(selected, self.route_provider)
         hard_errors = validate_hard_constraints(

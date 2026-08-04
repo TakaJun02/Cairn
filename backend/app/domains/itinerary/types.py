@@ -102,6 +102,11 @@ class Itinerary(DomainModel):
     days: list[ItineraryDay]
     concessions: list[Concession] = Field(default_factory=list)
     version: int = Field(default=0, ge=0)
+    # 未確認の前提(日付・起点等)の日本語短文リスト。版ごとにコピーされ、
+    # 永続化は itineraries.body(jsonb)に載るだけ(2026-08-04 追加。
+    # Docs/30_design/agent_react_architecture.md §5・§14、
+    # Docs/30_design/data_model.md §4.5.2)。
+    assumptions: list[str] = Field(default_factory=list)
 
 
 class Position(DomainModel):

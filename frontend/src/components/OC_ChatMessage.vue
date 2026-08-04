@@ -64,9 +64,20 @@
           <div class="tw-flex tw-flex-wrap tw-items-center tw-justify-between tw-gap-2">
             <div class="tw-flex tw-items-center tw-gap-2">
               <p class="tw-font-semibold tw-text-white">旅程 v{{ itinerary.version }}</p>
-              <span class="tw-rounded-full tw-bg-slate-700 tw-px-2 tw-py-0.5 tw-text-xs tw-text-slate-200">
-                {{ itinerary.phase === 'provisional' ? '調整中' : '確定' }}
+              <span
+                v-if="itinerary.phase === 'provisional'"
+                class="tw-rounded-full tw-bg-slate-700 tw-px-2 tw-py-0.5 tw-text-xs tw-text-slate-200"
+              >
+                調整中
               </span>
+              <details v-if="itineraryAssumptions.length" class="tw-relative" :title="itineraryAssumptions.join('、')">
+                <summary
+                  class="tw-inline-flex tw-cursor-pointer tw-list-none tw-items-center tw-rounded-full tw-bg-amber-900/60 tw-px-2 tw-py-0.5 tw-text-xs tw-text-amber-200"
+                >仮の前提あり</summary>
+                <ul class="tw-mt-1 tw-space-y-0.5 tw-rounded-lg tw-border tw-border-amber-700/60 tw-bg-slate-900/90 tw-p-2 tw-text-xs tw-text-amber-100">
+                  <li v-for="(assumption, index) in itineraryAssumptions" :key="index">{{ assumption }}</li>
+                </ul>
+              </details>
             </div>
             <button
               v-if="itinerary.phase === 'final' && itinerary.version > 1"
@@ -159,6 +170,18 @@ const gradientId = `spinner-gradient-${Math.random().toString(36).substring(2, 9
 
 const formattedContent = computed(() => DOMPurify.sanitize(marked.parse(props.content || '')))
 const itineraryDays = computed(() => props.itinerary?.itinerary?.days || [])
+
+// 2026-08-04([25 §1-3]の是正・レビュー是正 L-1): `phase` はソルバー処理の
+// 段階であってユーザーが内容を確定したという意味ではない。「確定」の語は
+// 使わない。final はバッジ自体を出さない(見出しの「旅程 v{n}」と重複する
+// ため)。provisional のときだけ「調整中」バッジを出す
+// (frontend_nav.md §2.4)。
+
+// 未確認の前提(日付・起点等)。空なら何も表示しない。
+const itineraryAssumptions = computed(() => {
+  const values = props.itinerary?.assumptions ?? props.itinerary?.itinerary?.assumptions
+  return Array.isArray(values) ? values : []
+})
 
 const spotName = (spotId) => {
   const spot = navStore.spots.find((value) => value.spot_id === spotId)
