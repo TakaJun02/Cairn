@@ -20,6 +20,7 @@
 | 4 | [40_api/chat_sse.md](40_api/chat_sse.md) | SSE とREST の契約。**フロント⇔バックの正** |
 | 5 | [30_design/narration_qa.md](30_design/narration_qa.md) | 知識検索サブエージェント |
 | 6 | [30_design/recommendation_planning.md](30_design/recommendation_planning.md) | 推薦とソルバーの方式。**§4.4 が述語 17 種の定義の正** |
+| 7 | [30_design/dialogue_style.md](30_design/dialogue_style.md) | **対話体験(respond の応答様式・ask_user 選択肢品質)の正**(決定稿 2026-08-04) |
 | 補 | [30_design/agent_patterns_survey.md](30_design/agent_patterns_survey.md) | 外部知見の調査記録 |
 
 **Phase 2(geo / パック / 音声)を実装するなら、この 3 本**(すべて決定稿 2026-08-01):
