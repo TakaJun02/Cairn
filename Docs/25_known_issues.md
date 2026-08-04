@@ -1,20 +1,27 @@
 # 既知の問題インベントリ(ReAct 再構築後)
 
-- 状態: **記録(2026-08-04。ReAct 再構築の完了時点で残っている問題の棚卸し)**
+- 状態: **記録(2026-08-04。ReAct 再構築の完了時点で残っている問題の棚卸し)。同日夜、§1 の 4 件と §4-1 を解消・決着(下記)**
 - 位置づけ: **「いま何が残っているか」の一覧の正。**[23_ux_issues.md](23_ux_issues.md)(旧・一括プラン方式の系に対する調査記録)の各項目の**現状**も本書で追跡する(23 は記録として凍結)
 - 根拠: 2026-08-04 の実機通し確認(新規ユーザーでブラウザ操作。推薦 + HITL 質問 / 旅程作成 / 編集 / undo / QA / 再編集の 6 ターン)+ Codex 実装レビュー + サーバーログ
 - 運用: **対応方針は該当設計文書を更新してから決める**(Docs 駆動開発)。解消したらこの文書の該当行を更新する
 
 ---
 
-## 1. 実害あり・未解決
+## 1. 実害あり → **全 4 件解消(2026-08-04 夜。実装 + 実機確認済み)**
 
-| # | 問題 | 根拠・現状 | 関係する文書 |
+**確認方法**: 新規ユーザー `fix-verify-0804` でブラウザ通し(推薦 → 起点の HITL 質問 → 旅程作成 → 編集)。コンソールエラー 0 件。
+
+| # | 問題(当時) | 解消内容 | 正となる文書 |
 | --- | --- | --- | --- |
-| **1-1** | **旅程作成・更新のたびに地図の経路復元が失敗する**(routes 404 の競合)。`state:itinerary` 直後の `GET /api/v1/routes/{id}` が 404 になり、フロントは再試行しない | **2026-08-04 も再現**(通し確認でコンソールに 404 ×12、`[NavStore] Failed to restore itinerary routes`)。同じ id を後から取ると 200(= 競合状態)。旧 [23 §1-2〜1-5](23_ux_issues.md) から持ち越し。**ReAct 再構築のスコープ外として未着手** | [geo.md §3.3](30_design/geo.md) / [chat_sse.md](40_api/chat_sse.md)(route 永続化と応答タイミングの契約確認が要る) |
-| **1-2** | **編集の再ソルブで、頼んでいないスポットの入れ替えが起きる。**「三崎公園は外して」で三崎公園に加えて牛渡川も外れ、奈曽の白滝・金峰神社が入った(実測)。diff カードには正直に出るが、ユーザーは 1 件の削除しか頼んでいない | 旧 [23 §2-1](23_ux_issues.md)(頼んでいないスポットが入る)の変種。ILS が編集のたびに効用最大化で再充填するため。**設計論点**: 編集時は既存訪問を既定で lock するか / 編集距離ペナルティ β を強めるか / 「入れ替えてもよいか」を respond で確認するか | [recommendation_planning.md §4](30_design/recommendation_planning.md)(目的関数)/ [agent_react_architecture.md §5](30_design/agent_react_architecture.md) |
-| **1-3** | **確認していない前提の旅程に「確定」バッジが付く。**日付・起点を仮定した v1 がそのまま「確定」表示 | 再現(旧 [23 §2-2](23_ux_issues.md))。respond は仮定を明示するようになった(改善)が、バッジ表示は変わっていない | [frontend_nav.md](30_design/frontend_nav.md) |
-| **1-4** | **候補カードの所要時間が未確認の起点基準**(「鳥海高原家族旅行村から車で約 25 分」) | 再現(旧 [23 §2-3](23_ux_issues.md)) | [recommendation_planning.md](30_design/recommendation_planning.md)(reason_materials の起点の扱い) |
+| **1-1** | 旅程作成・更新のたびに routes 404(SSE 送出時点で route 行が未コミットで別コネクションから見えない競合)。フロントは再試行しない | **解消**。route はレッグごとに専用の短寿命 session で即時 commit(OSRM 往復は session 外・並列度 4)。`state:itinerary`(final)送出時点で全 `route_id` が GET 可能、が SSE 契約に。フロントは 404 限定リトライ + `allSettled` 部分描画を防御に追加。**実機: 経路 GET ×9 が全件一発 200** | [ADR-0020](adr/0020-routes-early-commit.md) / [geo.md §3.5](30_design/geo.md) / [chat_sse.md §1.2](40_api/chat_sse.md) |
+| **1-2** | 編集の再ソルブで頼んでいないスポットの入れ替え(「三崎公園は外して」で牛渡川も外れ 2 件入った) | **解消**。編集は既定で訪問集合を固定(削除保護 + 挿入プール空。並び・時刻の再調整は許す)。再充填は `allow_refill`(明示要求時のみ true)。**実機: 「金峰神社は外して」の diff が削除 1 件のみ** | [ADR-0021](adr/0021-edit-turn-default-lock.md) / [recommendation_planning.md §4.5(7)](30_design/recommendation_planning.md) |
+| **1-3** | 仮定前提の旅程に「確定」バッジ | **解消**。「確定」の語を廃止(provisional=「調整中」、final=バッジなし)。`assumptions`(未確認の前提)を版に永続化して SSE に載せ、**「仮の前提あり」チップ**で明示。**実機: v1 に「日付は明日と仮定」チップを確認** | [frontend_nav.md §2.4](30_design/frontend_nav.md) / [chat_sse.md §1.2](40_api/chat_sse.md) |
+| **1-4** | 候補カードの所要時間が未確認の既定起点基準(facility ソート順先頭を暗黙採用) | **解消**。既定起点の暗黙選択を廃止。所要時間文は接地起点(既存旅程の起点)があるときだけ。旅程の起点未指定は `precondition_unmet` → **メインエージェントが ask_user で質問**(実機確認)。 | [recommendation_planning.md §3.3](30_design/recommendation_planning.md) / [agent_react_architecture.md §5](30_design/agent_react_architecture.md) |
+
+**このラウンドで判明・積み残した小粒の論点**(いずれも実害小。[90_backlog.md](90_backlog.md)):
+- 物理的に時間割が組めない編集での実行可能化フォールバック削除は Concession にならず diff にのみ現れる(ADR-0021 の明記済み例外)
+- 旅程がまだ無い段階の推薦に起点を渡す口が無い(所要時間文が出ないのは仕様)
+- `edit_itinerary.allow_refill` は guided スキーマ上 required で、既定 false の担保はプロンプトのみ
 
 ## 2. 監視項目(発生条件つき・対処方針は確定済み)
 
@@ -43,7 +50,7 @@
 
 | # | 項目 | 内容 |
 | --- | --- | --- |
-| 4-1 | **認証**(旧 [23 §7-1](23_ux_issues.md)): `POST /login` はユーザー名のみで、他人のユーザー名を打てばその人のスレッドが開く | 仕様判断待ちのまま(研究プロトタイプとして許容するなら [10_requirements.md](10_requirements.md) に明記する) |
+| 4-1 | **認証**(旧 [23 §7-1](23_ux_issues.md)): `POST /login` はユーザー名のみで、他人のユーザー名を打てばその人のスレッドが開く | **決定済み(2026-08-04)**: 研究プロトタイプとして許容し、[10_requirements.md FR-5.2](10_requirements.md) に明記した。実装変更なし |
 | 4-2 | 設計文書への footnote: `update_profile` の guided フォールバック(§2-1)を [agent_react_architecture.md §2](30_design/agent_react_architecture.md) に追記 | **追記済み(2026-08-04)** |
 | 4-3 | [24_architecture_as_built.md](24_architecture_as_built.md) の再執筆 | **完了(2026-08-04)** |
 

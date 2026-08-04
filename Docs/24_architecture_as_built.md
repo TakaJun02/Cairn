@@ -268,6 +268,19 @@ sequenceDiagram
 | 4 | `messages.meta` に `presented` と並んで旧互換フィールド(`candidate_spot_ids` 等)が残る | 契約([data_model.md §4.4](30_design/data_model.md))は `presented` が正。互換値は同期して書かれる。許容 |
 | 5 | `pending_constraints` への保存経路は「旅程なしで `edit_itinerary` が失敗したときの退避」のみ | ReAct 化で制約は常に Tool 引数として来るため、これが到達可能な唯一の経路。設計 §5 の「一時保持」の実装形として許容 |
 
+## 7.5 追補 — 既知問題 §1 の解消(2026-08-04 夜)
+
+[25_known_issues.md §1](25_known_issues.md) の 4 件を解消した。実装状の変更点(本文の該当節より新しい):
+
+| 変更 | 中身 | 正となる文書 |
+| --- | --- | --- |
+| **routes の即時 commit** | route の永続化はターンの session を使わず、レッグごとに専用の短寿命 session(照会 → OSRM(session 外)→ 保存)で即時 commit する(`_FallbackRouteProvider`、並列度 Semaphore 4)。`state:itinerary`(final)送出時点で全 `route_id` が GET 可能、が SSE 契約になった。フロントは 404 限定の再試行 + `Promise.allSettled` の部分描画を防御に持つ | [ADR-0020](adr/0020-routes-early-commit.md) / [geo.md §3.5](30_design/geo.md) |
+| **編集ターンの集合固定** | `edit_itinerary` に `allow_refill`(既定 false)。既定では ops 適用後の訪問を `removal_protected_spot_ids`(削除保護専用。並び替えは locked のみが制限)で守り、`insertion_pool=frozenset()` で新規挿入ゼロ。解 A/B/C と選択 LLM も省略(編集の LLM 1 回減) | [ADR-0021](adr/0021-edit-turn-default-lock.md) / [recommendation_planning.md §4.5(7)](30_design/recommendation_planning.md) |
+| **`assumptions`(未確認の前提)** | `plan_itinerary` の引数 → `Itinerary.assumptions`(body jsonb 内、版ごとにコピー)→ `state:itinerary` / undo / `GET /itinerary` に載る。UI は「仮の前提あり」チップ。クローズドワールドの明示的例外(前提の自由文) | [agent_react_architecture.md §5/§14](30_design/agent_react_architecture.md) / [chat_sse.md §1.2](40_api/chat_sse.md) |
+| **既定起点の廃止** | `_default_origin` のフォールバックは既存旅程の起点のみ。推薦の所要時間文は接地起点があるときだけ。旅程は起点未解決なら `precondition_unmet` を返し、メインエージェントが ask_user で聞く(プロンプトの「起点は仮定してよい」も撤去) | [recommendation_planning.md §3.3](30_design/recommendation_planning.md) / [agent_react_architecture.md §5](30_design/agent_react_architecture.md) |
+
+旅程カードの「確定」バッジは廃止(provisional のみ「調整中」、final はバッジなし)。
+
 ---
 
 ## 8. 読む順序(この文書からの案内)

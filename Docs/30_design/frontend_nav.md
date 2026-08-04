@@ -158,6 +158,8 @@ const res  = await fetch('/api/v1/chat', {
 - `state:itinerary` の `diff`(added / removed / moved / retimed)を差分として表示する
 - **[元に戻す] は `POST /api/v1/itinerary/undo` を直接呼ぶ**(LLM を通さない。[chat_sse.md §2](../40_api/chat_sse.md))。`expected_current_version` を必ず付ける
 - 応答は `state:itinerary` と同じスキーマなので、**描画コードは 1 本で済む**
+- **フェーズバッジに「確定」と書かない**(2026-08-04、[25 §1-3](../25_known_issues.md) の是正): `phase` はソルバー処理の段階(provisional = 経路取得前 / final = 経路取得済み)であって、**ユーザーが内容を確定したという意味ではない**。表示は provisional → 「調整中」、**final → バッジを出さない**(カード見出しに「旅程 v{n}」の版表示が既にあり、バッジで繰り返すと冗長 — 2026-08-04 レビュー指摘で「v{version}」バッジ案から変更)。いずれも「確定」の語を使わない
+- **仮の前提チップ**(2026-08-04 追加): `state:itinerary` の `assumptions`([chat_sse.md](../40_api/chat_sse.md))が非空のとき、旅程カードに「仮の前提あり」チップを出し、タップ/ホバーで中身(「日付は明日と仮定」等)を列挙する。空なら何も出さない
 
 ### 2.5 【新規】パック生成の進捗パネル
 
@@ -185,6 +187,7 @@ const res  = await fetch('/api/v1/chat', {
 | 3 | **SW のタイルキャッシュが空回り**([22 §13-5](../22_current_issues.md))。`TILE_HOSTS` は OSM 公式だが、`NavMap.vue` が使うのは別ホストで拡張子も無い | **`public/sw.js` の URL 判定を `lib/tiles.js` の実際の URL に合わせる。**作り直さない([ADR-0017](../adr/0017-frontend-incremental-change.md)) |
 | 4 | **ハードコードされたバッファ値**(`NavView` の 350 m / 15 m が API 側の値と食い違う: [22 §12-7](../22_current_issues.md))。**2026-08-02 訂正**: 括弧内に「API の 300 m / 10 m」と書いていたが、**foot バッファは [geo.md §5.2](geo.md) で 10 m → 50 m に変更済み**である。いずれにせよフロントは自前の定数を持たない | **manifest の `trigger_radius_m` を読む**([packs_pipeline.md §7.2](packs_pipeline.md))。定数を 2 か所に持たない |
 | 5 | **デッド UI**(`RTDoc` の `u` / `h` は供給源が無い: [22 §12-4](../22_current_issues.md)) | **表示を消す。**予報は要求に無い([realtime_lora.md §11](realtime_lora.md)) |
+| 6 | **`state:itinerary` 後の経路復元が 404 で全滅し、再試行しない**(2026-08-04 追加: [25 §1-1](../25_known_issues.md))。`lib/api.js` の `getRoute` が status を落とした素の `Error` を投げるため、404 だけの再試行も書けない | 主修正はバックエンド([ADR-0020](../adr/0020-routes-early-commit.md)、送出時点で解決可能が契約)。フロントは**防御**として、(a) `getRoute` のエラーに status を保持させ、(b) 404 のときだけ短い再試行(例: 300ms 間隔 ×3。値は実装時に決める)を入れる。(c) 復元は `Promise.all` でなく **`Promise.allSettled` で取れたレッグだけ描き**、欠けたレッグは経路縮退(`route_degraded`)と同じ扱いにする(2026-08-04 レビュー指摘。1 本の失敗で成功した 11 本まで消さない) |
 
 ---
 
@@ -228,6 +231,8 @@ applyDownlink({ packEpoch, codes }, manifest) {
 | 6 | パック生成中もチャットが使え、**`partial` が「完了」と表示されない** |
 | 7 | `src/assets/POI.json` / `facilities.json` が**存在しない** |
 | 8 | **`npm run build` が通る**(CI の最低線: [20 §13](../20_architecture.md)) |
+| 9 | **旅程作成・編集の直後に地図へ経路が描かれる**(コンソールに routes 404 が出ない。2026-08-04 追加: [25 §1-1](../25_known_issues.md)) |
+| 10 | 旅程カードに**「確定」の語が出ない**。`assumptions` 非空のとき「仮の前提あり」チップが出る(2026-08-04 追加: [25 §1-3](../25_known_issues.md)) |
 
 ---
 

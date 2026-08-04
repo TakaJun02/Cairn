@@ -246,6 +246,15 @@ plan_itinerary / edit_itinerary
 
 [recommendation_planning.md §5](recommendation_planning.md) の「OSRM で leg 経路 → `state: itinerary(final)`」がこれである。**provisional の時点で時刻はすべて確定している**(行列由来)ので、ここで取るのは線だけであり、失敗しても旅程は変わらない。
 
+### 3.5 永続化の可視性(2026-08-04 追加。[ADR-0020](../adr/0020-routes-early-commit.md))
+
+**`app.routes` への書き込みは、会話ターンの一括 commit(N6 persist)を待たず、専用の短寿命セッションで即時 commit する。**
+
+- 会話ターンは 1 つの長寿命トランザクションで貫かれ、commit はターン終端の N6 だけ、という設計([agent_react_architecture.md §12](agent_react_architecture.md))のままだと、`state:itinerary`(final)送出時点で route 行が**別コネクションから見えず**、フロントの `GET /routes/{id}` が 404 になる(実機で毎回再現: [25_known_issues.md §1-1](../25_known_issues.md))
+- `app.routes` は `params_hash` キーの冪等キャッシュであり会話状態ではないため、先行 commit してよい(ターンが rollback しても残る行は無害な再利用可能エントリ)。`pending_ask` の即時 commit(`write_pending_ask_now`)と同じ形
+- この結果、**`state:itinerary`(final)が運ぶ `route_id` は送出時点で `GET /api/v1/routes/{route_id}` により解決できることを契約とする**([chat_sse.md §1.2](../40_api/chat_sse.md))
+- フロントエンドは防御として 404 に短い再試行を持つ([frontend_nav.md §3](frontend_nav.md))が、これは保険であり契約はバックエンドが守る
+
 ---
 
 ## 4. G-1 移動時間行列

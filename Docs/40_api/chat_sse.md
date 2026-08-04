@@ -74,7 +74,7 @@ event: done    { ... }        # 必ず 1 回、最後に
 | --- | --- | --- |
 | **`step`** | **メインエージェントが手を実行するとき**(開始・実況・完了。0 回以上・可変。[ADR-0019](../adr/0019-react-main-agent-subagents.md)) | `{"tool":"recommend","status":"started"\|"progress"\|"finished","label_ja":"おすすめを探しています"}` |
 | `candidates` | `recommend` 実行時。**2 回**(provisional → final) | `{"phase":"provisional"\|"final","items":[{"spot_id","name_ja","reason_materials":{...}}]}` |
-| `itinerary` | 旅程が作られた/変わったとき。**2 回**(provisional → final)。**1 ターンに複数回の書き換えがあれば、その回数だけ出る**(ADR-0019) | `{"phase":..,"version":4,"itinerary":{...},"diff":{...},"concessions":[...]}` |
+| `itinerary` | 旅程が作られた/変わったとき。**2 回**(provisional → final)。**1 ターンに複数回の書き換えがあれば、その回数だけ出る**(ADR-0019) | `{"phase":..,"version":4,"itinerary":{...},"diff":{...},"concessions":[...],"assumptions":["日付は明日と仮定"]}` |
 | `ask_user` | **`ask_user` Tool を `kind:"preference"` で実行**(選好の聞き取り)。**ターンの途中で出る**(§1.4) | `{"slot":"mobility","reason":"歩ける距離を知りたい","options":["あまり歩きたくない","30分程度なら","登山もしたい"]}` |
 | **`clarify`** | **`ask_user` Tool を `kind:"clarify"` で実行**(発話の聞き返し)。**ターンの途中で出る**(§1.4) | `{"surface":"2番目のやつ","reason":"候補が 2 つある","options":[{"label":"鶴間池","value":"spot_012"}]}` |
 | `profile` | `profile_delta` が反映されたとき。**差分が空のターンは送らない**(ADR-0019) | `{"profile":{...}}` |
@@ -88,6 +88,8 @@ event: done    { ... }        # 必ず 1 回、最後に
 
 - **`phase: provisional` → `final` の 2 段送出**が [ADR-0006](../adr/0006-recommendation-hybrid.md) 形-2 の実体。**カードと地図は provisional の時点で描画する。**同じ `kind` が 2 回来ることをクライアントは前提にする
 - `provisional` が来て `final` が来ないことがある(リランクが縮退したとき)。**その場合は `provisional` をそのまま確定として扱う。**判別は `error{code:"rerank_degraded"}` で行う
+- **`itinerary`(final)の `route_id` は送出時点で解決可能**(2026-08-04 追加、[ADR-0020](../adr/0020-routes-early-commit.md))。`itinerary.days[].items[].leg_from_prev.route_id` が指す行は、イベント送出前に commit 済みであり、直後の `GET /api/v1/routes/{route_id}` は 200 を返す。これはサーバー側の契約である(クライアントの 404 再試行は防御にすぎない)
+- **`assumptions`**(2026-08-04 追加): その版の旅程が依って立つ**未確認の前提**(日付・起点など)の日本語短文リスト。空配列なら前提なし。UI はこれが非空のとき「仮の前提あり」を表示する([frontend_nav.md §2.4](../30_design/frontend_nav.md))。undo/redo・`GET /api/v1/itinerary` の応答にも同じフィールドが載る(版に紐づいて永続化される)
 
 #### `token` — 応答本文
 

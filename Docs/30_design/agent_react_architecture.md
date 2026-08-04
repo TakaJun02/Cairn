@@ -119,8 +119,8 @@ flowchart TD
 | Tool | 引数(メインエージェントが書く) | 返るもの | 実体 |
 | --- | --- | --- | --- |
 | `recommend` | `instruction`(自然言語) | 推薦結果のダイジェスト(名前空間) | §4 サブエージェント。`k=5` は**コードが固定**し LLM に書かせない |
-| `plan_itinerary` | `days`(日付・開始終了・起終点)・`must_visit`・`constraints`・`notes` — POI は**スポット名**で書く | 旅程ダイジェスト(自然言語) | §5 完全ワークフロー |
-| `edit_itinerary` | `ops` + `constraints` + `notes`(スポット名で書く) | 旅程ダイジェスト + diff(自然言語) | §5 完全ワークフロー |
+| `plan_itinerary` | `days`(日付・開始終了・起終点)・`must_visit`・`constraints`・`notes`・**`assumptions`(未確認の前提。2026-08-04 追加)** — POI は**スポット名**で書く | 旅程ダイジェスト(自然言語) | §5 完全ワークフロー |
+| `edit_itinerary` | `ops` + `constraints` + `notes`(スポット名で書く)+ **`allow_refill`(既定 false。明示要求時のみ true。2026-08-04 追加、[ADR-0021](../adr/0021-edit-turn-default-lock.md))**+ **`assumptions?`(省略なら基の版からコピー)** | 旅程ダイジェスト + diff(自然言語) | §5 完全ワークフロー |
 | `search_knowledge` | `request`(自然言語)・`spot_name?` | 回答(自然言語 + 出典) | §6 サブエージェント |
 | `ask_user` | `kind`(`preference` / `clarify`)・`slot?` / `surface?`・`reason`・`options`(2〜4) | **ユーザーの答え**(UI 経由で取得し、**同一ターン内で** act に返る) | §7 HITL |
 | `done` | なし | —(`respond` へ遷移) | §3.4 |
@@ -179,14 +179,17 @@ flowchart LR
 
 | フロー | 中身 | LLM |
 | --- | --- | --- |
-| **1. 受付** | ソルバー入力のうち **LLM が書く場所**(`days` / `must_visit` / `ops` / `constraints` / `notes`)を**メインエージェントから**受け取る。POI は**スポット名**で来る | なし |
+| **1. 受付** | ソルバー入力のうち **LLM が書く場所**(`days` / `must_visit` / `ops` / `constraints` / `notes`、plan では **`assumptions`**、edit では **`allow_refill`**。2026-08-04 追加)を**メインエージェントから**受け取る。POI は**スポット名**で来る | なし |
 | **2. 構築** | 残りの入力をコード + DB で構築: **名寄せでスポット名 → `spot_id` 解決**(序数・別名辞書 + DB 照合。**解決できない要素はその要素だけ落として記録**)、効用スコア(プロフィール由来)、移動時間行列、営業時間、滞在時間、**現行 version から継承する既存 `constraints` と新規分のマージ** | なし |
-| **3. 実行** | `revert` 特例(ソルバーを回さず version を戻すだけ)→ `ops` 適用(`locked` 固定)→ **ILS ×3(解 A / B / C)** → **解の選択(LLM 1 回。**決定 2026-08-04、論点 3。選択ヒントはフロー 1 の `notes`**)** → 全述語でペナルティ再評価 → 譲歩の内訳 → **OSRM で leg 経路**。`state: itinerary` の provisional / final もここから送出 | 解の選択に 1 回 |
+| **3. 実行** | `revert` 特例(ソルバーを回さず version を戻すだけ)→ `ops` 適用(`locked` 固定)→ **ソルブ**。`plan` と `edit(allow_refill:true)` は **ILS ×3(解 A / B / C)→ 解の選択(LLM 1 回。**決定 2026-08-04、論点 3。選択ヒントはフロー 1 の `notes`**)**。**`edit` の既定(集合固定)は単一解でこの選択を省略**([ADR-0021](../adr/0021-edit-turn-default-lock.md))→ 全述語でペナルティ再評価 → 譲歩の内訳 → **OSRM で leg 経路**。`state: itinerary` の provisional / final もここから送出 | 解の選択に 0〜1 回 |
 | **4. 整形** | **メインエージェントが判断に必要な情報だけ残し、コードで自然言語に整形**して返す: 日ごとの出発時刻・各スポットの**名前**・到着 / 滞在 / 移動手段と移動分・終了時刻、譲歩(`message_ja`)、diff、フロー 2 で落とした要素。**`spot_id` は返さない**(ユーザー指示) | なし |
 
 - **経路取得までがこの Tool の責務。**「旅程はあるが経路がない」中間状態を作らない([ADR-0013](../adr/0013-leg-route-door-to-door.md))
 - **制約の寿命**: `constraints` は旅程行に紐づけて永続化し、**version ごとにコピーする**(undo すると制約も一緒に戻る)。旅程がまだ無いターンの制約はスレッド行に一時保持し、最初の `plan_itinerary` で旅程へ移す。取り消しは `edit_itinerary.constraints` の remove 操作として表現し、**現在有効な制約は id つきでメインのコンテキスト③に載せる**(見えない制約はユーザーが外せない)
 - **1 ターンに複数回の旅程書き換えを許す**(決定 2026-08-04、論点 6)。書き換えごとに version +1 し、`persist` で一括コミット。undo の粒度は version のまま
+- **編集の既定は「集合固定」**(2026-08-04、[ADR-0021](../adr/0021-edit-turn-default-lock.md)): `edit_itinerary` の既定では訪問集合の変更は `ops` によるものだけで、ソルバーは並び・時刻の再調整しか行わない。**`allow_refill: true`(ユーザーが「代わりに/追加で何か入れて」と明示的に求めたときだけメインエージェントが立てる)**でフル ILS に戻る。詳細は [recommendation_planning.md §4.5(7)](recommendation_planning.md)
+- **起点の既定値は存在しない**(2026-08-04、[25 §1-4](../25_known_issues.md) の是正): フロー 2 の名寄せで日の起点が解決できない(メインが `origin_name` を渡さず、既存旅程の起点も無い)ときは、**勝手に施設を選ばず** `ToolError(precondition_unmet, "起点が未指定")` を返す。メインエージェントは `ask_user` で聞くか、会話から得た地点名を明示して再実行する(その仮定は `assumptions` に書く)
+- **`assumptions`(2026-08-04 追加)**: `plan_itinerary` の引数に、日付・起点など**ユーザーに確認していない前提**を日本語短文で列挙する(レコメンド SA の `assumptions` と同型)。旅程の版に紐づけて永続化し、`state:itinerary` に載せる([chat_sse.md](../40_api/chat_sse.md))。`edit_itinerary` は基の版から**そのままコピー**し、編集で前提が解消されたときだけメインが `assumptions` を差し替える(引数に与えれば置換、省略ならコピー)。UI は非空のとき「仮の前提あり」を表示する([frontend_nav.md §2.4](frontend_nav.md))。**`assumptions` はクローズドワールド原則([ADR-0006](../adr/0006-recommendation-hybrid.md) / [recommendation_planning.md §3.3](recommendation_planning.md))の明示的な例外である** — POI の事実ではなく「エージェントが置いた前提」の自由文であり、spot_id 照合を掛けない。UI には前提の説明としてのみ表示し、地名として解釈・リンクしない
 - 旅程が無い状態の `edit_itinerary` は `ToolError(precondition_unmet)` を**結果として返す**。メインエージェントは**それを見て `plan_itinerary` に切り替えられる**(破棄で終わらない)
 - **undo の入口は 2 つのまま**: 差分カードの [元に戻す] ボタン(LLM を通さない専用 REST)と、自然言語(メイン → `edit_itinerary` の `revert`)。どちらも「version を戻す」に落ち、ソルバーは回さない
 - フロー 4 の整形はコードで行う(LLM を挟むと静かな要約ドリフトが入る)。**同じ整形器を §3.1 ③「現在の旅程」の構築にも使う**(実装は 1 つ)
@@ -353,6 +356,8 @@ event: done    {"turn_id":"...","degraded":false}          // 必ず 1 回、最
 
 **`pending_turn` は存在しない**(旧案の遺物。ターンを中断しないので不要)。DDL は [data_model.md](data_model.md)(migration 0004)が正。
 
+**一括 commit の例外(2026-08-04、[ADR-0020](../adr/0020-routes-early-commit.md))**: 会話状態の commit は N6 persist の 1 回だけ、が原則だが、**冪等キャッシュ(`app.routes`)と `pending_ask` は専用の短寿命セッションで即時 commit する**。前者は `state:itinerary`(final)送出時点で `GET /routes/{id}` が解決できるため([geo.md §3.5](geo.md))、後者はリロード復元のため(§7)。どちらも会話状態ではなく、ターンの rollback で残っても無害である。
+
 ## 13. 不変条件(明文)
 
 1. **状態は毎ターン DB から再構築する**(ADR-0004)。プロセス内に**ターンをまたぐ**状態を持たない(質問待ちはターン内。§7)
@@ -392,7 +397,8 @@ Concession  = {constraint_id, pred, args, violation, message_ja}
 ItineraryItem = {seq, spot_id, arrive_min, stay_min, depart_min,
                  leg_from_prev: {mode, min, route_id|null}, locked, note|null}
 ItineraryDay  = {date, start_min, end_min, origin, destination, items: [ItineraryItem]}
-Itinerary     = {days: [ItineraryDay], concessions: [Concession], version}
+Itinerary     = {days: [ItineraryDay], concessions: [Concession], version,
+                 assumptions: [string]}   // 未確認の前提（日付・起点等）。版ごとにコピー。2026-08-04 追加
 Diff          = {added, removed, moved, retimed}
 
 RecommendationResult = {spot_ids, candidates, provisional_spot_ids, rerank_used}   // 既存実装の型のまま

@@ -587,6 +587,9 @@ CREATE UNIQUE INDEX itineraries_one_current
     {"constraint_id": "c_014", "pred": "lunch_break", "args": {"from": 720, "to": 780, "min": 60},
      "violation": 45,                     // ペナルティレジストリが返した違反量
      "message_ja": "昼休憩を12時台に置けませんでした（移動が入るため13時台になっています）"}
+  ],
+  "assumptions": [                        // 未確認の前提（日付・起点等）の日本語短文。2026-08-04 追加
+    "日付は明日（8/10）と仮定"            // concessions と同じく版スナップショットの一部。undo で一緒に戻る
   ]
 }
 ```
