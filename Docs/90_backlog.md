@@ -3,7 +3,7 @@
 - 最終更新: **2026-08-04**
 - 用途: **会話セッションをまたぐときの引き継ぎ。**新しいセッションはこの文書から読み始める
 
-> # ✅ 現在地(2026-08-04 深夜・ADR-0022)— **「1 スポット指名で複数スポットのプランが返る」を設計変更で解消(実装・レビュー・修正済み。実機確認待ち)**
+> # ✅ 現在地(2026-08-04 深夜・ADR-0022)— **「1 スポット指名で複数スポットのプランが返る」を設計変更で解消(実装・レビュー・実機確認済み = `51deed5`)。実機確認中に新規バグ [25 §1-6](25_known_issues.md) を検出(未対応)**
 >
 > **体制**: 仕様設計・受け入れ = Fable 5 / 実装 = Sonnet 5 / 実装レビュー = Opus 5(Codex リミット中の代行)。
 >
@@ -11,7 +11,9 @@
 > - **決定([ADR-0022](adr/0022-plan-turn-explicit-candidate-pool.md))**: `plan_itinerary` に `candidate_spots`(任意候補・既定空)を追加し、挿入プールを `must_visit ∪ candidate_spots` に限定。両方空(実効プール空)は `precondition_unmet`。「おすすめで組んで」はメインが `recommend` → 候補名転記で表現(ツールは柔軟・駆動はメインエージェントの判断)
 > - **レビュー指摘と対処(ADR-0022 追記)**: High 2 件 — ①解 C が must_visit を落として空旅程になり空 v1 が確定保存されうる → `_relaxed_solution` の除去対象に required を追加 + 任意候補ゼロは単一解・選択 LLM 省略 ②起終点にしか解決しないと空判定をすり抜け → 実効プール(起終点除外後)で判定。Medium: 全滅時メッセージへ dropped/ambiguous 付記・弱アサーション強化・退化テスト追従。全て修正済み
 > - **テスト**: バックエンド 373 passed(skip 12 は DB 統合の既知ベースライン)/ ruff 新規違反ゼロ
-> - **積み残し(小粒)**: (a) pending の `require` が有効なターンで must_visit 空の plan がガードに弾かれる false positive(1 手の浪費。メインは有効制約を見て回復可能 — ADR-0022 追記 5)(b) `insertion_pool` の実在しない spot_id は黙って無視(`required_spot_ids` の ValueError と非対称。resolve_names 経由なら実害なし)(c) `candidate_spots` 最大 12 件が軌跡テキストで毎周ダンプされ R2 予算を数百トークン圧迫(実害が出る規模ではない)(d) **実機の通し確認が未実施**(Fable 担当。次の作業)
+> - **実機確認(2026-08-04 深夜、新規ユーザー)**: 「道の駅象潟を起点に元滝伏流水に行きたい」→ HITL「他に立ち寄りたい場所は?」→「特になし」→ **旅程は元滝伏流水 1 件のみ**(v1・DB 照合済み)。エージェントは候補ゼロ差し戻しから自律回復
+> - **⚠ 実機確認中の新規発見([25 §1-6](25_known_issues.md)・未対応)**: `ask_user` の引数不正(guided スキーマが kind 排他を強制しない)→ 包括 except で recoverable=false → `error_event(stage="ask_user")` が契約外語彙 → その防御ログが LogRecord 予約キー `message` 上書きで KeyError、という 3 欠陥の連鎖で**ターン全体が落ち、発話が保存されない**(⑤必達の不変条件が破れる)。修正案は 25 §1-6 に記載(既存設計との整合を取るだけで新しい設計判断は不要)
+> - **積み残し(小粒)**: (a) pending の `require` が有効なターンで must_visit 空の plan がガードに弾かれる false positive(1 手の浪費。メインは有効制約を見て回復可能 — ADR-0022 追記 5)(b) `insertion_pool` の実在しない spot_id は黙って無視(`required_spot_ids` の ValueError と非対称。resolve_names 経由なら実害なし)(c) `candidate_spots` 最大 12 件が軌跡テキストで毎周ダンプされ R2 予算を数百トークン圧迫(実害が出る規模ではない)
 >
 > ---
 >

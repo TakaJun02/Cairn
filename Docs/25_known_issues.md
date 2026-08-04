@@ -23,11 +23,17 @@
 - 旅程がまだ無い段階の推薦に起点を渡す口が無い(所要時間文が出ないのは仕様)
 - `edit_itinerary.allow_refill` は guided スキーマ上 required で、既定 false の担保はプロンプトのみ
 
-## 1.5 実害あり → **設計確定・実装待ち(2026-08-04 夜、ユーザーの実機テストで新規発見)**
+## 1.5 実害あり → **解消(2026-08-04 深夜。実装・レビュー・実機確認済み)**
 
-| # | 問題 | 調査結果 | 対応方針 | 正となる文書 |
+| # | 問題 | 調査結果 | 対応 | 正となる文書 |
 | --- | --- | --- | --- | --- |
-| **1-5** | 「〇〇に行きたいです」と 1 スポットのみ指名しても、複数スポットが組み込まれたプランが返る。ユーザーは当初「他ユーザーの『行きたいスポット』が混入しているのでは」とデータ分離バグを疑った | **データ分離バグではないと確認済み**(コード直読: `repository.py` / `repo.py` の全クエリが `user_id` でスコープ済み、`profiles.user_id` は主キー、そもそも「行きたいスポット」を全ユーザー共有で保存するテーブル自体が存在しない)。実際の原因は `plan_itinerary`(新規作成)がユーザーの指名数に関わらず常にフル ILS で動き、観光地マスタ(43 件・全ユーザー共通・個人データではない)から空き時間を自動充填する**仕様どおりの挙動**だったこと | **実装済み(2026-08-04 深夜。実機確認待ち)**: `plan_itinerary` に `candidate_spots`(既定空)を追加し、挿入プールを `must_visit ∪ candidate_spots` に限定。実効プール(起終点除外後)が空なら `precondition_unmet`。レビュー(Opus 5 代行)の High 2 件(解 C の空旅程・起終点すり抜け)も是正済み(ADR-0022 追記)。テスト 373 passed | [ADR-0022](adr/0022-plan-turn-explicit-candidate-pool.md) / [recommendation_planning.md §4.5(8)](30_design/recommendation_planning.md) / [agent_react_architecture.md §3.3・§5](30_design/agent_react_architecture.md) |
+| **1-5** | 「〇〇に行きたいです」と 1 スポットのみ指名しても、複数スポットが組み込まれたプランが返る。ユーザーは当初「他ユーザーの『行きたいスポット』が混入しているのでは」とデータ分離バグを疑った | **データ分離バグではないと確認済み**(コード直読: `repository.py` / `repo.py` の全クエリが `user_id` でスコープ済み、`profiles.user_id` は主キー、そもそも「行きたいスポット」を全ユーザー共有で保存するテーブル自体が存在しない)。実際の原因は `plan_itinerary`(新規作成)がユーザーの指名数に関わらず常にフル ILS で動き、観光地マスタ(43 件・全ユーザー共通・個人データではない)から空き時間を自動充填する**仕様どおりの挙動**だったこと | **解消(`51deed5`)**: `plan_itinerary` に `candidate_spots`(既定空)を追加し、挿入プールを `must_visit ∪ candidate_spots` に限定。実効プール(起終点除外後)が空なら `precondition_unmet`。レビュー(Opus 5 代行)の High 2 件(解 C の空旅程・起終点すり抜け)も是正済み(ADR-0022 追記)。テスト 373 passed。**実機確認(2026-08-04 深夜、新規ユーザー)**: 「明日、道の駅象潟を起点に元滝伏流水に行きたいです」→ エージェントが「他に立ち寄りたい場所は?」と HITL 質問 → 「特になし」→ **旅程は元滝伏流水 1 件のみ**(`v1` current、DB 照合済み)。エージェントは途中の `plan_itinerary` 失敗(候補ゼロ差し戻し)から自律回復して質問に至った | [ADR-0022](adr/0022-plan-turn-explicit-candidate-pool.md) / [recommendation_planning.md §4.5(8)](30_design/recommendation_planning.md) / [agent_react_architecture.md §3.3・§5](30_design/agent_react_architecture.md) |
+
+## 1.6 実害あり → **新規発見(2026-08-04 深夜、ADR-0022 実機確認中に検出。未対応)**
+
+| # | 問題 | 詳細 | 対応方針 |
+| --- | --- | --- | --- |
+| **1-6** | **`ask_user` の引数不正がターン全体を落とす**(応答なし・保存なし。⑤必達の不変条件が破れる) | 実機で再現(起点名が解決できない発話 → メインが `ask_user` を選択 → クラッシュ)。**3 つの欠陥の連鎖**: (1) `_ask_user_args_schema`(prompts.py)が `kind` と `slot`/`surface` の排他を強制しない平坦なスキーマで、LLM が `kind=clarify` + `slot` 非 null を書ける。pydantic(`AskUserArgs`)の検証だけが排他を持ち、ValidationError が `_dispatch` の包括 except で **recoverable=false の INTERNAL** になる(設計は「引数不正は結果で差し戻し、次の一手で対処」= recoverable のはず) (2) `main_agent.py` がループ打ち切り時に `error_event(stage=tool)` を呼ぶが、`"ask_user"` は SSE 契約の `ErrorStage` 語彙にない (3) その契約外 stage の防御(`events.py` の `invalid_error_stage` warning)が **`extra={"message": ...}` と LogRecord 予約キーを上書きして KeyError** になり、防御自体が例外でターンを殺す。結果: `error(stage=persist, stream_failed)` → `done(message_id: null)`、**ユーザー発話も応答も保存されない** | **未対応**。修正案: (1) guided スキーマを kind ごとの anyOf 分岐にして排他を強制(§14 の型定義に実装を合わせる)+ `_dispatch_ask_user` の ValidationError は recoverable=true で差し戻す (2) `stage` は `"main_agent"` を渡す(契約語彙に合わせる) (3) `extra` のキーを `error_message` 等へ改名。いずれも既存設計文書([agent_react_architecture.md](30_design/agent_react_architecture.md) §3.3/§13/§14・[chat_sse.md](40_api/chat_sse.md))との整合を取る修正であり、新しい設計判断は不要 |
 
 ## 2. 監視項目(発生条件つき・対処方針は確定済み)
 
