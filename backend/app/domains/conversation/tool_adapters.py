@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
@@ -25,10 +26,13 @@ from app.domains.conversation.events import (
     error_event,
     state_event,
 )
+from app.domains.conversation.guards import filter_unresolvable_ask_user_options
 from app.domains.conversation.itinerary_selector import (
     LLMItinerarySelector,
     SelectorGenerationPort,
 )
+from app.domains.conversation.name_resolution import build_name_resolution_context
+from app.domains.conversation.state import SpotFact
 from app.domains.conversation.tool_ports import SearchAskCallback
 from app.domains.conversation.types import (
     AskUserArgs,
@@ -84,6 +88,8 @@ PendingAskWriter = Callable[..., Awaitable[None]]
 # `session_scope`(専用の短寿命 session・即時 commit)。テストで差し替える。
 RouteSessionScopeFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
+logger = logging.getLogger("app.conversation.tool_adapters")
+
 
 class ToolAdapters:
     """TurnState を知らず、明示引数だけで既存ドメインへ委譲する。"""
@@ -95,6 +101,7 @@ class ToolAdapters:
         event_sink: EventSinkLike = None,
         settings: Settings | None = None,
         spot_names: Mapping[str, str] | None = None,
+        spot_catalog: Mapping[str, SpotFact] | None = None,
         search_runner: SearchRunner = search_knowledge,
         attach_routes: bool = True,
         generation_client: SelectorGenerationPort | None = None,
@@ -109,6 +116,13 @@ class ToolAdapters:
         self.event_sink = event_sink
         self.settings = settings or get_settings()
         self.spot_names = dict(spot_names or {})
+        # H-3(2026-08-04 レビュー是正): A7(`_apply_ask_user_option_guard`)の
+        # 名寄せを本番同等(別名 `aliases_ja` 込み)にするための実カタログ。
+        # `pipeline.py` の既定 `_default_tools` が `state.spot_catalog`
+        # (`ContextSnapshot.spots` 由来。DB の `aliases_ja` を持つ)を渡す。
+        # 省略時(既存の軽量呼び出し・一部テスト)は `spot_names` のみから
+        # 別名なしの索引を組む(後方互換のフォールバック)。
+        self.spot_catalog = dict(spot_catalog or {})
         self.search_runner = search_runner
         self.attach_routes = attach_routes
         self.generation_client = generation_client or GenerationClient(self.settings)
@@ -398,7 +412,43 @@ class ToolAdapters:
         あるが waiter は無い」を「死んだ待機」と誤認して掃除してしまう。
         ① を最初にすることで `GET /thread`(`ask_registry.is_waiting`)は
         waiter 登録済みを live と判定でき、両方の競合窓が閉じる。
+
+        **A7(2026-08-04 追加。dialogue_style.md §3 論点 C)**: 上記の手順に
+        入る前に、`kind=clarify` と `kind=preference(slot=origin)` の選択肢を
+        名寄せで検査し、解決できない選択肢を除去する。除去後に 2 個未満に
+        なれば、質問を送出せず(waiter 登録・SSE 送出・`pending_ask` 書き込み
+        のいずれも行わず)recoverable な `ToolError` を返す(既存 A3 と同じ
+        閾値。呼び出し元 `ask_execution.execute_ask_user` は他のガード拒否と
+        同じ「観測として差し戻す」経路でこれを扱う)。
         """
+
+        args, removed_options = self._apply_ask_user_option_guard(args)
+        if removed_options:
+            # M-3(2026-08-04 レビュー是正・観測性のみ): 除去内容と解決結果を
+            # ログに残す。差し戻しに至らない(残り2個以上で送出する)ケースも
+            # 含めて記録する — 名寄せの部分一致ティアが誤って解決する/実在
+            # 施設名を取りこぼす経路が既知の限界として残っているため
+            # (dialogue_style.md §6「A7 の名寄せ限界」)、実機で追えるように
+            # する。カウンタ消費は変えない(裁定済み)。
+            logger.info(
+                "ask_user_option_guard_removed_options",
+                extra={
+                    "removed_options": removed_options,
+                    "kept_options": [option.value for option in args.options],
+                    "resolution": "rejected" if len(args.options) < 2 else "sent",
+                },
+            )
+        if len(args.options) < 2:
+            return ToolError(
+                code=ToolErrorCode.REFERENCE_UNRESOLVED,
+                message_ja=(
+                    "選択肢を具体的な地点として解決できませんでした"
+                    f"({'、'.join(removed_options)})。"
+                    "他の聞き方を試すか、最も妥当な仮定を置いて進めてください。"
+                ),
+                recoverable=True,
+                details={"removed_options": removed_options},
+            )
 
         future = None
         if self.user_id is not None:
@@ -468,6 +518,38 @@ class ToolAdapters:
             tool=ToolName.ASK_USER,
             data=result.model_dump(mode="json", exclude_none=True),
         )
+
+    def _apply_ask_user_option_guard(
+        self, args: AskUserArgs
+    ) -> tuple[AskUserArgs, list[str]]:
+        """A7(§10 追加): `guards.filter_unresolvable_ask_user_options` を、
+
+        本番同等の名寄せ索引で駆動する。
+
+        2026-08-04 レビュー是正(High・H-3): 是正前は `self.spot_names`
+        (spot_id → 表示名のみ)から `SpotFact` を合成しており、`aliases_ja`
+        が常に空だった。実カタログで「ゆらり」(`spot_030`「鳥海温泉 遊楽里」
+        の別名)・「ねむの丘」(道の駅象潟の別名)のような**実在する別名**が
+        誤って解決不能と判定され除去されていた。`self.spot_catalog`
+        (`state.spot_catalog` 由来。`pipeline.py` の既定 `_default_tools` が
+        渡す。`aliases_ja` を持つ本番カタログ)があればそれをそのまま使い、
+        `name_resolution.py` の優先度つきティア(正式名完全一致 > 正式名
+        部分一致 > 別名完全一致 > 別名部分一致)を `main_agent._name_context`
+        と同じ精度で適用する。`spot_catalog` を渡さない呼び出し元(一部の
+        軽量テスト)は、後方互換として `self.spot_names` だけから別名なしの
+        索引を組む(旧挙動)。
+        """
+
+        spot_catalog = self.spot_catalog or {
+            spot_id: SpotFact(spot_id=spot_id, name_ja=name, kind="poi")
+            for spot_id, name in self.spot_names.items()
+        }
+        context = build_name_resolution_context(spot_catalog=spot_catalog)
+
+        def is_resolvable(value: str) -> bool:
+            return value in self.spot_names or context.resolve(value) is not None
+
+        return filter_unresolvable_ask_user_options(args, is_resolvable=is_resolvable)
 
     async def _itinerary_utilities(
         self,

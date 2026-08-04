@@ -1073,6 +1073,8 @@ def _system_prompt(available_tools: list[str]) -> str:
             "slot は null にします。reason は質問文(そのまま画面に表示され"
             "ます)、options は label/value のペアです。回答は次の周に観測"
             "として返ります。念のための確認には使いません。"
+            "options[].value は実在のスポット名で書いてください"
+            "(名寄せで解決できない選択肢は送出前に除去されます)。"
         )
         if "ask_user" in available_tools
         else ""

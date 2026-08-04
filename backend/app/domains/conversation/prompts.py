@@ -9,12 +9,20 @@ Tool 定義+出力スキーマ → ②プロフィール → ③現在の旅程+
 prefix caching のため)。R1/R2 のガードレールが発動したときだけ、例外的に
 縮小スキーマ(`main_agent_done_only_schema`)へ切り替える(これは
 `Docs/30_design/agent_react_architecture.md` §10 が明示的に許した縮退である)。
+
+`build_respond_messages` は `Docs/30_design/dialogue_style.md` §4 の入力構成
+(① 軌跡 / ② 譲歩・縮退 / ③ 会話履歴 / ④ ユーザーの発話 / **⑤ 素材**)に従う。
+⑤ 素材(このターンで提示したスポットの説明)は `respond.py` が
+`static.spots` から読み取り専用クエリで取得し、`SpotMaterial` として渡す
+(論点 A2: ツールのダイジェスト/メインループには足さない。respond の入力に
+だけ足す)。
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -39,13 +47,32 @@ _PRED_VOCABULARY = " | ".join(pred_values())
 _SLOT_VOCABULARY = " | ".join(slot_values())
 _JAPAN_TZ = ZoneInfo("Asia/Tokyo")
 _WEEKDAYS_JA = ("月", "火", "水", "木", "金", "土", "日")
+# dialogue_style.md §4: ⑤ 素材の上限件数(候補 + 旅程 diff 追加分の合計)と、
+# 素材 1 件あたりの description 表示上限文字数(暴走防止。rerank.py の
+# description_ja_db 切り詰め[:360]と同じ発想で、respond 入力用にやや短く保つ)。
+RESPOND_MATERIALS_MAX_SPOTS = 8
+RESPOND_MATERIAL_DESCRIPTION_MAX_CHARS = 240
+
+
+@dataclass(frozen=True, slots=True)
+class SpotMaterial:
+    """⑤ 素材 1 件分(dialogue_style.md §4)。`static.spots` から読み取る。
+
+    `description`/`social_proof` は当該言語(現状 `users.language` は未実装
+    — 20_architecture.md §10 — のため常に日本語)、無ければ `None`。
+    """
+
+    description: str | None = None
+    social_proof: str | None = None
+    tags_ja: tuple[str, ...] = ()
 
 MAIN_AGENT_MAX_DAYS = 5
 MAIN_AGENT_MAX_MUST_VISIT = 8
-# recommend 1 回分の結果件数(コード側で k=5 に固定)を転記できる余地を
-# 持たせつつ、複数回の recommend 結果を積み増しても暴走しない上限
-# (ADR-0022)。recommend 自体に候補数の上限引数はない(L-2 是正:
-# 旧コメントは「上限 8」と書いていたが、そのような口は存在しない)。
+# recommend 1 回分の結果件数(コード側で k=3 に固定。2026-08-04、
+# dialogue_style.md §4 決定: 推薦は 3 件に固定し、respond が 3 件すべてを
+# 語る)を転記できる余地を持たせつつ、複数回の recommend 結果を積み増しても
+# 暴走しない上限(ADR-0022)。recommend 自体に候補数の上限引数はない
+# (L-2 是正: 旧コメントは「上限 8」と書いていたが、そのような口は存在しない)。
 MAIN_AGENT_MAX_CANDIDATE_SPOTS = 12
 MAIN_AGENT_MAX_OPS = 8
 MAIN_AGENT_MAX_CONSTRAINTS_ADD = 8
@@ -120,7 +147,7 @@ JSON 1 個(thought + action)だけを出力してください。説明文や Mar
 
 Tool(action.tool)は次の 6 つです。1 周につき 1 つだけ選びます。
 - recommend: おすすめのスポットを探す。args = {{"instruction": 自然文}}。
-  件数(k=5)はコードが固定するので書きません。
+  件数(k=3)はコードが固定するので書きません。
 - plan_itinerary: 旅程がまだ無いときに新規作成する。
   args = {{"days":[{{"date":"YYYY-MM-DD","start":"HH:MM","end":"HH:MM",
   "origin_name":スポット名 または null(**会話に根拠(ユーザーが言った宿・
@@ -169,6 +196,13 @@ Tool(action.tool)は次の 6 つです。1 周につき 1 つだけ選びます�
   ask_user で聞いてください**(下の plan_itinerary の項も参照)。
   ask_user は 1 ターンに 2 回までです。同じ slot・同じ曖昧さを 2 回聞いては
   いけません。
+- ask_user の options は**そのまま採用できる具体値だけ**を書きます。起点を
+  聞くとき(kind=preference, slot=origin)は、会話・軌跡・現在の旅程に出て
+  きた**実在の施設名・駅名**を選択肢に並べてください。「宿」「駅」「その他」
+  のような**カテゴリ語・抽象語は選択肢にできません**(自由入力欄が常にある
+  ので網羅する必要はありません)。名寄せで解決できない選択肢は送出前に
+  取り除かれ、残りが 2 個未満なら質問自体が実行されません。kind=clarify の
+  options[].value も同様にスポット名で書いてください(上記のとおり)。
 - constraints はあなたが直接書きます。述語(pred)は次の 17 種のどれかです:
   {_PRED_VOCABULARY}
   args の中身は述語ごとに異なります(例: require/exclude/first/last は
@@ -198,6 +232,14 @@ Tool(action.tool)は次の 6 つです。1 周につき 1 つだけ選びます�
   呼んでください**(「おすすめで組んで」等)。must_visit と
   candidate_spots が両方とも空のまま plan_itinerary を呼ぶとエラーが
   返ります(空の旅程を作らないため)。
+  **candidate_spots の判断基準(必ず守ること)**: ユーザーが具体的なスポット
+  名を挙げて追加・訪問を頼んだときは、candidate_spots は**空のまま**にして
+  ください(指名された場所は must_visit だけで組みます。指名していない
+  場所を候補として混ぜてはいけません)。candidate_spots に入れてよいのは、
+  ユーザーが「おすすめで埋めて」「空いた時間は任せる」のように**選定を
+  任せた**場合に、直前の recommend の結果(このターンの軌跡に載っている
+  スポット名)から**転記した名前だけ**です。自分の知識やユーザーが言って
+  いない地名を candidate_spots に創作して入れてはいけません。
 - plan_itinerary.assumptions には、日付・起点など**ユーザーに確認していない
   前提**を日本語短文で必ず列挙してください(例:「日付は明日と仮定」
   「起点は直前に話題に出た宿泊施設と仮定」)。何も仮定していなければ
@@ -214,18 +256,45 @@ Tool(action.tool)は次の 6 つです。1 周につき 1 つだけ選びます�
 """
 
 
-RESPOND_SYSTEM_PROMPT = """あなたは鳥海山観光ガイダンスの respond ステップです。
-入力 JSON の軌跡(このターンで実行した手と結果)・譲歩・会話履歴をもとに、
-ユーザー向けの自然で簡潔な日本語を 1 回だけ生成してください。
+# dialogue_style.md §4「新 RESPOND_SYSTEM_PROMPT 案(全文)」(2026-08-04
+# 決定稿)をそのまま採用する。旧プロンプト(様式・分量の規定が無く、
+# 「考慮した条件・仮定・譲歩を必ず列挙」という網羅性だけを強制していた版)は
+# 報告書調・列挙調の直接原因だった(同文書 §1)。
+RESPOND_SYSTEM_PROMPT = """\
+あなたは鳥海山エリア専門の親切なツアーガイドです。いまシステムが実行した手と
+その結果(軌跡)・素材・会話履歴をもとに、ユーザーへの応答を 1 回だけ書きます。
 
-必須規則:
-- 軌跡・現在の旅程・会話履歴にある事実(スポット名、時刻、件数)だけを
-  使います。無い事実を作りません。
+書き方:
+- 敬体で、ガイドとして自然に語りかけます。Markdown(見出し・箇条書き・太字)は
+  内容が伝わる範囲で使います。絵文字は、見出しやスポット紹介など内容の理解を
+  助けるところで控えめに使ってかまいません(1 文ごとに付けるのは過剰です)。
+- 次の順で構成します:
+  1. 要望をどう受け取り何をしたかを 1〜2 文で。ユーザーの言葉(好み・条件)を
+     言い換えて反映します。
+  2. 本体:
+     - おすすめを出したターンでは、提示した 3 件**すべて**について、各スポット
+       が「なぜこの方に合うか」「何が見どころか」を素材の範囲で 1〜3 文ずつ
+       紹介します(一番の推し 1 件に厚みをつけてかまいません)。
+     - 旅程を作成・変更したターンでは、行程を上から全部読み上げません
+       (旅程カードが表示されています)。1 日の流れの要点と、変更した点・
+       工夫した点を紹介します。
+     - 質問に答えるターンでは、検索結果の範囲で具体的に答えます。
+  3. 反映できなかった要望・解決できなかった項目・エラーがあれば必ず伝えます
+     (無言で捨てません)。判断に影響する仮定(日付・起点など)は自然な文で
+     一言添えます(箇条書きの列挙にしません。詳細はカードに表示されています)。
+  4. 最後に必ず、次にできることを具体的な質問 1〜2 個で提案します
+     (例: 「丸池様を旅程に加えますか? それとも他の水辺の候補もご覧に
+     なりますか?」)。提案は、いま提示している候補・旅程・この場でできる操作の
+     範囲に限ります。
+
+必須規則(書き方より優先):
+- 軌跡・素材・現在の旅程・会話履歴にある事実(スポット名、時刻、件数)だけを
+  使います。無い事実を作りません。素材にない魅力・設備・混雑状況を推測で
+  書きません。
 - 候補や旅程を組み替えません。実行済みの結果を説明するだけです。
-- 今回考慮した条件・置いた仮定・譲歩を必ず列挙します(何が効いているかが
-  見えないと、ユーザーは「もう不要」と言えません)。
-- 反映できなかった要望・解決できなかった項目・エラーがあれば必ず言及します
-  (無言で捨てません)。
+- 内部の実装語を出しません: ツール名・処理ステップ名・spot_id・タグや
+  プロフィールの英語コード(nature, mobility など)・「検索を実施しました」の
+  ような処理の自己言及。
 - mode が failure のときは、うまく処理できなかったことと、次にユーザーが
   できること(言い換え・条件を絞る等)を短く伝えます。
 """
@@ -354,7 +423,16 @@ def build_respond_messages(
     state: TurnState,
     *,
     mode: ResponseMode,
+    materials: Mapping[str, SpotMaterial] | None = None,
+    material_spot_ids: Sequence[str] = (),
 ) -> list[dict[str, str]]:
+    """①〜⑤を dialogue_style.md §4 の順で組み立てる。
+
+    `materials`/`material_spot_ids` は `respond.py` が組み立てる(§4 論点 A2:
+    素材はメインループには渡さず、respond の入力にだけ足す)。呼び出し元が
+    省略した場合(既存呼び出し・素材が無いターン)は「(なし)」になる。
+    """
+
     degraded_json = _compact_json(
         [value.model_dump(mode="json") for value in state.degraded]
     )
@@ -365,12 +443,55 @@ def build_respond_messages(
             "② 譲歩・縮退:\n" + degraded_json,
             "③ 会話履歴:\n" + (state.history or "(なし)"),
             "④ ユーザーの発話:\n" + state.utterance,
+            "⑤ 素材(このターンで提示したスポットの説明):\n"
+            + format_materials_section(
+                material_spot_ids, materials or {}, state.spot_names
+            ),
         ]
     )
     return [
         {"role": "system", "content": RESPOND_SYSTEM_PROMPT},
         {"role": "user", "content": dynamic},
     ]
+
+
+def format_materials_section(
+    spot_ids: Sequence[str],
+    materials: Mapping[str, SpotMaterial],
+    spot_names: Mapping[str, str],
+) -> str:
+    """⑤ 素材節の本文。`- {名前}: {description} / {social_proof} / タグ: {tags_ja}`
+
+    の行列挙(dialogue_style.md §4)。`spot_ids` はこのターンで提示した
+    スポットに限定済みの前提(`respond._presented_material_spot_ids` が上限
+    `RESPOND_MATERIALS_MAX_SPOTS` 件まで絞る)。
+
+    2026-08-04 レビュー是正(L-6): `spot_names` に無い spot_id は行ごと
+    スキップする(元は生の `spot_id` をそのまま名前欄に出していたが、respond
+    の入力にコード内部識別子を漏らさないため)。
+    """
+
+    if not spot_ids:
+        return "(なし)"
+    lines: list[str] = []
+    for spot_id in spot_ids:
+        name = spot_names.get(spot_id)
+        if name is None:
+            continue
+        material = materials.get(spot_id)
+        parts: list[str] = []
+        description = material.description if material is not None else None
+        if description:
+            if len(description) > RESPOND_MATERIAL_DESCRIPTION_MAX_CHARS:
+                description = description[:RESPOND_MATERIAL_DESCRIPTION_MAX_CHARS] + "…"
+            parts.append(description)
+        if material is not None and material.social_proof:
+            parts.append(material.social_proof)
+        if material is not None and material.tags_ja:
+            parts.append("タグ: " + "、".join(material.tags_ja))
+        detail = " / ".join(parts) if parts else "(説明なし)"
+        lines.append(f"- {name}: {detail}")
+    return "\n".join(lines) if lines else "(なし)"
 
 
 def main_agent_guided_schema(

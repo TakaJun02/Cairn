@@ -2,9 +2,10 @@
 
 `Docs/30_design/agent_react_architecture.md` §4 の指示書が求める受け入れ条件:
 「車で回ります。滝が好き」相当の指示から SA が `{"filter": {"tags": ["滝"],
-"mobility": null}}` を返す想定で、推薦が 0 件にならず k=5 で返ること。さらに
-モックが不正値(`tags: ["滝","山"]`)を返しても「山」だけ落ちて実行される
-こと(23_ux_issues.md §0.3 の実害の再発防止)。
+"mobility": null}}` を返す想定で、推薦が 0 件にならず k=3 で返ること
+(2026-08-04、dialogue_style.md §4 決定: 推薦は 3 件に固定。旧 k=5 から
+変更)。さらにモックが不正値(`tags: ["滝","山"]`)を返しても「山」だけ落ちて
+実行されること(23_ux_issues.md §0.3 の実害の再発防止)。
 
 `recommendation` ドメインの内部(`RecommendationService`/`scoring.py`)は一切
 変更していない。ここでは実装をそのまま、DB を使わないインメモリ repository
@@ -134,7 +135,7 @@ def _spot(number: int, tags: tuple[str, ...]) -> RecommendationSpot:
 
 
 def _data() -> RecommendationData:
-    # 「滝」タグの地点を 6 件用意し、k=5 に対して常に十分な母数を確保する。
+    # 「滝」タグの地点を 6 件用意し、k=3 に対して常に十分な母数を確保する。
     spots = tuple(_spot(number, ("滝", "自然")) for number in range(1, 7))
     return RecommendationData(
         spots=spots,
@@ -165,7 +166,7 @@ def _state() -> TurnState:
 
 
 async def test_car_mobility_instruction_no_longer_zeroes_out_recommendations() -> None:
-    """受け入れ条件1: 「車で回ります。滝が好き」相当が 0 件にならず k=5 で返る。"""
+    """受け入れ条件1: 「車で回ります。滝が好き」相当が 0 件にならず k=3 で返る。"""
 
     state = _state()
     tools = RealRecommendationTools(MemoryRecommendationRepository(_data()))
@@ -184,11 +185,11 @@ async def test_car_mobility_instruction_no_longer_zeroes_out_recommendations() -
     assert state.main_agent_failed is False
     result = state.step_results[1]
     assert result.tool is ToolName.RECOMMEND
-    assert len(result.data["spot_ids"]) == 5
+    assert len(result.data["spot_ids"]) == 3
     assert state.trajectory[0].error is None
 
 
-async def test_partially_invalid_filter_drops_only_the_bad_tag_and_still_returns_five() -> None:
+async def test_partially_invalid_filter_drops_only_the_bad_tag_and_still_returns_three() -> None:
     """受け入れ条件2: 不正値(tags: ["滝","山"])でも「山」だけ落ちて実行される。"""
 
     state = _state()
@@ -206,7 +207,7 @@ async def test_partially_invalid_filter_drops_only_the_bad_tag_and_still_returns
     await run_main_agent(state, tools=tools, client=client)
 
     result = state.step_results[1]
-    assert len(result.data["spot_ids"]) == 5
+    assert len(result.data["spot_ids"]) == 3
     observation = state.trajectory[0].observation
     assert "除外した条件" in observation
     assert "山" in observation

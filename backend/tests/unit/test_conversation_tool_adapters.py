@@ -21,8 +21,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.domains.conversation.ask_registry import AskAnswer, AskUserRegistry
 from app.domains.conversation.events import MemoryEventSink
+from app.domains.conversation.state import SpotFact
 from app.domains.conversation.tool_adapters import ToolAdapters, _FallbackRouteProvider
-from app.domains.conversation.types import AskUserArgs
+from app.domains.conversation.types import AskUserArgs, ToolError
 from app.domains.geo.osrm import Coordinate, RouteResult
 from app.domains.geo.repo import ApproachRecord, RouteRecord, SpotRecord
 from app.domains.itinerary.repo_types import ItineraryVersion, PlanningData
@@ -211,6 +212,232 @@ async def test_ask_user_skips_pending_write_when_thread_id_is_none() -> None:
 
     assert writer.calls == []
     assert result.data["answered_by"] == "timeout"  # user_id が無いので待機できない
+
+
+# ---------------------------------------------------------------------------
+# A7(dialogue_style.md §3 論点 C・2026-08-04 決定): 送出前の選択肢の名寄せ。
+# ---------------------------------------------------------------------------
+
+
+def _origin_args(options: list[dict[str, str]]) -> AskUserArgs:
+    return AskUserArgs.model_validate(
+        {
+            "kind": "preference",
+            "slot": "origin",
+            "reason": "どこから出発しますか",
+            "options": options,
+        }
+    )
+
+
+async def test_ask_user_drops_unresolvable_origin_options_before_sending() -> None:
+    """実測(known_issues §6-2)の再現: 「鳥海山麓の宿」のような解決不能な
+
+    カテゴリ語は送出前に除去され、実在の施設名だけが SSE・pending_ask に残る。
+    """
+
+    writer = RecordingPendingAskWriter()
+    registry = AskUserRegistry()
+    adapter = ToolAdapters(
+        cast(AsyncSession, None),
+        event_sink=MemoryEventSink(),
+        settings=get_settings(),
+        spot_names={"spot_101": "道の駅象潟", "spot_102": "にかほ市役所"},
+        thread_id=1,
+        user_id=42,
+        ask_registry=registry,
+        pending_ask_writer=writer,
+    )
+
+    async def answer_soon() -> None:
+        await asyncio.sleep(0)
+        registry.resolve(42, AskAnswer(answer="道の駅象潟", answered_by="chip"))
+
+    asyncio.create_task(answer_soon())
+    result = await adapter.ask_user(
+        step_id=1,
+        args=_origin_args(
+            [
+                {"label": "道の駅象潟", "value": "道の駅象潟"},
+                {"label": "にかほ市役所", "value": "にかほ市役所"},
+                {"label": "鳥海山麓の宿", "value": "鳥海山麓の宿"},
+                {"label": "その他", "value": "その他"},
+            ]
+        ),
+    )
+
+    assert result.data["answer"] == "道の駅象潟"
+    assert writer.calls[0]["pending"]["options"] == [
+        {"label": "道の駅象潟", "value": "道の駅象潟"},
+        {"label": "にかほ市役所", "value": "にかほ市役所"},
+    ]
+
+
+async def test_ask_user_returns_recoverable_error_when_fewer_than_two_options_resolve() -> None:
+    """除去の結果 2 個未満なら、質問を送出せず recoverable な ToolError を返す
+
+    (既存 A3 と同じ閾値。waiter 登録・SSE 送出・pending_ask 書き込みのいずれも
+    行わない)。
+    """
+
+    writer = RecordingPendingAskWriter()
+    sink = MemoryEventSink()
+    registry = AskUserRegistry()
+    adapter = ToolAdapters(
+        cast(AsyncSession, None),
+        event_sink=sink,
+        settings=get_settings(),
+        spot_names={"spot_101": "道の駅象潟"},
+        thread_id=1,
+        user_id=42,
+        ask_registry=registry,
+        pending_ask_writer=writer,
+    )
+
+    result = await adapter.ask_user(
+        step_id=1,
+        args=_origin_args(
+            [
+                {"label": "鳥海山麓の宿", "value": "鳥海山麓の宿"},
+                {"label": "その他", "value": "その他"},
+            ]
+        ),
+    )
+
+    assert isinstance(result, ToolError)
+    assert result.recoverable is True
+    assert result.details["removed_options"] == ["鳥海山麓の宿", "その他"]
+    assert writer.calls == []
+    assert sink.events == []
+    assert registry.is_waiting(42) is False
+
+
+async def test_ask_user_option_guard_does_not_affect_enum_preference_slots() -> None:
+    """選好 enum(mobility 等)は名寄せ対象外なので、実在しない値でも素通りする。"""
+
+    writer = RecordingPendingAskWriter()
+    adapter = _adapter(writer=writer)
+
+    async def answer_soon() -> None:
+        await asyncio.sleep(0)
+        adapter.ask_registry.resolve(42, AskAnswer(answer="30分程度なら", answered_by="chip"))
+
+    asyncio.create_task(answer_soon())
+    result = await adapter.ask_user(step_id=1, args=_preference_args())
+
+    assert result.data["answer"] == "30分程度なら"
+    assert writer.calls[0]["pending"]["options"] == [
+        {"label": "あまり歩きたくない", "value": "avoid_walk"},
+        {"label": "30分程度なら", "value": "short_walk_ok"},
+    ]
+
+
+async def test_ask_user_option_guard_resolves_real_catalog_aliases() -> None:
+    """H-3 の回帰(2026-08-04 レビュー是正): 実カタログ相当の別名は誤除去されない。
+
+    是正前は `_apply_ask_user_option_guard` が `self.spot_names`(表示名の
+    みの spot_id → 名前辞書)から `SpotFact` を合成しており `aliases_ja` が
+    常に空だったため、実データで実在する別名「ゆらり」(`spot_030`「鳥海温泉
+    遊楽里」の別名)・「ねむの丘」(道の駅象潟の別名)が解決不能と誤判定され
+    除去されていた。`spot_catalog`(`state.spot_catalog` 相当・別名込み)を
+    渡すと、この 2 つの別名がどちらも A7 を通過して送出されることを確認する。
+    """
+
+    writer = RecordingPendingAskWriter()
+    registry = AskUserRegistry()
+    adapter = ToolAdapters(
+        cast(AsyncSession, None),
+        event_sink=MemoryEventSink(),
+        settings=get_settings(),
+        spot_names={
+            "spot_030": "鳥海温泉 遊楽里",
+            "spot_101": "道の駅象潟",
+        },
+        spot_catalog={
+            "spot_030": SpotFact(
+                spot_id="spot_030",
+                name_ja="鳥海温泉 遊楽里",
+                kind="onsen",
+                aliases_ja=["ゆらり"],
+            ),
+            "spot_101": SpotFact(
+                spot_id="spot_101",
+                name_ja="道の駅象潟",
+                kind="roadside_station",
+                aliases_ja=["ねむの丘"],
+            ),
+        },
+        thread_id=1,
+        user_id=42,
+        ask_registry=registry,
+        pending_ask_writer=writer,
+    )
+
+    async def answer_soon() -> None:
+        await asyncio.sleep(0)
+        registry.resolve(42, AskAnswer(answer="ゆらり", answered_by="chip"))
+
+    asyncio.create_task(answer_soon())
+    result = await adapter.ask_user(
+        step_id=1,
+        args=_origin_args(
+            [
+                {"label": "ゆらり", "value": "ゆらり"},
+                {"label": "ねむの丘", "value": "ねむの丘"},
+            ]
+        ),
+    )
+
+    assert result.data["answer"] == "ゆらり"
+    assert writer.calls[0]["pending"]["options"] == [
+        {"label": "ゆらり", "value": "ゆらり"},
+        {"label": "ねむの丘", "value": "ねむの丘"},
+    ]
+
+
+async def test_ask_user_option_guard_logs_removed_options(caplog: Any) -> None:
+    """M-3(観測性のみ): 除去したとき、差し戻しに至らないケースでもログに残す。"""
+
+    import logging
+
+    writer = RecordingPendingAskWriter()
+    registry = AskUserRegistry()
+    adapter = ToolAdapters(
+        cast(AsyncSession, None),
+        event_sink=MemoryEventSink(),
+        settings=get_settings(),
+        spot_names={"spot_101": "道の駅象潟", "spot_102": "にかほ市役所"},
+        thread_id=1,
+        user_id=42,
+        ask_registry=registry,
+        pending_ask_writer=writer,
+    )
+
+    async def answer_soon() -> None:
+        await asyncio.sleep(0)
+        registry.resolve(42, AskAnswer(answer="道の駅象潟", answered_by="chip"))
+
+    asyncio.create_task(answer_soon())
+    with caplog.at_level(logging.INFO, logger="app.conversation.tool_adapters"):
+        await adapter.ask_user(
+            step_id=1,
+            args=_origin_args(
+                [
+                    {"label": "道の駅象潟", "value": "道の駅象潟"},
+                    {"label": "にかほ市役所", "value": "にかほ市役所"},
+                    {"label": "鳥海山麓の宿", "value": "鳥海山麓の宿"},
+                ]
+            ),
+        )
+
+    records = [
+        record
+        for record in caplog.records
+        if record.message == "ask_user_option_guard_removed_options"
+    ]
+    assert len(records) == 1
+    assert records[0].removed_options == ["鳥海山麓の宿"]
+    assert records[0].resolution == "sent"
 
 
 async def test_fallback_route_provider_opens_a_dedicated_session_per_leg() -> None:

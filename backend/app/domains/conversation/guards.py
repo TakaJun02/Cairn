@@ -5,20 +5,33 @@
 - `normalize_revert_ops`: `edit_itinerary.ops` に `revert` が混じったときの
   排他化。メインループが Tool 実行前に使う
 - `validate_response_spot_names`: `respond` のクローズドワールド検査
+- `find_forbidden_internal_terms`: `respond` の内部語・自己言及の事後検査
+  (層 1 の安全網。`Docs/30_design/dialogue_style.md` §3 論点 E・§4)
 - `evaluate_ask_user`(R4・A1〜A6): `ask_user` の HITL 抑制ガード。
   `ask_execution.execute_ask_user` がメイン・レコメンド SA・知識検索 SA の
   3 経路共通で呼ぶ(§7・§10)
+- `filter_unresolvable_ask_user_options`(A7): `ask_user` の選択肢を送出前に
+  名寄せし、解決できない選択肢だけを除去する。`tool_adapters.ToolAdapters
+  .ask_user` が「送出」の直前(SSE イベント・`pending_ask` 書き込みより前)
+  で呼ぶ(`Docs/30_design/dialogue_style.md` §3 論点 C・2026-08-04 決定)
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from app.domains.conversation.state import ProfileState, SpotFact
-from app.domains.conversation.types import AskUserArgs, ConstraintDraft, Slot, UnmodeledItem
+from app.domains.conversation.types import (
+    AskUserArgs,
+    AskUserOption,
+    ConstraintDraft,
+    Slot,
+    UnmodeledItem,
+)
 from app.domains.itinerary.predicates import normalize_constraints
+from app.domains.recommendation.types import PreferenceKey
 
 # R4: `ask_user` は 1 ターン 2 回まで(メイン・SA 合算。§3.5・§10)。
 MAX_ASK_USER_PER_TURN = 2
@@ -123,6 +136,114 @@ def validate_response_spot_names(
             f"未提示の POI 名が応答に含まれます: {unauthorized}",
         )
     return GuardResult(True)
+
+
+# dialogue_style.md §3 論点 E・§4「必須規則」: 内部の実装語(ツール名・
+# 処理ステップ名・spot_id・タグやプロフィールの英語 enum 値)・処理の自己
+# 言及をユーザー向け応答に出さない。主防御はプロンプト指示だが、層 1 の
+# 安全網としてここで事後検査する(closed-world 検査と同じ位置づけ: 検出
+# しても既にストリーミング済みのトークンは書き換えられないため、
+# `state.degraded` へ記録するだけにとどめる)。
+_FORBIDDEN_INTERNAL_TERMS: tuple[str, ...] = (
+    # ask_user/profile のスロット名・タグの英語コード(フィールド名自体も
+    # 含む。実測: 「移動手段の制限(mobility)は…」のような漏れが
+    # 25_known_issues.md §3-1 で観測されている)。
+    "mobility",
+    "party",
+    "pace",
+    "interests",
+    # Mobility/Party/Pace の enum 値。
+    "avoid_walk",
+    "short_walk_ok",
+    "hike_ok",
+    "family_kids",
+    "packed",
+    "relaxed",
+    # 処理の自己言及(ツール名・ステップの実況)。2026-08-04 レビュー是正
+    # (L-1): 「を実施しました」単独は「例大祭を実施しました」のような正当な
+    # 文にも誤検知するため削除した(「検索を実施」等の複合語は残す)。
+    "検索を実施",
+    "ツールを実行",
+    "処理を実行",
+    "recommend を",
+    "plan_itinerary",
+    "edit_itinerary",
+    "search_knowledge",
+)
+# 2026-08-04 レビュー是正(L-2): 元は `\bspot_[a-z0-9]+\b` だったが、Python の
+# `re` は日本語文字も `\w`(Unicode 既定)として扱うため、「地点spot_017を」の
+# ような日本語に直接続く spot_id では先頭の `\b` が成立せず検出漏れになって
+# いた。ASCII 英数字・アンダースコア以外が前にあれば境界とみなす否定先読みに
+# 変える(末尾は `[a-z0-9]+` が貪欲マッチするため追加の境界は不要)。
+_FORBIDDEN_SPOT_ID_RE = re.compile(r"(?<![0-9A-Za-z_])spot_[a-z0-9]+", re.IGNORECASE)
+
+# 2026-08-04 レビュー是正(M-2): `PreferenceKey`(interests のキー語彙。
+# dialogue_style.md §3 論点 E が禁止する「タグやプロフィールの英語コード」)
+# を禁止語に加える。日本語文中で誤検知しないよう(「water」等の英語圏の
+# 固有名詞への部分一致を避けるため)、ASCII 英数字・アンダースコア以外が
+# 前後にあることを要求する境界つき正規表現で検出する(spot_id と同じ理由で
+# `\b` は使わない — 日本語直後に単語が続くケースを取りこぼすため)。
+_PREFERENCE_ENUM_TERMS: tuple[str, ...] = tuple(key.value for key in PreferenceKey)
+_FORBIDDEN_ENUM_RE = re.compile(
+    r"(?<![0-9A-Za-z_])(?:"
+    + "|".join(re.escape(term) for term in _PREFERENCE_ENUM_TERMS)
+    + r")(?![0-9A-Za-z_])"
+)
+
+
+def find_forbidden_internal_terms(text: str) -> list[str]:
+    """内部語・自己言及の検出(層 1 の安全網)。見つかった語をそのまま返す。"""
+
+    found = [term for term in _FORBIDDEN_INTERNAL_TERMS if term in text]
+    found.extend(dict.fromkeys(_FORBIDDEN_ENUM_RE.findall(text)))
+    if _FORBIDDEN_SPOT_ID_RE.search(text):
+        found.append("spot_id")
+    return found
+
+
+def ask_user_options_need_resolution_check(question: AskUserArgs) -> bool:
+    """A7(§10 追加。dialogue_style.md 論点 C)の対象判定。
+
+    対象は `kind=clarify` と `kind=preference` かつ `slot=origin` だけ。
+    選好 enum の選択肢(interests/party/mobility/pace 等。値が nature や
+    avoid_walk のような固定語彙)は、そもそも地点名ではなく解決不要の値
+    なので対象外(dialogue_style.md §5 実装方針の注記どおり)。
+    """
+
+    if question.kind == "clarify":
+        return True
+    return question.kind == "preference" and question.slot is Slot.ORIGIN
+
+
+def filter_unresolvable_ask_user_options(
+    question: AskUserArgs,
+    *,
+    is_resolvable: Callable[[str], bool],
+) -> tuple[AskUserArgs, list[str]]:
+    """A7: 送出前に選択肢を名寄せし、解決できない選択肢だけを除去する。
+
+    `is_resolvable` は呼び出し元(`tool_adapters.ToolAdapters.ask_user`)が
+    `name_resolution.py` と同じ経路(`NameResolutionContext.resolve`)で
+    組み立てる述語である。**質問ごとの差し戻しはしない**(ユーザー決定
+    2026-08-04)。除去の結果、選択肢が 2 個未満になるかどうかの判定・
+    recoverable な差し戻し(既存 A3 と同じ閾値)は呼び出し元が行う。
+
+    対象外の `kind`/`slot` の組み合わせでは何もせず、除去件数 0 の
+    `(question, [])` を返す。
+    """
+
+    if not ask_user_options_need_resolution_check(question):
+        return question, []
+    kept: list[AskUserOption] = []
+    removed: list[str] = []
+    for option in question.options:
+        if is_resolvable(option.value):
+            kept.append(option)
+        else:
+            removed.append(option.value)
+    if not removed:
+        return question, []
+    return question.model_copy(update={"options": kept}), removed
 
 
 def evaluate_ask_user(

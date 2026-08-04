@@ -42,8 +42,11 @@
         <div v-if="candidates" class="tw-mt-4 tw-space-y-2">
           <div class="tw-flex tw-items-center tw-gap-2">
             <p class="tw-text-sm tw-font-semibold tw-text-white">おすすめ候補</p>
-            <span class="tw-rounded-full tw-bg-slate-700 tw-px-2 tw-py-0.5 tw-text-xs tw-text-slate-200">
-              {{ candidates.phase === 'provisional' ? '候補' : '確定' }}
+            <span
+              v-if="candidates.phase === 'provisional'"
+              class="tw-rounded-full tw-bg-slate-700 tw-px-2 tw-py-0.5 tw-text-xs tw-text-slate-200"
+            >
+              候補
             </span>
           </div>
           <div class="tw-grid tw-gap-2 sm:tw-grid-cols-2">

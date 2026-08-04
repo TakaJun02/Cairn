@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from app.core.config import get_settings
 from app.domains.conversation.events import MemoryEventSink, emit, state_event
 from app.domains.conversation.pipeline import ConversationPipeline
 from app.domains.conversation.state import (
@@ -328,6 +329,48 @@ async def test_respond_input_includes_this_turns_trajectory() -> None:
     respond_messages = client.generate_calls[-1]
     respond_dynamic = respond_messages[1]["content"]
     assert "tool=recommend" in respond_dynamic
+
+
+async def test_pipeline_passes_settings_to_respond() -> None:
+    """dialogue_style.md §5「2b」の結線テスト: `ConversationPipeline` は
+
+    respond へ必ず `self.settings` を渡す(⑤ 素材の DB 取得に使う。
+    `respond._load_spot_materials` は `settings=None` だと DB に触れず
+    素材なしへ縮退するため、ここでの取り違えは実機で素材が常に空になる
+    という静かな劣化につながる)。`respond` 本体をモックに差し替え、渡された
+    kwargs を検査する(respond 自体の挙動は test_conversation_respond.py /
+    test_dialogue_style.py が別途検証する)。
+    """
+
+    import app.domains.conversation.pipeline as pipeline_module
+
+    captured: dict[str, Any] = {}
+
+    async def fake_respond(state: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        state.respond_status = "complete"
+        state.assistant_text = "ダミー応答"
+        return state
+
+    original_respond = pipeline_module.respond
+    pipeline_module.respond = fake_respond
+    try:
+        sink = MemoryEventSink()
+        repository = MemoryConversationRepository()
+        client = TurnClient([_update_profile_output(), _done_json()])
+        sentinel_settings = get_settings()
+
+        await ConversationPipeline(
+            repository,
+            event_sink=sink,
+            llm_client=client,
+            tools=FakeTools(),
+            settings=sentinel_settings,
+        ).run(user_id=1, utterance="こんにちは")
+    finally:
+        pipeline_module.respond = original_respond
+
+    assert captured.get("settings") is sentinel_settings
 
 
 async def test_non_recoverable_tool_error_still_reaches_persist_and_done() -> None:

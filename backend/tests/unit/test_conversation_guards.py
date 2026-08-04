@@ -9,7 +9,10 @@
 from __future__ import annotations
 
 from app.domains.conversation.guards import (
+    ask_user_options_need_resolution_check,
     evaluate_ask_user,
+    filter_unresolvable_ask_user_options,
+    find_forbidden_internal_terms,
     has_repeated_ngram,
     normalize_revert_ops,
     validate_and_normalize_constraints,
@@ -242,3 +245,157 @@ def test_a4_and_a5_apply_to_clarify_only() -> None:
     assert evaluate_ask_user(
         _clarification(), **common, allowed_spot_ids=existing, existing_spot_ids=existing
     ).accepted is True
+
+
+# ---------------------------------------------------------------------------
+# A7(dialogue_style.md §3 論点 C・2026-08-04 決定): ask_user 選択肢の
+# 送出前の名寄せ検査(解決不能な選択肢の除去のみ。質問ごとの差し戻しはしない)。
+# ---------------------------------------------------------------------------
+
+
+def _origin_question(options: list[dict[str, str]]) -> AskUserArgs:
+    return AskUserArgs.model_validate(
+        {
+            "kind": "preference",
+            "slot": "origin",
+            "reason": "どこから出発しますか",
+            "options": options,
+        }
+    )
+
+
+def test_ask_user_options_need_resolution_check_targets_clarify_and_origin_only() -> None:
+    clarify = _clarification()
+    origin = _origin_question(
+        [
+            {"label": "道の駅象潟", "value": "道の駅象潟"},
+            {"label": "にかほ市役所", "value": "にかほ市役所"},
+        ]
+    )
+    mobility = AskUserArgs.model_validate(_preference_args("mobility"))
+    interests = AskUserArgs.model_validate(_preference_args("interests"))
+
+    assert ask_user_options_need_resolution_check(clarify) is True
+    assert ask_user_options_need_resolution_check(origin) is True
+    # 選好 enum(mobility/interests 等。値が avoid_walk・nature のような
+    # 固定語彙)は検査対象外(dialogue_style.md §5 実装方針の注記どおり)。
+    assert ask_user_options_need_resolution_check(mobility) is False
+    assert ask_user_options_need_resolution_check(interests) is False
+
+
+def test_filter_unresolvable_ask_user_options_drops_only_the_unresolvable_ones() -> None:
+    """実測(known_issues §6-2)の再現: 起点の選択肢に解決不能なカテゴリ語が
+
+    混ざっていても、解決できる施設名だけを残して送出できる。
+    """
+
+    question = _origin_question(
+        [
+            {"label": "道の駅象潟", "value": "道の駅象潟"},
+            {"label": "鳥海山麓の宿", "value": "鳥海山麓の宿"},
+            {"label": "その他", "value": "その他"},
+        ]
+    )
+
+    filtered, removed = filter_unresolvable_ask_user_options(
+        question, is_resolvable=lambda value: value == "道の駅象潟"
+    )
+
+    assert [option.value for option in filtered.options] == ["道の駅象潟"]
+    assert removed == ["鳥海山麓の宿", "その他"]
+
+
+def test_filter_unresolvable_ask_user_options_keeps_all_when_all_resolve() -> None:
+    question = _origin_question(
+        [
+            {"label": "道の駅象潟", "value": "道の駅象潟"},
+            {"label": "にかほ市役所", "value": "にかほ市役所"},
+        ]
+    )
+
+    filtered, removed = filter_unresolvable_ask_user_options(
+        question, is_resolvable=lambda value: True
+    )
+
+    assert filtered.options == question.options
+    assert removed == []
+
+
+def test_filter_unresolvable_ask_user_options_skips_preference_enum_slots() -> None:
+    """選好 enum の選択肢(interests 等)は名寄せ対象外(解決不要の値)。"""
+
+    question = AskUserArgs.model_validate(_preference_args("mobility"))
+
+    filtered, removed = filter_unresolvable_ask_user_options(
+        question, is_resolvable=lambda value: False
+    )
+
+    assert filtered is question
+    assert removed == []
+
+
+def test_filter_unresolvable_ask_user_options_applies_to_clarify() -> None:
+    question = _clarification(invalid_value="鳥海山麓のどこか")
+
+    filtered, removed = filter_unresolvable_ask_user_options(
+        question, is_resolvable=lambda value: value.startswith("spot_")
+    )
+
+    assert [option.value for option in filtered.options] == ["spot_001"]
+    assert removed == ["鳥海山麓のどこか"]
+
+
+# ---------------------------------------------------------------------------
+# find_forbidden_internal_terms(dialogue_style.md §3 論点 E・§4「必須規則」)
+# ---------------------------------------------------------------------------
+
+
+def test_find_forbidden_internal_terms_detects_enum_leak_and_spot_id_and_self_reference() -> None:
+    assert find_forbidden_internal_terms(
+        "移動手段の制限(mobility)は指定せずに抽出しました。"
+    ) == ["mobility"]
+    assert find_forbidden_internal_terms("spot_017 を旅程に追加しました。") == ["spot_id"]
+    # L-1(2026-08-04 レビュー是正): 「を実施しました」単独は禁止語から削除
+    # したので、複合語「検索を実施」だけが検出される。
+    assert find_forbidden_internal_terms("ナレッジ検索を実施しました。") == ["検索を実施"]
+
+
+def test_find_forbidden_internal_terms_accepts_clean_japanese_text() -> None:
+    assert find_forbidden_internal_terms(
+        "鶴間池は美しい湖沼です。次に丸池様もご覧になりますか?"
+    ) == []
+
+
+def test_find_forbidden_internal_terms_does_not_flag_legitimate_use_of_jisshi() -> None:
+    """L-1 の回帰: 「実施しました」を含む正当な文(例大祭など)は誤検知しない。"""
+
+    assert find_forbidden_internal_terms(
+        "毎年 8 月に例大祭を実施しました。"
+    ) == []
+
+
+def test_find_forbidden_internal_terms_detects_preference_key_enum_values() -> None:
+    """M-2 の回帰: `PreferenceKey`(interests のキー語彙)の英語コードも検出する。
+
+    ASCII 単語境界つきで検出するため、英語圏の固有名詞への部分一致
+    (「Watergate」等)では誤検知しない。
+    """
+
+    assert find_forbidden_internal_terms(
+        "interests は nature と water を中心に抽出しました。"
+    ) == ["interests", "nature", "water"]
+    # ASCII 単語境界つきの部分一致で誤検知しないこと(「water」は
+    # 「underwater」のような英語圏の複合語の一部に当たり得る)。
+    assert find_forbidden_internal_terms("underwaterな景色が楽しめます。") == []
+    # 日本語に直接続く場合でも検出できること(spot_id と同じ理由)。
+    assert find_forbidden_internal_terms("natureを中心に選びました。") == ["nature"]
+
+
+def test_find_forbidden_internal_terms_detects_spot_id_immediately_after_japanese() -> None:
+    """L-2 の回帰: 日本語に直接続く spot_id も検出する(`\\b` は Unicode 対応の
+
+    Python 正規表現では日本語文字も単語構成文字とみなすため、
+    「地点spot_017を」のような直前が日本語の場合に検出漏れがあった。
+    """
+
+    assert find_forbidden_internal_terms("地点spot_017を旅程に追加しました。") == ["spot_id"]

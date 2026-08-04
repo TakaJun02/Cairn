@@ -508,7 +508,9 @@ async def _dispatch_recommend(
     context = build_recommendation_context(state)
     args = RecommendArgs(
         filter=act_result.filter.model_dump(mode="json", exclude_none=True),
-        k=5,
+        # 2026-08-04、dialogue_style.md §4 決定: 推薦は 3 件に固定し、
+        # respond が 3 件すべてを語る(旧 k=5 から変更)。
+        k=3,
         exclude=list(state.presented_spot_ids),
     )
     result = await tools.recommend(

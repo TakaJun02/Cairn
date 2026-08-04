@@ -390,4 +390,7 @@ def test_respond_context_includes_trajectory_and_degradation() -> None:
     assert "mode: explanation" in dynamic
     assert "[手1] tool=search_knowledge" in dynamic
     assert '"code":"rerank_degraded"' in dynamic
-    assert dynamic.endswith(state.utterance)
+    # dialogue_style.md §4: ④ ユーザーの発話の後に ⑤ 素材が続く(末尾は
+    # ⑤ 素材節になる。素材を渡さない呼び出しでは「(なし)」になる)。
+    assert "④ ユーザーの発話:\n" + state.utterance in dynamic
+    assert dynamic.endswith("⑤ 素材(このターンで提示したスポットの説明):\n(なし)")

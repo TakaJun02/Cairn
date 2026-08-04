@@ -119,6 +119,12 @@ class ConversationPipeline:
                     state,
                     client=self.llm_client,
                     event_sink=self.event_sink,
+                    # dialogue_style.md §4「⑤ 素材」: respond が
+                    # `static.spots` を読み取り専用クエリで引くための
+                    # settings。呼び出し元がここで渡さないテスト等では、
+                    # respond 側が DB へ触らず素材なしに縮退する
+                    # (`respond._load_spot_materials`)。
+                    settings=self.settings,
                 )
             except RespondGenerationError:
                 await emit(
@@ -212,6 +218,10 @@ class ConversationPipeline:
             event_sink=self.event_sink,
             settings=self.settings,
             spot_names=state.spot_names,
+            # H-3(2026-08-04 レビュー是正): A7 の名寄せに `aliases_ja`
+            # (別名)を使えるよう、`load_context` が読み込んだ実カタログ
+            # (`ContextSnapshot.spots` 由来)をそのまま渡す。
+            spot_catalog=state.spot_catalog,
             generation_client=self.llm_client,
             thread_id=state.thread_id,
             user_id=state.user_id,

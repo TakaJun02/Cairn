@@ -22,6 +22,7 @@ from app.domains.conversation.events import (
     MemoryEventSink,
     state_event,
 )
+from app.domains.conversation.state import SpotFact
 from app.domains.conversation.tool_adapters import ToolAdapters
 from app.domains.conversation.types import AskUserArgs
 
@@ -74,13 +75,28 @@ async def test_ask_user_and_clarify_sse_include_reason_without_changing_options(
     adapter.thread_id = None
     adapter.user_id = None
     adapter.ask_registry = AskUserRegistry()
+    # A7(2026-08-04、dialogue_style.md §3 論点 C): `kind=clarify` の
+    # options[].value(下の呼び出しでは既に spot_id へ解決済みの形で来る。
+    # main_agent._dispatch_ask_user と同じ契約)を名寄せ検査するため、
+    # `spot_names` を持たせる。このテストの関心はイベント本文の受け渡しで
+    # あり、A7 の解決可否そのものは `test_conversation_tool_adapters.py` の
+    # 担当。
+    adapter.spot_names = {"spot_001": "鶴間池", "spot_002": "元滝伏流水"}
+    # H-3(2026-08-04 レビュー是正): `_apply_ask_user_option_guard` が
+    # `self.spot_catalog` を参照するため、`__init__` を経由しないこの
+    # テスト用インスタンスにも明示的に持たせる(空でも、`self.spot_names`
+    # からの後方互換フォールバックで解決できる)。
+    adapter.spot_catalog = {}
 
     await adapter.ask_user(
         step_id=1,
         args=AskUserArgs.model_validate(
             {
+                # A7 は kind=preference の中でも slot=origin だけを対象に
+                # する(選択肢は実在の施設名が要件)。この質問は施設名とは
+                # 無関係の一般的な確認なので、対象外の slot(dates)を使う。
                 "kind": "preference",
-                "slot": "origin",
+                "slot": "dates",
                 "reason": "仮定した旅程条件の確認",
                 "options": [
                     {"label": "この条件で進める", "value": "accept_assumptions"},
@@ -111,7 +127,7 @@ async def test_ask_user_and_clarify_sse_include_reason_without_changing_options(
 
     assert preference == {
         "kind": "ask_user",
-        "slot": "origin",
+        "slot": "dates",
         "reason": "仮定した旅程条件の確認",
         "options": ["この条件で進める", "条件を変更する"],
     }
@@ -123,6 +139,56 @@ async def test_ask_user_and_clarify_sse_include_reason_without_changing_options(
             {"label": "鶴間池", "value": "spot_001"},
             {"label": "元滝伏流水", "value": "spot_002"},
         ],
+    }
+
+
+async def test_origin_ask_user_with_resolvable_options_passes_through_sse() -> None:
+    """dialogue_style.md §3 論点 C・テスト追加項目3: `slot=origin` の
+
+    `ask_user` は、選択肢がすべて実在の施設名(A7 で解決可能)なら、除去
+    されずそのまま SSE(`state:ask_user`)へ送出される。H-3 是正後の
+    `spot_catalog`(別名込み)を持たせても結果が変わらないことも確認する。
+    """
+
+    sink = MemoryEventSink()
+    adapter = object.__new__(ToolAdapters)
+    adapter.event_sink = sink
+    adapter.thread_id = None
+    adapter.user_id = None
+    adapter.ask_registry = AskUserRegistry()
+    adapter.spot_names = {"spot_101": "道の駅象潟", "spot_102": "にかほ市役所"}
+    adapter.spot_catalog = {
+        "spot_101": SpotFact(
+            spot_id="spot_101",
+            name_ja="道の駅象潟",
+            kind="roadside_station",
+            aliases_ja=["ねむの丘"],
+        ),
+        "spot_102": SpotFact(spot_id="spot_102", name_ja="にかほ市役所", kind="facility"),
+    }
+
+    await adapter.ask_user(
+        step_id=1,
+        args=AskUserArgs.model_validate(
+            {
+                "kind": "preference",
+                "slot": "origin",
+                "reason": "どこから出発しますか",
+                "options": [
+                    {"label": "道の駅象潟", "value": "道の駅象潟"},
+                    {"label": "にかほ市役所", "value": "にかほ市役所"},
+                ],
+            }
+        ),
+    )
+
+    assert len(sink.events) == 1
+    payload = adapt_conversation_event(sink.events[0]).root.data.model_dump(mode="json")
+    assert payload == {
+        "kind": "ask_user",
+        "slot": "origin",
+        "reason": "どこから出発しますか",
+        "options": ["道の駅象潟", "にかほ市役所"],
     }
 
 
