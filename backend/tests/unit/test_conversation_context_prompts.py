@@ -255,6 +255,26 @@ def test_main_agent_guided_schema_has_exclusive_tool_enum_per_branch() -> None:
     assert empty_remove["anyOf"][1]["properties"]["remove"]["maxItems"] == 0
 
 
+def test_main_agent_guided_schema_plan_itinerary_branch_has_candidate_spots() -> None:
+    """ADR-0022: plan_itinerary 分岐に candidate_spots(string 配列)がある。
+
+    string 配列なので xgrammar の「配列要素内の number」既知不具合
+    ([25 §2-1])には該当しない。
+    """
+
+    schema = main_agent_guided_schema(["c_001"])
+    branches = schema["properties"]["action"]["anyOf"]
+    plan_branch = next(
+        branch for branch in branches if branch["properties"]["tool"]["enum"] == ["plan_itinerary"]
+    )
+    properties = plan_branch["properties"]["args"]["properties"]
+
+    assert "candidate_spots" in properties
+    assert properties["candidate_spots"]["type"] == "array"
+    assert properties["candidate_spots"]["items"] == {"type": "string", "minLength": 1}
+    assert "candidate_spots" in plan_branch["properties"]["args"]["required"]
+
+
 def test_main_agent_done_only_schema_only_allows_done() -> None:
     schema = main_agent_done_only_schema()
 

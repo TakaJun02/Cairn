@@ -810,12 +810,27 @@ def _schedule_with_mode(
 
 
 def _relaxed_solution(solution_a: Itinerary, data: SolverInput) -> Itinerary:
+    """解 C(1件減らしたゆったり版)を作る。
+
+    2026-08-04 夜(ADR-0022 追記・レビュー是正 H-1): 除外対象に
+    `data.required_spot_ids` を加える。`require` 制約(§4.4 経路1)は
+    「未訪問なら大ペナルティ」の意図で、解 C がこれを意図的に破ってまで
+    ゆったり化するのは設計と不整合。従来は `locked`/`protected`/
+    `removal_protected` しか見ておらず、挿入プールが must_visit だけの
+    ときに解 C が must_visit を丸ごと落として空旅程になっていた。
+    `_removal_protected_spot_ids` 自体は shake・実行可能化フォールバックが
+    共用する(意図的に required を除外対象にしていない — shake は
+    `_insert_requirements` で再挿入され、実行可能化は物理的破綻時の例外的
+    フォールバックであるため)。この関数だけの局所的な是正にとどめる。
+    """
+
     routes = [[item.spot_id for item in day.items] for day in solution_a.days]
     removable = [
         spot_id
         for route in routes
         for spot_id in route
         if spot_id not in _removal_protected_spot_ids(data)
+        and spot_id not in data.required_spot_ids
     ]
     if not removable:
         return _with_concessions(solution_a.model_copy(deep=True), data)

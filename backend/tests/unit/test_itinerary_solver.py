@@ -87,6 +87,44 @@ def test_a_b_c_are_returned_and_c_has_one_fewer_poi() -> None:
     )
 
 
+def test_relaxed_solution_never_drops_required_spot_ids() -> None:
+    """レビュー是正 H-1: 解 C(ゆったり版)は `required_spot_ids`(must_visit)を
+
+    除去対象にしない。旧実装は `locked`/`protected`/`removal_protected` しか
+    見ておらず、`required_spot_ids` を丸ごと除去候補にしていた。
+    """
+
+    data = replace(
+        _planning_data(),
+        required_spot_ids=frozenset({"spot_a", "spot_b"}),
+    )
+    solved = solve_itinerary(data)
+    solution_a, _, solution_c = solved.solutions
+
+    assert {"spot_a", "spot_b"} <= set(itinerary_spot_ids(solution_a))
+    assert {"spot_a", "spot_b"} <= set(itinerary_spot_ids(solution_c))
+
+
+def test_relaxed_solution_with_single_required_spot_and_no_optional_pool_is_not_emptied() -> None:
+    """H-1 の報告そのもの: 挿入プールが must_visit 1 件だけ(任意候補ゼロ)の
+
+    とき、旧実装は解 C がその 1 件を落として空旅程になっていた
+    (`removable` に required も含めていたため)。是正後は除去対象が無く
+    なり、`if not removable` の分岐で解 A のまま(譲歩の再計算のみ)返る。
+    """
+
+    data = replace(
+        _planning_data(),
+        required_spot_ids=frozenset({"spot_a"}),
+        insertion_pool=frozenset({"spot_a"}),
+    )
+    solved = solve_itinerary(data)
+    solution_a, _, solution_c = solved.solutions
+
+    assert itinerary_spot_ids(solution_a) == ["spot_a"]
+    assert itinerary_spot_ids(solution_c) == ["spot_a"]
+
+
 def test_impossible_soft_requirement_returns_concession_instead_of_exception() -> None:
     constraint = Constraint(
         id="c_001",

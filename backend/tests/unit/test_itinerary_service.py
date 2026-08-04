@@ -169,6 +169,11 @@ async def test_first_plan_moves_pending_constraints_and_returns_two_alternatives
             }
         ],
         must_visit=["spot_a"],
+        # レビュー是正(H-1): 任意候補ゼロだと解 A/B/C の生成自体が省略され
+        # alternatives が空になる(下の test_plan_itinerary_* 系で別途検査
+        # 済み)。本テストは「2 通りの解が返ること」自体を検査したいので、
+        # 任意候補(spot_b)を渡して自由度を持たせる。
+        candidate_spots=["spot_b"],
         constraints=[{"pred": "future_pred", "args": {}}],
         utilities={"spot_d": -10},
     )
@@ -323,6 +328,11 @@ async def test_plan_emits_solution_a_before_async_selection() -> None:
                 "origin": {"kind": "spot", "id": "spot_origin"},
             }
         ],
+        # M-4(レビュー是正): ADR-0022 は任意候補ゼロのとき解 A/B/C の生成と
+        # 選択 LLM を省略する(H-1)。この選択 LLM の呼び出し順序を検証したい
+        # テストなので、候補を渡して自由度のある解にする(0件旅程の退化
+        # ケースにしない)。
+        candidate_spots=["spot_a", "spot_b", "spot_c", "spot_d"],
         selection_text="のんびり",
     )
 
@@ -336,13 +346,23 @@ async def _planned_with_spare_capacity() -> tuple[MemoryItineraryRepository, Any
 
     選択の有無を検証したいのは edit 呼び出し側なので、初回計画に selector を
     付けると解 B(diversity 版)が選ばれて件数の前提が崩れる。
+
+    ADR-0022(2026-08-04 夜)以降、`plan_itinerary` の挿入プールは
+    `must_visit ∪ candidate_spots` に限定される(暗黙のカタログ全件参照は
+    廃止)。この helper は「カタログ 6 件中 4 件だけが予算に収まる」規模を
+    検証したい(空きがある状態を作る)ので、6 件全部を `candidate_spots` に
+    渡して recommend 済みの体で埋める。
     """
 
-    repository = MemoryItineraryRepository(_planning_with_spare_capacity())
+    planning = _planning_with_spare_capacity()
+    repository = MemoryItineraryRepository(planning)
     plan_service = ItineraryService(
         repository,  # type: ignore[arg-type]
         solver_config=SolverConfig(iterations=60, minimum_iterations=60, time_limit_ms=2_000),
     )
+    non_origin_spot_ids = [
+        spot_id for spot_id, spot in planning.spots.items() if spot.kind != "facility"
+    ]
     planned = await plan_service.plan_itinerary(
         user_id=7,
         days=[
@@ -353,6 +373,7 @@ async def _planned_with_spare_capacity() -> tuple[MemoryItineraryRepository, Any
                 "origin": {"kind": "spot", "id": "spot_origin"},
             }
         ],
+        candidate_spots=non_origin_spot_ids,
     )
     assert not isinstance(planned, ToolError)
     return repository, planned
@@ -456,11 +477,16 @@ async def test_plan_itinerary_sets_assumptions_on_result_and_provisional() -> No
                 "origin": {"kind": "spot", "id": "spot_origin"},
             }
         ],
+        # M-4(レビュー是正): candidate_spots を渡さないと insertion_pool が
+        # 空になり 0 件旅程の退化ケースになる。assumptions の伝播を検証する
+        # 本題とは無関係だが、非空の旅程で検証するために候補を渡す。
+        candidate_spots=["spot_a"],
         assumptions=["日付は明日と仮定"],
     )
 
     assert not isinstance(result, ToolError)
     assert result.itinerary.assumptions == ["日付は明日と仮定"]
+    assert result.spot_ids == ["spot_a"]
     assert provisional_assumptions == [["日付は明日と仮定"]]
     assert repository.versions[1].itinerary.assumptions == ["日付は明日と仮定"]
 
@@ -551,3 +577,158 @@ async def test_edit_default_allow_refill_false_still_applies_explicit_add_op() -
     # 明示的に add した spot_b は反映される。ソルバーが自発的に選んだのでは
     # ない spot_c/spot_d は増えない(集合固定)。
     assert frozenset(edited.spot_ids) == frozenset({"spot_a", "spot_b"})
+
+
+# ---------------------------------------------------------------------------
+# ADR-0022: 新規作成の挿入プールを明示候補(must_visit ∪ candidate_spots)に
+# 限定する(カタログ全件への暗黙フル ILS をやめる)。
+# ---------------------------------------------------------------------------
+
+
+async def test_plan_itinerary_single_must_visit_without_candidates_yields_only_that_spot() -> (
+    None
+):
+    """「1スポットのみ指名 → そのスポットだけの旅程になる」の直接検証。
+
+    時間帯(09:00〜17:00、480分)はカタログの spot_a〜spot_d 全部を回っても
+    余裕がある規模だが、candidate_spots を渡さなければ must_visit の
+    spot_a 以外は一切挿入プールに入らない。
+    """
+
+    repository = MemoryItineraryRepository(_planning())
+    service = _service(repository)
+
+    result = await service.plan_itinerary(
+        user_id=7,
+        days=[
+            {
+                "date": "2026-08-10",
+                "start": "09:00",
+                "end": "17:00",
+                "origin": {"kind": "spot", "id": "spot_origin"},
+            }
+        ],
+        must_visit=["spot_a"],
+    )
+
+    assert not isinstance(result, ToolError)
+    assert result.spot_ids == ["spot_a"]
+
+
+async def test_plan_itinerary_candidate_spots_restrict_insertion_pool() -> None:
+    """ADR-0022: candidate_spots に含めなかった POI は、時間・効用に余裕が
+
+    あっても挿入プールに入らない(insertion_pool = must_visit ∪
+    candidate_spots に厳密に限定される)。
+    """
+
+    repository = MemoryItineraryRepository(_planning())
+    service = _service(repository)
+
+    result = await service.plan_itinerary(
+        user_id=7,
+        days=[
+            {
+                "date": "2026-08-10",
+                "start": "09:00",
+                "end": "17:00",
+                "origin": {"kind": "spot", "id": "spot_origin"},
+            }
+        ],
+        candidate_spots=["spot_a", "spot_b"],
+        # spot_c/spot_d を強く好ませても、候補に入れていなければ挿入されない。
+        utilities={"spot_c": 10, "spot_d": 10},
+    )
+
+    assert not isinstance(result, ToolError)
+    # M-3(レビュー是正): 部分集合(`<=`)だと空リストですり抜けてしまう。
+    # この規模(480分の余裕、既定効用 1.0)では spot_a/spot_b は両方とも
+    # 挿入される(実測)ので、実際の期待値との厳密一致で検査する。
+    assert frozenset(result.spot_ids) == frozenset({"spot_a", "spot_b"})
+
+
+async def test_plan_itinerary_candidate_spots_do_not_create_require_constraints() -> None:
+    """ADR-0022: candidate_spots は require 制約を作らない(入れても入れなく
+
+    てもよい候補)。効用が強く負であれば挿入されないことがある一方、
+    must_visit に同じスポット・同じ効用を渡すと必ず入る(require 制約に
+    よって強制される)対比で確認する。
+    """
+
+    optional_repository = MemoryItineraryRepository(_planning())
+    optional_service = _service(optional_repository)
+    optional_only = await optional_service.plan_itinerary(
+        user_id=7,
+        days=[
+            {
+                "date": "2026-08-10",
+                "start": "09:00",
+                "end": "13:00",
+                "origin": {"kind": "spot", "id": "spot_origin"},
+            }
+        ],
+        candidate_spots=["spot_a", "spot_d"],
+        utilities={"spot_d": -10},
+    )
+    assert not isinstance(optional_only, ToolError)
+    assert "spot_d" not in optional_only.spot_ids
+
+    required_repository = MemoryItineraryRepository(_planning())
+    required_service = _service(required_repository)
+    forced = await required_service.plan_itinerary(
+        user_id=7,
+        days=[
+            {
+                "date": "2026-08-10",
+                "start": "09:00",
+                "end": "13:00",
+                "origin": {"kind": "spot", "id": "spot_origin"},
+            }
+        ],
+        must_visit=["spot_d"],
+        utilities={"spot_d": -10},
+    )
+    assert not isinstance(forced, ToolError)
+    assert "spot_d" in forced.spot_ids
+
+
+async def test_plan_itinerary_with_must_visit_only_and_notes_skips_selection_and_is_not_empty() -> (
+    None
+):
+    """H-1 の受け入れ条件そのもの: must_visit のみ(任意候補ゼロ)+ notes
+
+    あり(選択 LLM が走る条件)でも、解選択 LLM は呼ばれず(単一解に倒れる
+    ので selector を呼ぶ必要が無い)、結果の旅程は空にならない。是正前は
+    解 C(must_visit を落として空旅程)が選ばれてしまい、notes が付いた
+    せいで空の v1 が確定保存されるおそれがあった。
+    """
+
+    repository = MemoryItineraryRepository(_planning())
+
+    async def must_not_be_called(solutions: list[Itinerary], free_text: str) -> Itinerary:
+        raise AssertionError("任意候補ゼロでは解選択 LLM を呼んではいけない")
+
+    service = ItineraryService(
+        repository,  # type: ignore[arg-type]
+        solver_config=SolverConfig(iterations=20, minimum_iterations=20, time_limit_ms=2_000),
+        selector=must_not_be_called,
+    )
+
+    result = await service.plan_itinerary(
+        user_id=7,
+        days=[
+            {
+                "date": "2026-08-10",
+                "start": "09:00",
+                "end": "13:00",
+                "origin": {"kind": "spot", "id": "spot_origin"},
+            }
+        ],
+        must_visit=["spot_a"],
+        selection_text="のんびり回りたい",
+    )
+
+    assert not isinstance(result, ToolError)
+    assert result.selection_used is False
+    assert result.alternatives == []
+    assert result.spot_ids == ["spot_a"]

@@ -558,7 +558,28 @@ async def test_state_step_fires_started_then_finished_and_never_plan() -> None:
 
 
 async def test_plan_itinerary_resolves_names_and_reports_dropped() -> None:
-    state = _state()
+    # ADR-0022 是正 H-2: `_state()` の `default_origin_spot_id` は
+    # "spot_001"(= "鶴間池")と同じで、origin_name 未指定だと must_visit が
+    # 起点と同一 spot に解決してしまい実効プールがゼロになる
+    # (precondition_unmet に飲まれる)。この既存テストは名前解決・dropped
+    # 報告そのものを検査したいので、起点を独立した施設スポットにした
+    # 専用の state を組む。
+    spots = {
+        **_spots(),
+        "spot_origin": SpotFact(spot_id="spot_origin", name_ja="道の駅", kind="facility"),
+    }
+    state = TurnState(
+        turn_id="turn",
+        thread_id=1,
+        user_id=1,
+        utterance="滝が見たい",
+        profile=ProfileState(),
+        spot_id_vocab=list(spots),
+        spot_names={key: value.name_ja for key, value in spots.items()},
+        spot_catalog=spots,
+        tag_vocabulary=["自然", "滝", "登山", "温泉"],
+        default_origin_spot_id="spot_origin",
+    )
     tools = FakeTools()
     tools.plan_queue = [_plan_result()]
     client = ScriptedMainAgentClient(

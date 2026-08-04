@@ -42,6 +42,11 @@ _WEEKDAYS_JA = ("月", "火", "水", "木", "金", "土", "日")
 
 MAIN_AGENT_MAX_DAYS = 5
 MAIN_AGENT_MAX_MUST_VISIT = 8
+# recommend 1 回分の結果件数(コード側で k=5 に固定)を転記できる余地を
+# 持たせつつ、複数回の recommend 結果を積み増しても暴走しない上限
+# (ADR-0022)。recommend 自体に候補数の上限引数はない(L-2 是正:
+# 旧コメントは「上限 8」と書いていたが、そのような口は存在しない)。
+MAIN_AGENT_MAX_CANDIDATE_SPOTS = 12
 MAIN_AGENT_MAX_OPS = 8
 MAIN_AGENT_MAX_CONSTRAINTS_ADD = 8
 MAIN_AGENT_MAX_CONSTRAINTS_REMOVE = 8
@@ -123,6 +128,8 @@ Tool(action.tool)は次の 6 つです。1 周につき 1 つだけ選びます�
   precondition_unmet が返ったら下の境界の手順に従う),
   "destination_name":スポット名 または null}}],
   "must_visit":[スポット名,...],
+  "candidate_spots":[スポット名,...](入れても入れなくてもよい候補。
+  既定空。下記の判断基準を参照),
   "constraints":{{"add":[{{"pred":述語,"args":object,"weight":数値,
   "source_text":根拠になった発話}}],"remove":[制約id,...]}} または null,
   "notes":文字列 または null,
@@ -180,6 +187,17 @@ Tool(action.tool)は次の 6 つです。1 周につき 1 つだけ選びます�
   組み合わせにして」のように**補充・入れ替えを明示的に求めたとき**だけ
   true にしてください。「外して」だけの依頼(補充を求めていない)は
   false のままにします。
+- plan_itinerary.must_visit と candidate_spots は役割が異なります。
+  **必ず入れたい場所は must_visit** に書きます(ソルバーは必ず組み込みます)。
+  **candidate_spots は入れても入れなくてもよい候補**です(時間が余れば
+  ソルバーが組み込みます)。ソルバーはこの2つを合わせた集合の外からは
+  一切スポットを選びません(constraints の require で明示した場所は例外
+  で、集合の外でも必ず入ります)。**ユーザーが具体的なスポット名を挙げておらず
+  candidate_spots に入れる候補が必要な場合は、先に recommend を呼んで
+  候補を得てから、その候補名を candidate_spots に渡して plan_itinerary を
+  呼んでください**(「おすすめで組んで」等)。must_visit と
+  candidate_spots が両方とも空のまま plan_itinerary を呼ぶとエラーが
+  返ります(空の旅程を作らないため)。
 - plan_itinerary.assumptions には、日付・起点など**ユーザーに確認していない
   前提**を日本語短文で必ず列挙してください(例:「日付は明日と仮定」
   「起点は直前に話題に出た宿泊施設と仮定」)。何も仮定していなければ
@@ -570,11 +588,26 @@ def _plan_itinerary_args_schema(constraint_ids: list[str] | None) -> dict[str, A
                 "items": {"type": "string", "minLength": 1},
                 "maxItems": MAIN_AGENT_MAX_MUST_VISIT,
             },
+            # 入れても入れなくてもよい候補(既定空。2026-08-04 夜追加、
+            # ADR-0022)。string 配列なので xgrammar の「配列要素内の number」
+            # 既知不具合([25 §2-1])には該当しない。
+            "candidate_spots": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "maxItems": MAIN_AGENT_MAX_CANDIDATE_SPOTS,
+            },
             "constraints": _nullable_constraints_schema(constraint_ids),
             "notes": _nullable_string(),
             "assumptions": _assumptions_schema(),
         },
-        "required": ["days", "must_visit", "constraints", "notes", "assumptions"],
+        "required": [
+            "days",
+            "must_visit",
+            "candidate_spots",
+            "constraints",
+            "notes",
+            "assumptions",
+        ],
         "additionalProperties": False,
     }
 

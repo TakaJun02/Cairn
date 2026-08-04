@@ -91,6 +91,10 @@ class ItineraryService:
         user_id: int,
         days: Sequence[PlanningDay | Mapping[str, Any]],
         must_visit: Sequence[str] = (),
+        # 挿入してもしなくてもよい候補(spot_id。既定空。2026-08-04 夜、
+        # ADR-0022)。`require` 制約は作らない。`insertion_pool` へ
+        # `must_visit` と合流させるためだけに使う。
+        candidate_spots: Sequence[str] = (),
         constraints: Sequence[Constraint | Mapping[str, Any]] = (),
         utilities: UtilityInput | None = None,
         selection_text: str = "",
@@ -136,16 +140,27 @@ class ItineraryService:
         )
         try:
             utility_values = _utilities(planning, utilities)
+            required_spot_ids = frozenset(must_visit)
+            # 2026-08-04 夜(ADR-0022): 新規作成の挿入プールは
+            # must_visit ∪ candidate_spots の解決済み spot_id に限定する
+            # (None を渡さない = カタログ全件を暗黙に使わない)。
+            insertion_pool = required_spot_ids | frozenset(candidate_spots)
+            # レビュー是正・H-1: 任意候補がゼロ(insertion_pool ⊆
+            # required_spot_ids)のときは解に自由度がなく、解 A/B/C は
+            # 実質同じ内容になる。ADR-0021 の編集集合固定と対称に、
+            # 単一解へ倒して解選択 LLM を省略する。
+            has_optional_candidates = bool(insertion_pool - required_spot_ids)
             solver_input = SolverInput(
                 days=tuple(parsed_days),
                 spots=planning.spots,
                 travel_times=planning.travel_times,
                 constraints=tuple(normalized.constraints),
                 utilities=utility_values,
-                required_spot_ids=frozenset(must_visit),
+                required_spot_ids=required_spot_ids,
+                insertion_pool=insertion_pool,
                 config=self.solver_config,
             )
-            solved = solve_itinerary(solver_input)
+            solved = solve_itinerary(solver_input, alternatives=has_optional_candidates)
             resolved_assumptions = list(assumptions)
             await _emit_provisional(
                 self.provisional_sink,
@@ -154,15 +169,22 @@ class ItineraryService:
                 ),
                 Diff(),
             )
-            (
-                selected,
-                alternatives,
-                selection_used,
-            ) = await _select_solution_with_alternatives(
-                solved.solutions,
-                selection_text,
-                selector=self.selector,
-            )
+            if has_optional_candidates:
+                (
+                    selected,
+                    alternatives,
+                    selection_used,
+                ) = await _select_solution_with_alternatives(
+                    solved.solutions,
+                    selection_text,
+                    selector=self.selector,
+                )
+            else:
+                # レビュー是正・H-1: 解 A をそのまま単一解として使う
+                # (ADR-0021 の編集集合固定と同じ形)。
+                selected = solved.solutions[0]
+                alternatives = []
+                selection_used = False
             selected = selected.model_copy(
                 update={"assumptions": resolved_assumptions}, deep=True
             )

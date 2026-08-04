@@ -216,6 +216,7 @@ class RealItineraryTools:
             user_id=user_id,
             days=args.days,
             must_visit=args.must_visit,
+            candidate_spots=args.candidate_spots,
             constraints=[constraint_to_mapping(value) for value in constraints],
             selection_text=selection_text,
         )

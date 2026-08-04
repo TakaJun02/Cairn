@@ -73,6 +73,11 @@ async def run_plan_itinerary(
     ambiguous: list[str] = []
 
     days: list[dict[str, Any]] = []
+    # 日の起終点(2026-08-04 夜、ADR-0022 追記・レビュー是正 H-2): ソルバーは
+    # 起終点を挿入対象から常に除外するため、名寄せが起終点にしか解決しない
+    # ケース(例: origin_name と must_visit の両方に同じ地点名を書く)を
+    # 検知するために全 day の起終点 spot_id を集める。
+    endpoint_ids: set[str] = set()
     for day in parsed.days:
         origin_id = _resolve_endpoint(
             name_context, day.origin_name, state.default_origin_spot_id, dropped, ambiguous
@@ -97,6 +102,9 @@ async def run_plan_itinerary(
         destination_id = _resolve_endpoint(
             name_context, day.destination_name, origin_id, dropped, ambiguous
         )
+        endpoint_ids.add(origin_id)
+        if destination_id is not None:
+            endpoint_ids.add(destination_id)
         days.append(
             {
                 "date": day.date,
@@ -109,6 +117,12 @@ async def run_plan_itinerary(
     must_visit_outcome = resolve_names(name_context, parsed.must_visit)
     dropped.extend(must_visit_outcome.dropped)
     ambiguous.extend(must_visit_outcome.ambiguous)
+    # 挿入してもしなくてもよい候補(2026-08-04 夜、ADR-0022)。must_visit と
+    # 同じ名寄せ経路で解決する。require 制約は作らない(ItineraryService
+    # 側で must_visit とは別に insertion_pool へのみ加える)。
+    candidate_spots_outcome = resolve_names(name_context, parsed.candidate_spots)
+    dropped.extend(candidate_spots_outcome.dropped)
+    ambiguous.extend(candidate_spots_outcome.ambiguous)
 
     used_ids = set(active_constraint_ids(state))
     constraints, constraints_dropped, constraints_ambiguous = _build_constraint_drafts(
@@ -134,6 +148,42 @@ async def run_plan_itinerary(
         )
         return error.message_ja, _error_payload(error)
 
+    # 2026-08-04 夜(ADR-0022 追記・レビュー是正 H-2): 空判定は「実効プール」
+    # (解決済み must_visit ∪ candidate_spots から日の起終点を引いた集合)で
+    # 行う。ソルバーは起終点を挿入対象から常に除外するため、名寄せが起終点
+    # にしか解決しないケース(例: origin_name と must_visit の両方に同じ
+    # 地点名を書く)を見逃さない。空の旅程を黙って返さず precondition_unmet
+    # で止める。メインエージェントはこれを見て recommend を呼ぶか ask_user
+    # で聞くかを選べる(起点未解決と同型のガードレール)。
+    resolved_pool = frozenset(must_visit_outcome.resolved) | frozenset(
+        candidate_spots_outcome.resolved
+    )
+    effective_pool = resolved_pool - endpoint_ids
+    if not effective_pool:
+        # M-1(レビュー是正): 「指定されていません」だけでは、メインが
+        # 「書いたのに指定されていないと言われた」状態になり、同じ名前での
+        # 再試行や不要な recommend を誘発する。落ちた要素・曖昧だった要素・
+        # 起終点との衝突を理由として付記する。
+        notes: list[str] = []
+        if resolved_pool and resolved_pool <= endpoint_ids:
+            notes.append("指定された場所が起点・終点と同じです")
+        if dropped:
+            notes.append("解決できなかった項目: " + "、".join(dropped))
+        if ambiguous:
+            notes.append("曖昧だった項目: " + "、".join(ambiguous))
+        message = (
+            "旅程に含める観光地が指定されていません。recommend で候補を"
+            "挙げるか、行きたい場所を確認してください"
+        )
+        if notes:
+            message += "(" + "。".join(notes) + ")"
+        error = ToolError(
+            code=ToolErrorCode.PRECONDITION_UNMET,
+            message_ja=message,
+            recoverable=True,
+        )
+        return error.message_ja, _error_payload(error)
+
     # フロー3: 実行(既存 Tool。内部は変更しない)。
     selection_text = parsed.notes or ""
     context = build_recommendation_context(state)
@@ -143,6 +193,7 @@ async def run_plan_itinerary(
         args=PlanItineraryArgs(
             days=days,
             must_visit=must_visit_outcome.resolved,
+            candidate_spots=candidate_spots_outcome.resolved,
             assumptions=parsed.assumptions,
         ),
         constraints=constraints,

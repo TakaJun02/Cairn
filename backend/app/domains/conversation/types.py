@@ -189,6 +189,11 @@ class RecommendArgs(ConversationModel):
 class PlanItineraryArgs(ConversationModel):
     days: list[dict[str, Any]] = Field(default_factory=list)
     must_visit: list[str] = Field(default_factory=list)
+    # 挿入してもしなくてもよい候補(spot_id。既定空。2026-08-04 夜追加、
+    # ADR-0022)。`must_visit` と異なり require 制約は作らない —
+    # `ItineraryService.plan_itinerary` が `insertion_pool` に
+    # `must_visit ∪ candidate_spots` として渡す。
+    candidate_spots: list[str] = Field(default_factory=list)
     # 未確認の前提(日付・起点等)。レコメンド SA の assumptions と同型
     # (2026-08-04 追加。クローズドワールド原則の明示的な例外 —
     # Docs/30_design/agent_react_architecture.md §5・§14、
@@ -302,6 +307,12 @@ class MainPlanDay(ConversationModel):
 class MainPlanItineraryArgs(ConversationModel):
     days: list[MainPlanDay] = Field(default_factory=list)
     must_visit: list[str] = Field(default_factory=list)
+    # 挿入してもしなくてもよい候補のスポット名(既定空。2026-08-04 夜追加、
+    # ADR-0022)。ソルバーの挿入プールは既定で must_visit ∪ candidate_spots
+    # の解決済み spot_id に限定される(カタログ全件を暗黙に使わない)。
+    # ユーザーが具体的なスポット名を挙げておらず候補が必要な場合は、先に
+    # recommend を呼んで候補を得てから、その候補名をここに渡すこと。
+    candidate_spots: list[str] = Field(default_factory=list)
     constraints: MainConstraintOps | None = None
     notes: str | None = None
     # 未確認の前提(日付・起点等)を日本語短文で列挙する(2026-08-04 追加。

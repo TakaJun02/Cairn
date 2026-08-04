@@ -145,12 +145,18 @@ def _state(*, itinerary: ItineraryState | None = None) -> TurnState:
 
 
 async def test_plan_itinerary_reports_ambiguous_must_visit_with_candidates() -> None:
-    """フロー2: 曖昧な要素は落とし、フロー4の整形に候補つきで載る。"""
+    """フロー2: 曖昧な要素は落とし、フロー4の整形に候補つきで載る。
+
+    must_visit が曖昧の1件だけだと解決結果が空になり ADR-0022 の
+    precondition_unmet に飲まれてしまうため、別に確実に解決できる要素
+    (spot_c)を足して「候補ゼロではない」状態にしている。
+    """
 
     spots = {
         "spot_origin": SpotFact(spot_id="spot_origin", name_ja="道の駅", kind="facility"),
         "spot_a": SpotFact(spot_id="spot_a", name_ja="湧水地点エー", kind="poi"),
         "spot_b": SpotFact(spot_id="spot_b", name_ja="湧水地点ビー", kind="poi"),
+        "spot_c": SpotFact(spot_id="spot_c", name_ja="地点シー", kind="poi"),
     }
     state = TurnState(
         turn_id="turn",
@@ -179,7 +185,7 @@ async def test_plan_itinerary_reports_ambiguous_must_visit_with_candidates() -> 
                     "destination_name": None,
                 }
             ],
-            "must_visit": ["湧水"],
+            "must_visit": ["湧水", "地点シー"],
             "constraints": None,
             "notes": None,
         },
@@ -187,7 +193,7 @@ async def test_plan_itinerary_reports_ambiguous_must_visit_with_candidates() -> 
     )
 
     assert error is None
-    assert tools.plan_calls[0]["args"].must_visit == []
+    assert tools.plan_calls[0]["args"].must_visit == ["spot_c"]
     assert "曖昧だった項目" in digest
     assert "湧水地点エー" in digest and "湧水地点ビー" in digest
 
@@ -212,7 +218,7 @@ async def test_plan_itinerary_passes_notes_as_selection_hint() -> None:
                     "destination_name": None,
                 }
             ],
-            "must_visit": [],
+            "must_visit": ["地点エー"],
             "constraints": None,
             "notes": "のんびり回りたい",
         },
@@ -244,7 +250,7 @@ async def test_plan_itinerary_forwards_assumptions_to_tool_args() -> None:
                     "destination_name": None,
                 }
             ],
-            "must_visit": [],
+            "must_visit": ["地点エー"],
             "constraints": None,
             "notes": None,
             "assumptions": ["日付は明日と仮定"],
@@ -253,6 +259,200 @@ async def test_plan_itinerary_forwards_assumptions_to_tool_args() -> None:
     )
 
     assert tools.plan_calls[0]["args"].assumptions == ["日付は明日と仮定"]
+
+
+async def test_plan_itinerary_returns_precondition_unmet_when_no_candidates_specified() -> None:
+    """ADR-0022: must_visit・candidate_spots が両方とも空なら precondition_unmet
+    で止まり、空の旅程を黙って返さない。
+    """
+
+    state = _state()
+    tools = FakeItineraryTools()
+
+    digest, error = await run_plan_itinerary(
+        state,
+        tools,
+        {
+            "days": [
+                {
+                    "date": "2026-08-10",
+                    "start": "09:00",
+                    "end": "17:00",
+                    "origin_name": None,
+                    "destination_name": None,
+                }
+            ],
+            "must_visit": [],
+            "candidate_spots": [],
+            "constraints": None,
+            "notes": None,
+        },
+        step_id=1,
+    )
+
+    assert error is not None
+    assert error["code"] == ToolErrorCode.PRECONDITION_UNMET.value
+    assert error["recoverable"] is True
+    assert tools.plan_calls == []
+    assert "観光地が指定されていません" in error["message_ja"]
+
+
+async def test_plan_itinerary_precondition_unmet_message_includes_original_names_when_all_unresolved() -> (  # noqa: E501
+    None
+):
+    """M-1: must_visit が名寄せ全滅(すべて dropped)のとき、precondition_unmet
+
+    のメッセージに元のスポット名がそのまま含まれる。「指定されていません」
+    だけだと、メインエージェントから見て「書いたのに指定されていないと
+    言われた」状態になり、同じ名前での再試行や不要な recommend を誘発する。
+    """
+
+    state = _state()
+    tools = FakeItineraryTools()
+
+    digest, error = await run_plan_itinerary(
+        state,
+        tools,
+        {
+            "days": [
+                {
+                    "date": "2026-08-10",
+                    "start": "09:00",
+                    "end": "17:00",
+                    "origin_name": None,
+                    "destination_name": None,
+                }
+            ],
+            "must_visit": ["架空スポット壱", "架空スポット弐"],
+            "candidate_spots": [],
+            "constraints": None,
+            "notes": None,
+        },
+        step_id=1,
+    )
+
+    assert error is not None
+    assert error["code"] == ToolErrorCode.PRECONDITION_UNMET.value
+    assert tools.plan_calls == []
+    assert "解決できなかった項目" in error["message_ja"]
+    assert "架空スポット壱" in error["message_ja"]
+    assert "架空スポット弐" in error["message_ja"]
+
+
+async def test_plan_itinerary_returns_precondition_unmet_when_must_visit_resolves_to_origin() -> (
+    None
+):
+    """H-2: must_visit に起点と同じ地点名を書くと、名寄せ結果自体は非空
+
+    (spot_origin)でも実効プール(解決済み集合から日の起終点を引いた集合)
+    はゼロになる。空の旅程を黙って返さず precondition_unmet で止め、
+    メッセージに「起点・終点と同じ」の旨を含める(M-1)。
+    """
+
+    state = _state()
+    tools = FakeItineraryTools()
+
+    digest, error = await run_plan_itinerary(
+        state,
+        tools,
+        {
+            "days": [
+                {
+                    "date": "2026-08-10",
+                    "start": "09:00",
+                    "end": "17:00",
+                    "origin_name": None,
+                    "destination_name": None,
+                }
+            ],
+            "must_visit": ["道の駅"],
+            "candidate_spots": [],
+            "constraints": None,
+            "notes": None,
+        },
+        step_id=1,
+    )
+
+    assert error is not None
+    assert error["code"] == ToolErrorCode.PRECONDITION_UNMET.value
+    assert error["recoverable"] is True
+    assert tools.plan_calls == []
+    assert "起点・終点と同じ" in error["message_ja"]
+
+
+async def test_plan_itinerary_forwards_resolved_candidate_spots_separately_from_must_visit() -> (
+    None
+):
+    """ADR-0022: candidate_spots は must_visit と同じ名寄せ経路で解決され、
+
+    別フィールドとして Tool 引数へ渡る(混ざらない)。
+    """
+
+    state = _state()
+    tools = FakeItineraryTools()
+    tools.plan_queue = [_plan_result(spot_ids=["spot_a", "spot_b"])]
+
+    await run_plan_itinerary(
+        state,
+        tools,
+        {
+            "days": [
+                {
+                    "date": "2026-08-10",
+                    "start": "09:00",
+                    "end": "17:00",
+                    "origin_name": None,
+                    "destination_name": None,
+                }
+            ],
+            "must_visit": ["地点エー"],
+            "candidate_spots": ["地点ビー"],
+            "constraints": None,
+            "notes": None,
+        },
+        step_id=1,
+    )
+
+    call_args = tools.plan_calls[0]["args"]
+    assert call_args.must_visit == ["spot_a"]
+    assert call_args.candidate_spots == ["spot_b"]
+
+
+async def test_plan_itinerary_reports_dropped_candidate_spots_and_still_succeeds() -> None:
+    """ADR-0022: candidate_spots の名寄せ失敗要素は C4 と同じ扱いで dropped に
+
+    記録される(must_visit が候補ゼロを避けているので手全体は実行される)。
+    """
+
+    state = _state()
+    tools = FakeItineraryTools()
+    tools.plan_queue = [_plan_result(spot_ids=["spot_a"])]
+
+    digest, error = await run_plan_itinerary(
+        state,
+        tools,
+        {
+            "days": [
+                {
+                    "date": "2026-08-10",
+                    "start": "09:00",
+                    "end": "17:00",
+                    "origin_name": None,
+                    "destination_name": None,
+                }
+            ],
+            "must_visit": ["地点エー"],
+            "candidate_spots": ["架空スポット"],
+            "constraints": None,
+            "notes": None,
+        },
+        step_id=1,
+    )
+
+    assert error is None
+    assert tools.plan_calls[0]["args"].candidate_spots == []
+    assert "解決できなかった項目" in digest
+    assert "架空スポット" in digest
 
 
 async def test_edit_itinerary_forwards_allow_refill_and_assumptions_to_tool_args() -> None:
@@ -634,7 +834,7 @@ async def test_plan_itinerary_succeeds_with_explicit_origin_name_even_without_de
                     "destination_name": None,
                 }
             ],
-            "must_visit": [],
+            "must_visit": ["地点エー"],
             "constraints": None,
             "notes": None,
         },
