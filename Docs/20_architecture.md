@@ -198,7 +198,7 @@ GET  /packs/{pack_id}/manifest.json             → 完成後の成果物(appが
 - **ジョブモデル**: `pack_jobs(id, pack_id, state, params, created_at, ...)` + `pack_assets(pack_id, spot_id, variant, narration_state, audio_state, error, ...)`
   - state: `queued → running → ready | partial | failed`。**アセット単位の部分成功**を第一級で扱う(現行はTTS 1件失敗で全体500+孤児ファイル: 22 §2-6)
   - 冪等性: 同一 `(route_id, langs, options)` の再要求は既存ジョブ/パックを返す(現行のuuid乱発によるディスク積み上げを解消: 22 §2-7)
-  - 実行は `app` 内のasyncioワーカー。**Celery/Redisは再導入しない**(研究規模に不要、過去に廃止済み)
+  - 実行は `app` 内のasyncioワーカー。**Celery/Redisは再導入しない**(この規模に不要、過去に廃止済み)
 - **並列度**: ナレーション生成は `asyncio.gather` + Semaphore(既定8。vLLMの継続バッチングに委ねる)、TTSはSemaphore(既定3)+指数バックオフ。spot単位の失敗クールダウン連鎖(22 §2-6)は廃止。**両者はパイプラインで回す**(原稿が全部できるのを待たない)
 - **variant(状況)の一元化**(**2026-08-01 改訂: [ADR-0015](adr/0015-pack-asset-composition.md)**): `Variant = base | weather_cloudy | weather_rain | congestion_mid | congestion_high` を `api/schemas` の enum 1箇所で定義。アセットキーは `(spot_id, variant)`(言語は日本語のみ)。**排他ではなく base + overlay の合成**とし、天気と混雑を独立した軸として重ねられるようにする。「沿道POIは本編のみ」という現行の暗黙ルールは **`pack_assets.role`(visit / pass_by)**で表現する(22 §5-5 の7箇所散在を解消)
 - **成果物は `manifest.json` + `route.geojson` + `audio/*.mp3`**(**2026-08-01 具体化**)。テキスト本文はmanifestに含め、`Asset.text` 欠落(22 §5-2)を解消する。**経路は manifest に埋め込まず別ファイルにする** —— 現行は400KB中122KBがrouteの重複(22 §B-11)だったが、`route_id` 参照だけにすると**観光フェーズで引けない**ため、パック内のファイルとして持つ。**再生規則(`playback_rules`)と近接判定の半径も manifest に載せ**、フロントとサーバーが別々の定数を持たないようにする(22 §12-7)
@@ -230,7 +230,7 @@ GET  /packs/{pack_id}/manifest.json             → 完成後の成果物(appが
 
 **パック用ナレーションは知識検索サブエージェントを使わない。**`faci_spot/spot_NNN.md` が 43 件すべてと 1:1 で対応しているので検索が要らず、1 パック 25〜80 アセットのバッチに反復検索は載らない。安全・季節の事実は `spots` の enrichment 列からコードが組み立てて渡す。
 
-- 知識MDはGit管理のファイルのまま(研究上、差分管理できる利点が大きい)。ただし**起動時/シード時にインデックスを構築して整合性を検証**する: **`spot_id` から引ける**ようにし(`knowledge_documents.spot_id`。**旧 `md_slug` は死んでいるので使わない** — [30_design/data_model.md §1.2](30_design/data_model.md))、どこからも参照されない孤児MD(現行60件中17件: 22 §6-5)を `python -m app.cli validate-knowledge` で報告する。ランタイム対象は `ja/` のみ(en/zh のMDはデータとして残すが、検証・生成の対象外)
+- 知識MDはGit管理のファイルのまま(差分管理できる利点が大きい)。ただし**起動時/シード時にインデックスを構築して整合性を検証**する: **`spot_id` から引ける**ようにし(`knowledge_documents.spot_id`。**旧 `md_slug` は死んでいるので使わない** — [30_design/data_model.md §1.2](30_design/data_model.md))、どこからも参照されない孤児MD(現行60件中17件: 22 §6-5)を `python -m app.cli validate-knowledge` で報告する。ランタイム対象は `ja/` のみ(en/zh のMDはデータとして残すが、検証・生成の対象外)
 - プロンプトは状況を**パラメータ化した単一テンプレート**に統合(現行の「言語×状況」6テンプレート全文コピー問題(22 §F-11)は、多言語スコープ外化と合わせて消滅)。状況別プロンプトにも知識コンテキストを渡す(現行は無視: 22 §F-12)
 - `<think>`タグ除去などモデル依存の後処理は `core/llm.py` に一元化(現行はプロンプト文言の正規表現コピーが散在: 22 §F-8)
 - 生成結果の検証(空文字・拒否応答・長さ逸脱)をTTSに流す前に行う
@@ -276,7 +276,7 @@ PostgreSQL 16 ×1台(`postgis/postgis` イメージ)。[ADR-0002](adr/0002-singl
 
 | Method/Path | 内容 |
 | --- | --- |
-| `POST /api/v1/users`, `POST /api/v1/login`, `GET /api/v1/users/{name}/session` | 現行踏襲(研究用簡易認証) |
+| `POST /api/v1/users`, `POST /api/v1/login`, `GET /api/v1/users/{name}/session` | 現行踏襲(簡易認証) |
 | `POST /api/v1/chat` | SSE(§4) |
 | `POST /api/v1/routes`, `GET /api/v1/routes/{id}` | 経路探索+永続化(§6) |
 | `POST /api/v1/packs`, `GET /api/v1/jobs/{id}` | パック生成ジョブ(§5) |
@@ -323,7 +323,7 @@ PostgreSQL 16 ×1台(`postgis/postgis` イメージ)。[ADR-0002](adr/0002-singl
 
 ## 12. 可観測性
 
-> **2026-08-01 改訂: 実験計測をスコープから外した。**NFR-7(計測可能性)を要求から削除し、`turn_metrics` / `unmodeled_log` テーブルと `export-metrics` CLI を廃止した。**研究データを DB に貯めて取り出す機能は作らない。**
+> **2026-08-01 改訂: 実験計測をスコープから外した。**NFR-7(計測可能性)を要求から削除し、`turn_metrics` / `unmodeled_log` テーブルと `export-metrics` CLI を廃止した。**計測データを DB に貯めて取り出す機能は作らない。**
 
 - 構造化ログ(JSON, stdout)。request_id をミドルウェアで採番しドメイン層まで伝播。`print` と `basicConfig` 副作用(22 §9)を全廃
 - デバイスUUID別ログファイル(FDリーク+パス注入: 22 §6-6)は廃止。リクエストログはサイズ制限つきの要約のみ
@@ -375,7 +375,7 @@ FR-1(推薦)・FR-2(プランニング)の手段は**現行方式を仮移植せ
 | 選択肢 | 不採用の理由 |
 | --- | --- |
 | マイクロサービス構成を維持して修繕 | 独立デプロイ・独立スケールの要求が存在しない(NFR-8)。1人開発では境界維持コストが変更容易性(NFR-1)を直接損なう。詳細: ADR-0001 |
-| Celery/Redis再導入(ジョブ基盤) | 研究規模にオーバーキル。過去に一度廃止済み。DBジョブテーブル+asyncioで要件を満たす。詳細: ADR-0003 |
+| Celery/Redis再導入(ジョブ基盤) | この規模にオーバーキル。過去に一度廃止済み。DBジョブテーブル+asyncioで要件を満たす。詳細: ADR-0003 |
 | LangGraph継続(薄く保つ) | 現行グラフは実質線形+分岐1つで、フレームワークの利得よりチェックポインタ誤用等の事故面が大きい。実験でグラフ構造が本当に必要になったら再導入を妨げない設計にする。詳細: ADR-0004 |
 | ChromaDB継続 | 会話長期記憶1コレクションのためだけの追加コンテナ+依存。長期記憶自体をスコープ外とした(00_project)ため機能ごと廃止。再導入時も同一DBへのpgvector拡張で足りる。詳細: ADR-0002 |
 | 別言語/別フレームワークへの全面書き換え | FastAPI/Vueは要求を満たしており、ドメインロジック(推薦・名寄せ・プロンプト)は資産として移植する。書き換えの利得がない |

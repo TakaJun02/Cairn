@@ -22,7 +22,7 @@
 > **体制**: 仕様設計・受け入れ = Fable 5 / 実装 = Sonnet 5 / **実装レビュー = Opus 5(Codex がリミットのため代行。ユーザー指示 2026-08-04)**。
 >
 > - **解消した 4 件**(詳細と正の文書は [25_known_issues.md §1](25_known_issues.md)): ① routes 404 競合(**ADR-0020**: route を専用短寿命 session で即時 commit。SSE 契約化)② 編集の勝手な入れ替え(**ADR-0021**: 集合固定 + `allow_refill`)③ 「確定」バッジ(廃止 + `assumptions` の「仮の前提あり」チップ)④ 既定起点の暗黙採用(廃止。起点未指定は ask_user で質問)
-> - **§4-1 認証も決着**: 研究プロトタイプとして保護なしを許容([10_requirements.md FR-5.2](10_requirements.md) に明記)
+> - **§4-1 認証も決着**: プロトタイプ段階として保護なしを許容([10_requirements.md FR-5.2](10_requirements.md) に明記)
 > - **レビューの主要指摘と対処**: Critical 1(集合固定が順序まで固定 → `removal_protected_spot_ids` 新設で是正)/ High 3(接続プール枯渇 → OSRM を session 外 + Semaphore 4、プロンプトの起点矛盾 → 統一、data_model 追従)。全て修正・再テスト済み
 > - **テスト**: バックエンド(app コンテナ内)374 passed / フロント 34 passed / vite build 成功 / ruff 新規違反ゼロ
 > - **実機確認**(新規ユーザー通し): 経路 GET 全件一発 200・コンソールエラー 0 / 起点の HITL 質問 / 「仮の前提あり」チップ / 編集 diff が削除 1 件のみ
@@ -136,7 +136,7 @@
 
 ### A0-3. NFR-7(計測可能性)を削除し、会話履歴の構築方式を決めた(2026-08-01)
 
-**NFR-7 を要求から削除した。**研究データを DB に貯めて取り出す機能は作らない。廃止したもの: `turn_metrics` / `unmodeled_log` テーブル、`export-metrics` CLI、SSE `done` の `metrics`、[recommendation_planning.md §7](30_design/recommendation_planning.md) の「層 0 システム計測」。**残るのは構造化ログ(stdout)だけ**で、縮退の明示は NFR-5 が引き続き要求する。反映済み: `10_requirements.md` / `20_architecture.md` / `agent_planning_phase.md`(§10 を全面改訂)/ `recommendation_planning.md` / `understand_node.md` / ADR-0004・0006・0008・0009・0010。**NFR の番号は詰めていない**(NFR-8・NFR-9 への参照があるため)。
+**NFR-7 を要求から削除した。**計測データを DB に貯めて取り出す機能は作らない。廃止したもの: `turn_metrics` / `unmodeled_log` テーブル、`export-metrics` CLI、SSE `done` の `metrics`、[recommendation_planning.md §7](30_design/recommendation_planning.md) の「層 0 システム計測」。**残るのは構造化ログ(stdout)だけ**で、縮退の明示は NFR-5 が引き続き要求する。反映済み: `10_requirements.md` / `20_architecture.md` / `agent_planning_phase.md`(§10 を全面改訂)/ `recommendation_planning.md` / `understand_node.md` / ADR-0004・0006・0008・0009・0010。**NFR の番号は詰めていない**(NFR-8・NFR-9 への参照があるため)。
 
 **会話履歴を「近いほど詳しい 3 層」で構築すると決めた**([agent_planning_phase.md §7](30_design/agent_planning_phase.md))。直近 3 ターンは user も assistant も生テキスト、それ以前は user 発話は生 + assistant はイベント要約 1 行、予算(4,000 トークン)超過分は古い順に破棄。**要約 LLM は呼ばない**(イベント要約は `messages.meta` からコードが組み立てる)。
 

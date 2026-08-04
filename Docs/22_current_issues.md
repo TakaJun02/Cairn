@@ -74,7 +74,7 @@
 | # | 所見 | 根拠 |
 | --- | --- | --- |
 | 6-1 | `osrm_client.py` は `logging` をimportせず `logger.warning/error` を3箇所で呼ぶ→**NameError**。外側exceptに飲まれ、「到達許容誤差超え」判定が本来と別経路で成立 | `osrm_client.py:126,136,141` |
-| 6-2 | リアルタイム情報が欠損時、**`random.randint`で天気・混雑を捏造してDBに永続化**。研究データが乱数で汚染される | `realtime_router.py:69-71,82-83` |
+| 6-2 | リアルタイム情報が欠損時、**`random.randint`で天気・混雑を捏造してDBに永続化**。データが乱数で汚染される | `realtime_router.py:69-71,82-83` |
 | 6-3 | access_points DB障害時、「目的地の東0.01度」という無意味な座標をトレイルヘッドとしてフォールバックし経路生成 | `routing/logic.py:96-106` |
 | 6-4 | `car_to_trailhead`/`return_to_origin` はリクエストで受けるが**参照されない**(Gatewayは常にTrue注入) | `routing/main.py:35-36,120-128` |
 | 6-5 | 知識ベースの`md_slug`はnav→llmまで運ばれるが**retrieverが使わない**。さらにinitスクリプトは存在しないディレクトリを検証するため`md_slug`は常にNULL投入。結果、**知識MD 60件中17件が永久に到達不能** | `llm/retriever.py:76`, `script/init_static_db.py:314-317` |

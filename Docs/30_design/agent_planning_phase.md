@@ -399,7 +399,7 @@ flowchart TD
 | **`constraints`** | **`itineraries` 行**(version ごと) | **旅程の寿命**(§4.4) | ソルバーのペナルティ |
 | `unmodeled`(反映できなかった要望) | **どこにも保存しない** | そのターン限り | `respond` が「これは反映できませんでした」と伝えるためだけに使う([recommendation_planning.md §4.4](recommendation_planning.md) 経路 4) |
 
-> **2026-08-01 改訂**: NFR-7(計測可能性)の削除に伴い、`turn_metrics` テーブルと `unmodeled_log` テーブルを廃止した。**研究データを DB に貯めて取り出す仕組みは作らない。**縮退・破棄・失敗は構造化ログ(stdout)に出す([20_architecture.md §12](../20_architecture.md))。
+> **2026-08-01 改訂**: NFR-7(計測可能性)の削除に伴い、`turn_metrics` テーブルと `unmodeled_log` テーブルを廃止した。**計測データを DB に貯めて取り出す仕組みは作らない。**縮退・破棄・失敗は構造化ログ(stdout)に出す([20_architecture.md §12](../20_architecture.md))。
 
 **プロセス内キャッシュは持たない。**状態は毎ターン DB から再構築する([ADR-0004](../adr/0004-conversation-pipeline.md))。旧実装の `MemorySaver` が起こした「session_id が全ユーザー共通になる」型の事故を構造的に不可能にするため。
 
@@ -715,7 +715,7 @@ FR-3.3(無言の握り潰しをしない)と NFR-5(障害の局所化)に対応�
 
 ## 10. ログ(計測テーブルは持たない)
 
-> **2026-08-01 全面改訂。**旧 §10 は `turn_metrics` テーブルの列定義だった。**NFR-7(計測可能性)を要求から削除した**ため、計測テーブル・`unmodeled_log`・`export-metrics` CLI をすべて廃止する。**研究データを DB に貯めて取り出す仕組みは作らない。**
+> **2026-08-01 全面改訂。**旧 §10 は `turn_metrics` テーブルの列定義だった。**NFR-7(計測可能性)を要求から削除した**ため、計測テーブル・`unmodeled_log`・`export-metrics` CLI をすべて廃止する。**計測データを DB に貯めて取り出す仕組みは作らない。**
 
 残るのは**動かないときに原因を見るための構造化ログ**(JSON, stdout)だけである。これは NFR-5(縮退は必ず明示する)と FR-3.3(障害を握り潰さない)が引き続き要求するもので、NFR-7 の削除では消えない。
 
@@ -989,7 +989,7 @@ TurnState = {
 
 ### 15.8 補助図 — LLM とコードの境界
 
-§15.3 がグラフの形を示すのに対し、こちらは**同じものを「どこまでを LLM に任せるか」の軸で切った図**である。研究上の根拠([recommendation_planning.md](recommendation_planning.md) §2.2)がすべて「LLM に何をさせないか」に関するものだったので、この軸の図も併記しておく。
+§15.3 がグラフの形を示すのに対し、こちらは**同じものを「どこまでを LLM に任せるか」の軸で切った図**である。根拠([recommendation_planning.md](recommendation_planning.md) §2.2)がすべて「LLM に何をさせないか」に関するものだったので、この軸の図も併記しておく。
 
 ```mermaid
 flowchart TB
@@ -1766,7 +1766,7 @@ Part II の 5 論点、`understand` から派生した 3 件、[agent_patterns_s
 | **同一 GPU への LLM 呼び出しの並列化** | 総スループットは上がっても個々の TTFT が悪化しうる。しかも本件の GPU は他プロセスと共有している。**§17 案 1(`understand` の並列二分割)も、この理由で「計測してから」のままにする** |
 | **`understand` に自由記述の「考える欄」を置く** | §3.1.1 の並び替えで、抽出フィールド自体が構造化された思考の場になっている。自由文はトークンとレイテンシを増やし、どこにも接地しないフィールドを 1 つ増やす |
 | **常時の self-consistency / LLM critic / reflection** | いずれも 1 ターン 2〜3 回という予算を壊す。型・参照・DSL 規則で判定できるものはコードで足りる |
-| **span / OpenTelemetry の先行導入** | 単一プロセスの研究プロトタイプには構造化ログ(§10)で足りる。GenAI semantic conventions は status が Development。**実装後に必要になったら足す**(2026-08-01: NFR-7 削除で計測そのものをやめたため、さらに不要になった) |
+| **span / OpenTelemetry の先行導入** | 単一プロセスの本システムには構造化ログ(§10)で足りる。GenAI semantic conventions は status が Development。**実装後に必要になったら足す**(2026-08-01: NFR-7 削除で計測そのものをやめたため、さらに不要になった) |
 
 ### 24.3 「分からないときに聞ける」という能力(2026-07-31 追加 → 2026-08-03 改訂)
 

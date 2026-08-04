@@ -2,7 +2,7 @@
 
 - 状態: **決定稿 (2026-08-01)** / **改訂 2026-08-04([ADR-0019](../adr/0019-react-main-agent-subagents.md): 内側 Tool に `ask_user` を追加、呼び出し元が ReAct メインエージェントに変わった。検索・停止条件・縮退の中身は不変)**
 - 前提: [ADR-0011](../adr/0011-knowledge-search-subagent.md)(Agent as a Tool として切り出す)/ [ADR-0012](../adr/0012-knowledge-retrieval-pgvector.md)(pgvector + Qwen3-Embedding-8B)/ [agent_react_architecture.md](agent_react_architecture.md)(メインエージェント)/ [data_model.md](data_model.md)
-- 参考にした先行実装: **[TakaJun02/sarutahiko](https://github.com/TakaJun02/sarutahiko)**(同一研究室の別プロジェクト。`docs/AGENT_REACT.md` / `docs/KNOWLEDGE.md` / `backend/app/rag/`。**コードを直接読んで確認した**、2026-08-01)
+- 参考にした先行実装: **[TakaJun02/sarutahiko](https://github.com/TakaJun02/sarutahiko)**(同じ開発元の別プロジェクト。`docs/AGENT_REACT.md` / `docs/KNOWLEDGE.md` / `backend/app/rag/`。**コードを直接読んで確認した**、2026-08-01)
 
 ---
 

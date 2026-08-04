@@ -409,7 +409,7 @@ CREATE TABLE app.users (
 );
 ```
 
-研究用の簡易識別(FR-5.1)。
+簡易識別(FR-5.1)。
 
 **`api_token` は [40_api/chat_sse.md §4](../40_api/chat_sse.md) の決定で追加した(2026-08-01)。**1 ユーザー 1 スレッドにした以上、`GET /api/v1/thread` が「誰なのか」を特定できないと成立しない。旧実装の `GET /users/{name}/session` は**他人の名前を入れれば他人の会話が読める**形だったので、パスからユーザー名を外し、Bearer トークンで識別する。
 
