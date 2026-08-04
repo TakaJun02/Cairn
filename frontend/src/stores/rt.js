@@ -23,6 +23,7 @@
 
 import { defineStore } from 'pinia'
 import { fetchSpotRT } from '@/lib/realtime' // @ は src エイリアス想定。未設定なら相対に変更: '../lib/realtime'
+import { applyDownlinkToSpotMap } from '@/lib/realtimeDownlink'
 
 const POLL_INTERVAL_MS = 60_000
 
@@ -47,10 +48,18 @@ export const useRtStore = defineStore('rt', {
     notifyLog: [],
     /** @type {number|null} */
     timerId: null,
+    /** @type {boolean} */
+    pollingActive: false,
+    /** @type {number} */
+    pollingGeneration: 0,
     /** @type {number} */
     cursor: 0,
     /** @type {string[]} */
-    spotOrder: []
+    spotOrder: [],
+    /** @type {boolean} */
+    stale: false,
+    /** @type {number|null} */
+    lastReceivedAt: null,
   }),
 
   getters: {
@@ -85,20 +94,23 @@ export const useRtStore = defineStore('rt', {
      * @param {WaypointRef[]} waypoints
      */
     startPolling(waypoints) {
-      this.setSpotOrder(waypoints)
       // 既に動作中なら一旦止める
       this.stopPolling()
+      this.setSpotOrder(waypoints)
       if (this.spotOrder.length === 0) {
         return
       }
+      this.pollingActive = true
       // すぐに1回叩いてからスケジュール
-      this._tickAndSchedule()
+      this._tickAndSchedule(this.pollingGeneration)
     },
 
     /**
      * 停止
      */
     stopPolling() {
+      this.pollingActive = false
+      this.pollingGeneration += 1
       if (this.timerId !== null) {
         clearTimeout(this.timerId)
         this.timerId = null
@@ -108,11 +120,13 @@ export const useRtStore = defineStore('rt', {
     /**
      * 内部：tick実行後、次回を予約
      */
-    _tickAndSchedule() {
+    _tickAndSchedule(generation = this.pollingGeneration) {
+      if (!this.pollingActive || generation !== this.pollingGeneration) return
       // 実行
       this.tick().finally(() => {
+        if (!this.pollingActive || generation !== this.pollingGeneration) return
         // ドリフトを避けるため setTimeout で逐次スケジュール
-        this.timerId = setTimeout(() => this._tickAndSchedule(), POLL_INTERVAL_MS)
+        this.timerId = setTimeout(() => this._tickAndSchedule(generation), POLL_INTERVAL_MS)
       })
     },
 
@@ -158,43 +172,11 @@ export const useRtStore = defineStore('rt', {
       }
     },
 
-    /**
-     * LoRaなど外部ソースから受信したRTDocを反映する
-     * @param {RTDoc} next
-     */
-    processRtDoc(next) {
-      if (!next || typeof next !== 'object') return
-      const spotId = String(next.s || next.spot_id || '')
-      if (!spotId) return
-
-      const normalized = {
-        s: spotId,
-        w: Number(next.w ?? 0),
-        u: Number(next.u ?? 0),
-        h: typeof next.h === 'number' ? next.h : undefined,
-        c: Number(next.c ?? 0),
-      }
-
-      const prev = this.lastBySpot[spotId] ?? null
-      const changed = !this._isSame(prev, normalized)
-
-      console.debug('[rt-store] processRtDoc', {
-        spotId,
-        prev,
-        normalized,
-        changed,
-      })
-
-      this.lastBySpot[spotId] = normalized
-
-      if (changed) {
-        this.notifyLog.push({
-          spot_id: spotId,
-          prev,
-          next: normalized,
-          at: Date.now(),
-        })
-      }
+    /** LoRa ダウンリンクを manifest.spots の順に適用する。 */
+    applyDownlink(payload, manifest) {
+      const result = applyDownlinkToSpotMap(this.lastBySpot, payload, manifest)
+      this.stale = result.stale
+      if (result.applied) this.lastReceivedAt = result.receivedAt
     },
 
     /**
@@ -246,6 +228,10 @@ export const useRtStore = defineStore('rt', {
       this.notifyLog = []
       this.cursor = 0
       this.spotOrder = []
+      this.pollingActive = false
+      this.pollingGeneration += 1
+      this.stale = false
+      this.lastReceivedAt = null
     }
   }
 })

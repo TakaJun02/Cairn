@@ -1,184 +1,236 @@
-
 // src/lib/api.js
-import { useNavStore } from '@/stores/nav';
 
-const BACK_BASE = '/back';              // Nginxで /back → APIゲートウェイにリバースプロキシ
-const API_BASE  = `${BACK_BASE}/api`;
+const configuredBase = import.meta.env?.VITE_API_BASE ?? '/api/v1'
+export const API_BASE = String(configuredBase || '/api/v1').replace(/\/+$/, '')
 
-async function apiFetch(path, opts = {}) {
-  const navStore = useNavStore();
-  let url = `${API_BASE}${path}`;
-
-  // Inject deviceId as a query parameter for all requests
-  if (navStore.deviceId) {
-    const separator = url.includes('?') ? '&' : '?';
-    url += `${separator}uuid=${navStore.deviceId}`;
+function storedToken() {
+  if (typeof sessionStorage === 'undefined') return ''
+  try {
+    return JSON.parse(sessionStorage.getItem('user') || 'null')?.token || ''
+  } catch {
+    return ''
   }
+}
 
-  const headers = {
-    'Content-Type': 'application/json',
-    ...(opts.headers || {}),
-  };
+export function apiUrl(path) {
+  return `${API_BASE}/${String(path).replace(/^\/+/, '')}`
+}
+
+export function bearerHeaders(token = storedToken()) {
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
+export async function apiFetch(path, opts = {}) {
+  const {
+    auth = true,
+    headers: optionHeaders = {},
+    ...requestOptions
+  } = opts
+  const headers = new Headers(optionHeaders)
+
+  if (requestOptions.body != null && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+  if (auth && !headers.has('Authorization')) {
+    const token = storedToken()
+    if (token) headers.set('Authorization', `Bearer ${token}`)
+  }
 
   const init = {
     method: 'GET',
-    ...opts,
+    ...requestOptions,
     headers,
-  };
-
-  // For non-GET requests, also inject deviceId into the body if it exists
-  if (init.method.toUpperCase() !== 'GET' && init.body) {
-    try {
-      const payload = JSON.parse(init.body);
-      if (navStore.deviceId) {
-        payload.uuid = navStore.deviceId;
-      }
-      init.body = JSON.stringify(payload);
-    } catch (e) {
-      console.error('Failed to inject deviceId into request body', e);
-    }
   }
 
-  console.debug('[api]', init.method, path);
-  const res = await fetch(url, init);
-  const txt = await res.text();
-  let body;
-  try { body = txt ? JSON.parse(txt) : {}; } catch { body = txt; }
-  console.debug('[api]', init.method, 'status', res.status);
-  if (res.status >= 400) { // Removed status 202 from special cases
-    const err = new Error(`HTTP ${res.status}`);
-    err.status = res.status;
-    err.body = body;
-    throw err;
+  console.debug('[api]', init.method, path)
+  const res = await fetch(apiUrl(path), init)
+  const text = res.status === 204 || res.status === 304 ? '' : await res.text()
+  let body = null
+  try {
+    body = text ? JSON.parse(text) : null
+  } catch {
+    body = text
   }
-  return { status: res.status, body };
+
+  console.debug('[api]', init.method, 'status', res.status)
+  if (!res.ok && res.status !== 304) {
+    const detail = typeof body?.detail === 'string'
+      ? body.detail
+      : body?.detail?.message
+    const error = new Error(detail || `HTTP ${res.status}`)
+    error.status = res.status
+    error.body = body
+    throw error
+  }
+  return { status: res.status, body, headers: res.headers }
 }
 
-/** POST /route → 経路計画を同期取得 */
+/** POST /routes をレッグごとに呼び、既存ナビ画面向けの形へ結合する。 */
 export async function createRoutePlan(options) {
-  if (!options) throw new Error('options is required');
-  const {
-    language,
-    origin,
-    waypoints,
-    return_to_origin = true,
-  } = options;
-  const payload = {
-    language,
-    origin,
-    waypoints: (waypoints || []).map((w) => ({ spot_id: w.spot_id })),
-    return_to_origin,
-  };
-  const { status, body } = await apiFetch('/route', {
+  if (!options?.origin) throw new Error('origin is required')
+  const waypointIds = (options.waypoints || []).map((value) => value?.spot_id).filter(Boolean)
+  if (waypointIds.length === 0) throw new Error('waypoints are required')
+
+  const endpoints = [
+    { lat: options.origin.lat, lon: options.origin.lon },
+    ...waypointIds.map((spotId) => ({ spot_id: spotId })),
+  ]
+  if (options.return_to_origin !== false) {
+    endpoints.push({ lat: options.origin.lat, lon: options.origin.lon })
+  }
+
+  const legs = await Promise.all(
+    endpoints.slice(0, -1).map((from, index) => createRoute(from, endpoints[index + 1]))
+  )
+
+  return {
+    feature_collection: {
+      type: 'FeatureCollection',
+      features: legs.flatMap((leg) => leg.geojson?.features || []),
+    },
+    segments: legs.flatMap((leg) => leg.segments || []),
+    legs,
+    waypoints_info: waypointIds.map((spotId) => ({ spot_id: spotId, name: spotId })),
+  }
+}
+
+export async function createRoute(from, to) {
+  const { status, body } = await apiFetch('/routes', {
+    method: 'POST',
+    body: JSON.stringify({ from, to }),
+  })
+  if (status !== 200) throw new Error(`unexpected status ${status}`)
+  return body
+}
+
+export async function getRoute(routeId) {
+  // ADR-0020: `state:itinerary`(final)送出時点で route は commit 済みの
+  // はず(サーバー側の契約)。それでも 404 が来た場合に備え、呼び出し側
+  // (stores/nav.js)が「404 のときだけ」短い再試行を行えるよう、投げる
+  // Error には必ず HTTP status を持たせる(`apiFetch` が非 2xx を投げる際に
+  // 既に `error.status` を付けるが、ここでも明示して契約を保証する)。
+  const { status, body } = await apiFetch(`/routes/${encodeURIComponent(routeId)}`)
+  if (status !== 200) {
+    const error = new Error(`unexpected status ${status}`)
+    error.status = status
+    throw error
+  }
+  return body
+}
+
+export async function createPack(itineraryVersion, options = null) {
+  const payload = { itinerary_version: itineraryVersion }
+  if (options) payload.options = options
+  const { status, body } = await apiFetch('/packs', {
     method: 'POST',
     body: JSON.stringify(payload),
-  });
-  if (status !== 200) throw new Error(`unexpected status ${status}`);
-  return body;
+  })
+  if (status !== 202) throw new Error(`unexpected status ${status}`)
+  return body
 }
 
-/** POST /nav/plan → PlanResponse (200) */
-async function createNavigationPlan(routePayload) {
-  const { status, body } = await apiFetch('/nav/plan', {
-    method: 'POST',
-    body: JSON.stringify(routePayload),
-  });
-  if (status !== 200) throw new Error(`unexpected status ${status}`);
-  return body; // Returns the full plan
+export async function getPackJob(jobId) {
+  const { status, body } = await apiFetch(`/jobs/${encodeURIComponent(jobId)}`)
+  if (status !== 200) throw new Error(`unexpected status ${status}`)
+  return body
 }
 
-/**
- * 互換用: 旧 createPlan は Routing→NAV を一括実行していた。
- * 分離後も呼び出し箇所を壊さないよう、入力内容を見て適切に委譲する。
- */
-export async function createPlan(payload) {
-  if (!payload) throw new Error('payload is required');
-
-  // 新形式: 既に routing 結果を含む場合はそのまま NAV タスクを開始
-  if (payload.route || payload.polyline || payload.segments || payload.legs) {
-    const navPayload = {
-      buffer: payload.buffer || { car: 300, foot: 10 },
-      ...payload,
-    };
-    // Directly call the new synchronous function
-    return createNavigationPlan(navPayload);
-  }
-
-  // 旧形式: routing 未実行の場合はここで routing → NAV を直列で呼び出す
-  const routeResult = await createRoutePlan(payload);
-  const navPayload = {
-    language: payload.language,
-    buffer: payload.buffer || { car: 300, foot: 10 },
-    route: routeResult.feature_collection,
-    polyline: routeResult.polyline,
-    segments: routeResult.segments,
-    legs: routeResult.legs,
-    waypoints_info: routeResult.waypoints_info,
-  };
-  // Directly call the new synchronous function
-  return createNavigationPlan(navPayload);
+export async function getPack(packId) {
+  const { status, body } = await apiFetch(`/packs/${encodeURIComponent(packId)}`)
+  if (status !== 200) throw new Error(`unexpected status ${status}`)
+  return body
 }
 
-// --- Realtime (LoRaWAN/MQTT) ---
+export async function fetchPackJson(path) {
+  const response = await fetch(path, { cache: 'no-cache' })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  return response.json()
+}
+
+// 既存の NavStore 呼び出し名は残し、非同期パック API へ接続する。
+export async function createPlan(itineraryVersion, options = null) {
+  return createPack(itineraryVersion, options)
+}
+
+// --- Realtime (計画フェーズ表示用) ---
 export async function fetchRealtimeBySpotId(spotId, opts = {}) {
   const headers = {}
-  if (opts && Object.prototype.hasOwnProperty.call(opts, 'etag')) {
+  if (Object.prototype.hasOwnProperty.call(opts, 'etag')) {
     headers['If-None-Match'] = String(opts.etag)
   }
 
-  const requestOptions = Object.keys(headers).length ? { headers } : {}
-
-  const { status, body } = await apiFetch(`/rt/spot/${encodeURIComponent(spotId)}`, requestOptions);
-  if (status === 204 || status === 304) {
-    return { status, body: null }
-  }
+  const { status, body } = await apiFetch(
+    `/realtime/spots/${encodeURIComponent(spotId)}`,
+    { headers }
+  )
+  if (status === 204 || status === 304) return { status, body: null }
   return { status, body }
 }
 
-// Obsolete polling functions and aliases are removed.
-
 // --- User Authentication ---
 
-/** POST /v1/users -> ユーザー新規作成 */
-export async function createUser(userName, language = 'ja') {
-  const { status, body } = await apiFetch('/v1/users', {
-    method: 'POST',
-    body: JSON.stringify({ user_name: userName, language }),
-  });
-  if (status !== 201) throw new Error(`unexpected status ${status}`);
-  return body;
-}
-
-/** POST /v1/login -> ログイン */
-export async function loginUser(userName) {
-  const { status, body } = await apiFetch('/v1/login', {
+export async function createUser(userName) {
+  const { status, body } = await apiFetch('/users', {
+    auth: false,
     method: 'POST',
     body: JSON.stringify({ user_name: userName }),
-  });
-  if (status !== 200) throw new Error(`unexpected status ${status}`);
-  return body;
+  })
+  if (status !== 201) throw new Error(`unexpected status ${status}`)
+  return body
 }
 
-/** GET /v1/users/{user_name}/session -> セッション復元 */
-export async function getUserSession(userName) {
-  const { status, body } = await apiFetch(`/v1/users/${encodeURIComponent(userName)}/session`, {
-    method: 'GET',
-  });
-  if (status !== 200) throw new Error(`unexpected status ${status}`);
-  return body;
+export async function loginUser(userName) {
+  const { status, body } = await apiFetch('/login', {
+    auth: false,
+    method: 'POST',
+    body: JSON.stringify({ user_name: userName }),
+  })
+  if (status !== 200) throw new Error(`unexpected status ${status}`)
+  return body
 }
 
-/** POST /v1/chat -> AIエージェントとの会話 */
-export async function sendChatMessage(userName, userInput, threadId) {
-  const payload = {
-    user_name: userName,
-    user_input: userInput,
-    thread_id: threadId,
-  };
-  const { status, body } = await apiFetch('/v1/chat', {
+export async function getThread() {
+  const { status, body } = await apiFetch('/thread')
+  if (status !== 200) throw new Error(`unexpected status ${status}`)
+  return body
+}
+
+/**
+ * ask_user への回答(chat_sse.md §1.4)。204 のみ成功。イベントは元の SSE
+ * ストリームに流れるので、ここでは応答ボディを返さない。
+ * `payload.resolves` はチップ経由のときだけ付ける({surface,value} または
+ * {slot,value})。回答を待つターンが無ければ 409(呼び出し側で処理する)。
+ */
+export async function postChatAnswer(payload) {
+  const { status } = await apiFetch('/chat/answer', {
     method: 'POST',
     body: JSON.stringify(payload),
-  });
-  if (status !== 200) throw new Error(`unexpected status ${status}`);
-  return body;
+  })
+  if (status !== 204) throw new Error(`unexpected status ${status}`)
+  return true
+}
+
+export async function getSpots(etag = null) {
+  const headers = etag ? { 'If-None-Match': etag } : {}
+  const { status, body, headers: responseHeaders } = await apiFetch('/spots', { headers })
+  return {
+    status,
+    spots: status === 304 ? null : body,
+    etag: responseHeaders.get('ETag') || etag,
+  }
+}
+
+export async function getItinerary() {
+  const { status, body } = await apiFetch('/itinerary')
+  if (status !== 200) throw new Error(`unexpected status ${status}`)
+  return body
+}
+
+export async function undoItinerary(expectedCurrentVersion) {
+  const { status, body } = await apiFetch('/itinerary/undo', {
+    method: 'POST',
+    body: JSON.stringify({ expected_current_version: expectedCurrentVersion }),
+  })
+  if (status !== 200) throw new Error(`unexpected status ${status}`)
+  return body
 }

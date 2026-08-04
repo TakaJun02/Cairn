@@ -1,105 +1,98 @@
+# =============================================================================
+#  guidanceLLM2 — 統合開発環境
+# =============================================================================
+#  設定の置き場所（Docs/20_architecture.md §11）
+#    .env                     秘密・環境固有値のみ（API キー / パスワード / IP を含む URL）
+#    このファイル             接続先のトポロジ（どのコンテナがどこに居るか）
+#    app/core/config.py       それ以外の既定値。変えたい人だけ .env で上書きする
+#
+#  コードはイメージに焼かずマウントする。イメージが持つのは依存関係だけなので、
+#  backend / frontend のコードを直しても再ビルドは要らない（app は --reload で拾う）。
+#  再ビルドが要るのは pyproject.toml の依存を変えたときだけ。
+# =============================================================================
+
 services:
-  # === Vector DB ===
-  chromadb:
-    image: chromadb/chroma:0.6.3   # バージョンを明示推奨
-    ports:
-      - "8001:8000"   # ホスト8000はvLLMが使用するため8001に公開
-    volumes:
-      - chromadb_data:/chroma/chroma  # データ永続化フォルダ
+  # === PostgreSQL 16 + PostGIS + pgvector ===
+  #  Docs/50_operations/database.md。秘密は POSTGRES_PASSWORD だけなので
+  #  env_file は渡さない（Tavily キーなどを DB コンテナに持ち込まない）
+  db:
+    image: guidance-postgres:16-3.4-pgvector
+    build:
+      context: ./docker/postgres
     environment:
-      - IS_PERSISTENT=TRUE
-      - PERSIST_DIRECTORY=/chroma/chroma
-      - ANONYMIZED_TELEMETRY=TRUE
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-
-  # === Static DB (POI / access_points) ===
-  static-db:
-    image: postgis/postgis:16-3.4
-    env_file:
-      - .env
-    ports:
-      - "5432:5432"       # ローカルから接続したい場合（不要なら消してください）
+      #  DB 名・ユーザー名はプロジェクトの定数として固定する。秘密でも環境依存でもなく、
+      #  pgdata の初期化時に焼き付くので後から変えても壊れるだけだから（.env で扱わない）
+      POSTGRES_DB: guidance
+      POSTGRES_USER: guidance
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD を .env に設定してください（.env.example 参照）}
     volumes:
-      - pgdata_static:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U static_db -d static_db"]
+      test:
+        - CMD-SHELL
+        - pg_isready -U guidance -d guidance
       interval: 5s
       timeout: 5s
       retries: 20
     restart: unless-stopped
 
-  # === App DB (users / conversations) ===
-  app-db:
-    image: postgres:16-alpine
+  # === FastAPI モジュラモノリス ===
+  #  イメージは Python 依存のためだけにある。コードは ./backend のマウントが
+  #  イメージ内の同じパスを覆い、ホスト側の編集がそのまま動く
+  app:
+    build:
+      context: .
+      dockerfile: ./backend/Dockerfile.app
+    #  ホストの vLLM（127.0.0.1:8000）と、ホストへ公開した db / OSRM に届かせるため
+    network_mode: host
     env_file:
       - .env
     environment:
-      POSTGRES_USER: ${APP_DB_USER:-app_user}
-      POSTGRES_PASSWORD: ${APP_DB_PASSWORD:-app_password}
-      POSTGRES_DB: ${APP_DB_NAME:-app_db}
-    ports:
-      - "5433:5432" # static-dbとのポート衝突を避ける
+      # --- トポロジ: compose が決める値。.env には置かない ---
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: 5432
+      #  db サービスと同じ固定値。古い .env が残っていてもここが必ず勝つ
+      POSTGRES_DB: guidance
+      POSTGRES_USER: guidance
+      OSRM_CAR_URL: http://127.0.0.1:5001
+      OSRM_FOOT_URL: http://127.0.0.1:5002
+      PACKS_ROOT: /packs
+      # マウントしたコードを site-packages の同名パッケージより優先させる
+      PYTHONPATH: /app/backend
+      # --- 開発環境としての既定。必要な人だけ .env で上書きする ---
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:5173}
     volumes:
-      - pgdata_app:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${APP_DB_USER:-app_user} -d ${APP_DB_NAME:-app_db}"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-    restart: unless-stopped
-
-  # 初期データ投入（POI / facilities / access_points）
-  static-db-init:
-    build:
-      context: .
-      dockerfile: ./backend/script/Dockerfile.init
-    depends_on:
-      static-db:
-        condition: service_healthy
-    working_dir: /app/backend
-    env_file:
-      - .env
-    volumes:
-      - ./backend:/app/backend   # ← COPY せず volume で
-    command: >
-      bash -lc "
-        set -euo pipefail;
-        echo '--- Waiting for Static DB...';
-        sleep 5;
-        echo '--- Running Static DB init script...';
-        python -B script/init_static_db.py
-      "
-
-  # App DBのテーブル作成
-  app-db-init:
-    build:
-      context: .
-      dockerfile: ./backend/script/Dockerfile.init
-    depends_on:
-      app-db:
-        condition: service_healthy
-    working_dir: /app/backend
-    env_file:
-      - .env
-    volumes:
+      #  コード・マイグレーション・シード・知識データをまとめてマウントする
+      #  （backend/data/map も含むので BUILD を個別にマウントする必要はない）
       - ./backend:/app/backend
-    command: >
-      bash -lc "
-        set -euo pipefail;
-        echo '--- Waiting for App DB...';
-        sleep 5;
-        echo '--- Running App DB init script...';
-        python -B script/init_app_db.py;
-        echo '--- Ensuring spot_realtime table exists...';
-        python -B script/init_spot_realtime.py
-      "
-  
+      - packs_data:/packs
+    depends_on:
+      db:
+        condition: service_healthy
+      osrm-car:
+        condition: service_healthy
+      osrm-foot:
+        condition: service_healthy
+    working_dir: /app/backend
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8090"
+      - --log-config
+      - logging.json
+      - --no-access-log
+      - --reload
+      - --reload-dir
+      - /app/backend/app
+    restart: unless-stopped
+
   # === OSRM (car / foot) ===
   # データは scripts/build_osrm.sh で鳥海山エリアに切り出したもの（ADR-0014 / Docs/50_operations/osrm.md）
   osrm-car:
@@ -111,7 +104,12 @@ services:
       - "5001:5000"
     healthcheck:
       # 静的な ok ではなく実際のルート照会で見る（22 §6-11）。あがりこ大王 → 鳥海高原家族旅行村
-      test: ["CMD-SHELL", "curl -sf 'http://localhost:5000/route/v1/car/140.0244,39.1594;140.0354,39.0342' | grep -q '\"code\":\"Ok\"'"]
+      test:
+        - CMD-SHELL
+        - >-
+          bash -ec 'exec 3<>/dev/tcp/127.0.0.1/5000;
+          printf "GET /route/v1/car/140.0244,39.1594;140.0354,39.0342?overview=false HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3;
+          grep -q "\"code\":\"Ok\"" <&3'
       interval: 30s
       timeout: 5s
       retries: 10
@@ -125,135 +123,34 @@ services:
     ports:
       - "5002:5000"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf 'http://localhost:5000/route/v1/foot/140.0244,39.1594;140.0354,39.0342' | grep -q '\"code\":\"Ok\"'"]
+      test:
+        - CMD-SHELL
+        - >-
+          bash -ec 'exec 3<>/dev/tcp/127.0.0.1/5000;
+          printf "GET /route/v1/foot/140.0244,39.1594;140.0354,39.0342?overview=false HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3;
+          grep -q "\"code\":\"Ok\"" <&3'
       interval: 30s
       timeout: 5s
       retries: 10
     restart: unless-stopped
-  
-  # === API Gateway (フロント直結) ===
-  api:
-    build:
-      context: .
-      dockerfile: ./backend/Dockerfile
-    env_file:
-      - .env
-    volumes:
-      - ./backend:/app/backend
-    depends_on:
-      static-db:
-        condition: service_healthy
-      app-db:
-        condition: service_healthy
-      svc-nav:
-        condition: service_started
-      svc-agent: # AIエージェントサービスに依存
-        condition: service_started
-    command: bash -lc "uvicorn backend.api.main:app --host 0.0.0.0 --port 8080 --log-level debug"
-    ports:
-      - "8080:8080"
-    restart: unless-stopped
 
   # === Frontend (Vite dev server) ===
+  #  イメージは素の node。依存は named volume の node_modules に入れる
   frontend:
     image: node:20-alpine
+    network_mode: host
     working_dir: /app/frontend
+    environment:
+      #  未設定なら Vite の proxy 経由（/api/v1 → localhost:8090）になる
+      VITE_API_BASE: ${VITE_API_BASE:-}
     volumes:
       - ./frontend:/app/frontend
       - frontend_node_modules:/app/frontend/node_modules
-    ports:
-      - "5173:5173"
     command: sh -lc "npm install && npm run dev -- --host 0.0.0.0"
     depends_on:
-      - api
+      - app
 
-  # === Worker側のマイクロサービス===
-  svc-routing:
-    build: { context: ., dockerfile: ./backend/Dockerfile }
-    command: bash -lc "uvicorn backend.worker.app.services.routing.main:app --host 0.0.0.0 --port 9101"
-    env_file:
-      - .env
-    volumes:
-      - ./backend:/app/backend
-    depends_on: [osrm-car, osrm-foot, static-db]
-    ports: ["9101:9101"]
-
-  svc-alongpoi:
-    build: { context: ., dockerfile: ./backend/Dockerfile }
-    command: bash -lc "uvicorn backend.worker.app.services.alongpoi.main:app --host 0.0.0.0 --port 9102"
-    env_file:
-      - .env
-    volumes:
-      - ./backend:/app/backend
-    depends_on: [static-db]
-    ports: ["9102:9102"]
-  
-  svc-llm:
-    build: { context: ., dockerfile: ./backend/Dockerfile }
-    command: bash -lc "uvicorn backend.worker.app.services.llm.main:app --host 0.0.0.0 --port 9103"
-    environment:
-      KNOWLEDGE_DIR: /app/backend/worker/data/knowledge
-      # コンテナ内からホストのvLLMへ (.env の 127.0.0.1 はコンテナ内では自分自身を指すため上書き)
-      Inference_server: http://host.docker.internal:8000/v1
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ./backend:/app/backend
-      - ./backend/worker/data:/app/backend/worker/data:ro
-    ports: ["9103:9103"]
-
-  svc-voice:
-    build:
-      context: .
-      dockerfile: ./backend/worker/app/services/voice/Dockerfile
-    command: |
-      bash -lc "
-      set -euo pipefail;
-      echo '--- voice bootstrap ---';
-      ffmpeg -hide_banner -version || { echo 'ERROR: ffmpeg not found in PATH'; exit 1; };
-      mkdir -p /home/junta_takahashi/guidanceLLM2/packs;
-      export OMP_NUM_THREADS=1;
-      uvicorn backend.worker.app.services.voice.main:app --host 0.0.0.0 --port 9104
-      "
-    env_file:
-      - .env
-    volumes:
-      - ./backend:/app/backend
-      - /var/www/packs:/packs
-    ports: ["9104:9104"]
-
-  svc-nav:
-    build: { context: ., dockerfile: ./backend/Dockerfile }
-    command: bash -lc "uvicorn backend.worker.app.services.nav.main:app --host 0.0.0.0 --port 9100"
-    env_file:
-      - .env
-    volumes:
-      - ./backend:/app/backend
-      - /var/www/packs:/packs
-    depends_on: [svc-routing, svc-alongpoi, svc-llm, svc-voice]
-    ports: ["9100:9100"]
-
-  # === AI Agent Service ===
-  svc-agent:
-    build: { context: ., dockerfile: ./backend/Dockerfile }
-    command: bash -lc "uvicorn backend.worker.agent_app.api:app --host 0.0.0.0 --port 9200"
-    env_file:
-      - .env
-    environment:
-      # コンテナ内からホストのvLLMへ (.env の 127.0.0.1 はコンテナ内では自分自身を指すため上書き)
-      Inference_server: http://host.docker.internal:8000/v1
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ./backend:/app/backend
-    depends_on:
-      - app-db
-      - chromadb
-    ports: ["9200:9200"]
-    restart: unless-stopped
-  
 volumes:
-  pgdata_static:
-  pgdata_app:
-  chromadb_data:
+  pgdata:
+  packs_data:
   frontend_node_modules:

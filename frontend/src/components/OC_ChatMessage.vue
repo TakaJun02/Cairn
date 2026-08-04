@@ -1,22 +1,14 @@
 <template>
   <div class="tw-py-4 tw-px-4 md:tw-px-8">
-    <!-- User Message -->
-    <div
-      v-if="sender === 'user'"
-      class="tw-flex tw-justify-end"
-    >
+    <div v-if="sender === 'user'" class="tw-flex tw-justify-end">
       <div class="tw-max-w-xl">
         <div class="tw-px-4 tw-py-3 tw-rounded-2xl tw-bg-blue-800 tw-text-white tw-rounded-br-none tw-shadow-sm">
-          <p class="tw-text-base tw-leading-relaxed tw-whitespace-pre-wrap">
-            {{ content }}
-          </p>
+          <p class="tw-text-base tw-leading-relaxed tw-whitespace-pre-wrap">{{ content }}</p>
         </div>
       </div>
     </div>
 
-    <!-- AI Message -->
-    <div v-else class="tw-max-w-4xl tw-mx-auto">
-      <!-- Pending/Spinner -->
+    <div v-else class="tw-max-w-4xl tw-mx-auto tw-space-y-3">
       <div v-if="isPending" class="tw-flex tw-items-center tw-gap-4">
         <div class="tw-relative tw-w-8 tw-h-8">
           <svg class="tw-absolute tw-top-0 tw-left-0 tw-w-full tw-h-full tw-overflow-visible animate-gemini-spinner-container" viewBox="0 0 24 24">
@@ -27,95 +19,219 @@
                 <stop offset="100%" stop-color="#69F0AE" />
               </linearGradient>
             </defs>
-            <circle cx="12" cy="12" r="11" fill="none" stroke-width="2.5" class="tw-stroke-gray-500" opacity="0"></circle>
             <circle cx="12" cy="12" r="11" fill="none" :stroke="`url(#${gradientId})`" stroke-width="2.5" class="animate-gemini-spinner-arc" stroke-linecap="round" stroke-dasharray="69.115"></circle>
           </svg>
           <div class="tw-absolute tw-inset-0 tw-flex tw-items-center tw-justify-center">
-            <img 
-              src="/app-icon.png" 
-              alt="App Icon" 
-              class="tw-w-5 tw-h-5 tw-rounded-full animate-icon-rotate" 
-              style="transform-origin: 50% 50%; box-shadow: 0 0 10px rgba(255, 255, 255, 0.4);"
-            >
+            <img src="/app-icon.png" alt="App Icon" class="tw-w-5 tw-h-5 tw-rounded-full animate-icon-rotate">
           </div>
         </div>
-        <p class="tw-text-base tw-text-gray-200">{{ pendingText }}</p>
+        <p class="tw-text-sm tw-text-gray-300">{{ statusText || pendingText }}</p>
       </div>
 
-      <!-- Rendered Markdown Content -->
-      <div v-if="!isPending">
+      <div v-if="content || candidates || itinerary || profile">
         <div class="tw-w-8 tw-h-8 tw-flex tw-items-center tw-justify-start tw-shrink-0">
           <img src="/app-icon.png" alt="App Icon" class="tw-w-6 tw-h-6 tw-rounded-full">
         </div>
+
         <div
+          v-if="content"
           class="tw-prose tw-prose-invert tw-prose-zinc lg:tw-prose-lg tw-max-w-none tw-pt-2 prose-p:tw-text-gray-50 prose-li:tw-text-gray-50 prose-headings:tw-text-white"
           v-html="formattedContent"
         ></div>
+
+        <div v-if="candidates" class="tw-mt-4 tw-space-y-2">
+          <div class="tw-flex tw-items-center tw-gap-2">
+            <p class="tw-text-sm tw-font-semibold tw-text-white">おすすめ候補</p>
+            <span class="tw-rounded-full tw-bg-slate-700 tw-px-2 tw-py-0.5 tw-text-xs tw-text-slate-200">
+              {{ candidates.phase === 'provisional' ? '候補' : '確定' }}
+            </span>
+          </div>
+          <div class="tw-grid tw-gap-2 sm:tw-grid-cols-2">
+            <div
+              v-for="item in candidates.items || []"
+              :key="item.spot_id"
+              class="tw-rounded-xl tw-border tw-border-slate-600 tw-bg-slate-800/70 tw-p-3"
+            >
+              <p class="tw-font-semibold tw-text-white">{{ item.name_ja || spotName(item.spot_id) }}</p>
+              <p v-if="candidateReason(item)" class="tw-mt-1 tw-text-xs tw-leading-relaxed tw-text-slate-300">
+                {{ candidateReason(item) }}
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="itinerary" class="tw-mt-4 tw-rounded-xl tw-border tw-border-slate-600 tw-bg-slate-800/70 tw-p-4">
+          <div class="tw-flex tw-flex-wrap tw-items-center tw-justify-between tw-gap-2">
+            <div class="tw-flex tw-items-center tw-gap-2">
+              <p class="tw-font-semibold tw-text-white">旅程 v{{ itinerary.version }}</p>
+              <span
+                v-if="itinerary.phase === 'provisional'"
+                class="tw-rounded-full tw-bg-slate-700 tw-px-2 tw-py-0.5 tw-text-xs tw-text-slate-200"
+              >
+                調整中
+              </span>
+              <details v-if="itineraryAssumptions.length" class="tw-relative" :title="itineraryAssumptions.join('、')">
+                <summary
+                  class="tw-inline-flex tw-cursor-pointer tw-list-none tw-items-center tw-rounded-full tw-bg-amber-900/60 tw-px-2 tw-py-0.5 tw-text-xs tw-text-amber-200"
+                >仮の前提あり</summary>
+                <ul class="tw-mt-1 tw-space-y-0.5 tw-rounded-lg tw-border tw-border-amber-700/60 tw-bg-slate-900/90 tw-p-2 tw-text-xs tw-text-amber-100">
+                  <li v-for="(assumption, index) in itineraryAssumptions" :key="index">{{ assumption }}</li>
+                </ul>
+              </details>
+            </div>
+            <button
+              v-if="itinerary.phase === 'final' && itinerary.version > 1"
+              type="button"
+              :disabled="isUndoing"
+              class="tw-rounded-lg tw-border tw-border-slate-500 tw-px-3 tw-py-1.5 tw-text-sm tw-text-slate-100 tw-transition-colors hover:tw-bg-slate-700 disabled:tw-cursor-not-allowed disabled:tw-opacity-50"
+              @click="emit('undo', messageId)"
+            >
+              {{ isUndoing ? '戻しています…' : '元に戻す' }}
+            </button>
+          </div>
+
+          <div class="tw-mt-3 tw-space-y-3">
+            <div v-for="(day, dayIndex) in itineraryDays" :key="`${day.date}-${dayIndex}`">
+              <p class="tw-text-sm tw-font-semibold tw-text-blue-200">
+                {{ day.date || `${dayIndex + 1}日目` }}
+              </p>
+              <ol class="tw-mt-1 tw-space-y-1">
+                <li
+                  v-for="item in day.items || []"
+                  :key="`${dayIndex}-${item.seq}-${item.spot_id}`"
+                  class="tw-flex tw-items-baseline tw-gap-2 tw-text-sm tw-text-slate-200"
+                >
+                  <span class="tw-w-12 tw-shrink-0 tw-text-xs tw-text-slate-400">{{ formatMinute(item.arrive_min) }}</span>
+                  <span>{{ spotName(item.spot_id) }}</span>
+                  <span v-if="item.stay_min" class="tw-text-xs tw-text-slate-400">{{ item.stay_min }}分</span>
+                </li>
+              </ol>
+            </div>
+          </div>
+
+          <ul v-if="diffLines.length" class="tw-mt-3 tw-space-y-1 tw-border-t tw-border-slate-700 tw-pt-3">
+            <li v-for="line in diffLines" :key="line" class="tw-text-xs tw-text-slate-300">{{ line }}</li>
+          </ul>
+          <ul v-if="itinerary.concessions?.length" class="tw-mt-3 tw-space-y-1">
+            <li v-for="(item, index) in itinerary.concessions" :key="index" class="tw-text-xs tw-text-amber-200">
+              {{ item.message_ja || '一部の希望条件を調整しました。' }}
+            </li>
+          </ul>
+          <p v-if="undoError" class="tw-mt-2 tw-text-xs tw-text-red-300">{{ undoError }}</p>
+        </div>
+
+        <div v-if="profile" class="tw-mt-3 tw-rounded-lg tw-border tw-border-slate-700 tw-bg-slate-800/50 tw-px-3 tw-py-2 tw-text-xs tw-text-slate-300">
+          希望条件を更新しました<span v-if="profileSummary">: {{ profileSummary }}</span>
+        </div>
+
       </div>
+
+      <div v-if="notices?.length" class="tw-space-y-1">
+        <p
+          v-for="(notice, index) in notices"
+          :key="`${notice.code || 'notice'}-${index}`"
+          class="tw-text-xs"
+          :class="notice.degraded ? 'tw-text-amber-200' : 'tw-text-red-300'"
+        >
+          {{ notice.message }}
+        </p>
+      </div>
+      <p v-if="error" class="tw-text-sm tw-text-red-300">{{ error }}</p>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed, ref, watch, onUnmounted } from 'vue';
-import { marked } from 'marked';
-import { useUserStore } from '@/stores/user';
+import { computed } from 'vue'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
+import { useUserStore } from '@/stores/user'
+import { useNavStore } from '@/stores/nav'
 
 const props = defineProps({
+  messageId: { type: [String, Number], required: true },
   sender: { type: String, required: true },
-  content: { type: String, required: true },
+  content: { type: String, default: '' },
   isPending: { type: Boolean, default: false },
-});
+  statusText: { type: String, default: '' },
+  candidates: { type: Object, default: null },
+  itinerary: { type: Object, default: null },
+  profile: { type: Object, default: null },
+  notices: { type: Array, default: () => [] },
+  error: { type: String, default: '' },
+  undoError: { type: String, default: '' },
+  isUndoing: { type: Boolean, default: false },
+})
 
-const userStore = useUserStore();
-const gradientId = `spinner-gradient-${Math.random().toString(36).substring(2, 9)}`;
+const emit = defineEmits(['undo'])
+const userStore = useUserStore()
+const navStore = useNavStore()
+const gradientId = `spinner-gradient-${Math.random().toString(36).substring(2, 9)}`
 
-const displayedContent = ref('');
-let wordInterval = null;
+const formattedContent = computed(() => DOMPurify.sanitize(marked.parse(props.content || '')))
+const itineraryDays = computed(() => props.itinerary?.itinerary?.days || [])
 
-watch(() => props.isPending, (isPending, wasPending) => {
-  // Animate when loading is finished
-  if (wasPending && !isPending && props.content) {
-    displayedContent.value = '';
-    clearInterval(wordInterval);
+// 2026-08-04([25 §1-3]の是正・レビュー是正 L-1): `phase` はソルバー処理の
+// 段階であってユーザーが内容を確定したという意味ではない。「確定」の語は
+// 使わない。final はバッジ自体を出さない(見出しの「旅程 v{n}」と重複する
+// ため)。provisional のときだけ「調整中」バッジを出す
+// (frontend_nav.md §2.4)。
 
-    // Split by spaces and newlines, but keep them in the array to preserve formatting
-    const words = props.content.split(/(\s+)/);
-    let wordIndex = 0;
+// 未確認の前提(日付・起点等)。空なら何も表示しない。
+const itineraryAssumptions = computed(() => {
+  const values = props.itinerary?.assumptions ?? props.itinerary?.itinerary?.assumptions
+  return Array.isArray(values) ? values : []
+})
 
-    wordInterval = setInterval(() => {
-      if (wordIndex < words.length) {
-        displayedContent.value += words[wordIndex];
-        wordIndex++;
-      } else {
-        clearInterval(wordInterval);
-      }
-    }, 40); // ms per word/space
-  }
-});
-
-// If the component is mounted with content already (e.g. from chat history), display it directly
-if (!props.isPending && props.content) {
-  displayedContent.value = props.content;
+const spotName = (spotId) => {
+  const spot = navStore.spots.find((value) => value.spot_id === spotId)
+  return spot?.name_ja || spot?.name || spotId
 }
 
-onUnmounted(() => {
-  clearInterval(wordInterval);
-});
+const formatMinute = (value) => {
+  const minute = Number(value)
+  if (!Number.isFinite(minute)) return '--:--'
+  const hour = Math.floor(minute / 60)
+  return `${String(hour).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`
+}
 
-const formattedContent = computed(() => {
-  return marked.parse(displayedContent.value || '');
-});
+const candidateReason = (item) => {
+  const reason = item?.reason_materials || {}
+  const parts = []
+  if (Array.isArray(reason.matched_tags) && reason.matched_tags.length) {
+    parts.push(reason.matched_tags.join('・'))
+  }
+  if (reason.travel_time_text) parts.push(reason.travel_time_text)
+  if (reason.stay_min) parts.push(`滞在目安 ${reason.stay_min}分`)
+  return parts.join(' / ')
+}
+
+const positionText = (position) => {
+  if (!position) return ''
+  return `${position.day}日目 ${position.position}番目`
+}
+
+const diffLines = computed(() => {
+  const diff = props.itinerary?.diff || {}
+  const lines = []
+  if (diff.added?.length) lines.push(`追加: ${diff.added.map(spotName).join('、')}`)
+  if (diff.removed?.length) lines.push(`削除: ${diff.removed.map(spotName).join('、')}`)
+  for (const moved of diff.moved || []) {
+    lines.push(`移動: ${spotName(moved.spot_id)} (${positionText(moved.from)} → ${positionText(moved.to)})`)
+  }
+  if (diff.retimed?.length) lines.push(`時刻変更: ${diff.retimed.map(spotName).join('、')}`)
+  return lines
+})
+
+const profileSummary = computed(() => {
+  const values = [props.profile?.party, props.profile?.mobility, props.profile?.pace].filter(Boolean)
+  return values.join(' / ')
+})
 
 const pendingText = computed(() => {
-  const lang = userStore.user?.language || 'ja';
-  switch (lang) {
-    case 'en':
-      return 'Please wait...';
-    case 'zh':
-      return '请稍候...';
-    default: // 'ja'
-      return 'お待ちください...';
-  }
-});
+  const lang = userStore.user?.language || 'ja'
+  if (lang === 'en') return 'Please wait...'
+  if (lang === 'zh') return '请稍候...'
+  return 'お待ちください...'
+})
 </script>

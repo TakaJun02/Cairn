@@ -1,6 +1,6 @@
 # AI エージェントのアーキテクチャパターン — 調査と、現行設計への適用
 
-- 状態: **決定稿(2026-07-31、§6 の 6 論点が決着)**
+- 状態: **決定稿(2026-07-31、§6 の 6 論点が決着)** / **注記 2026-08-04: 本書が前提とした一括プラン方式は [ADR-0019](../adr/0019-react-main-agent-subagents.md) で廃止された(現行設計は [agent_react_architecture.md](agent_react_architecture.md))。本書は調査の記録として凍結する** — guided decoding のスキーマ順・観測設計などの知見自体は新設計にも引き継がれている
 - 日付: 2026-07-31
 - 位置づけ: [agent_planning_phase.md](agent_planning_phase.md) で固めたエージェント設計に、**ドメイン非依存の「エージェントの作り方」の知見**を当て、改善余地を洗い出す
 - 対象外: **旅行プランニング・旅程生成・POI 推薦・対話型推薦の研究**([recommendation_planning.md](recommendation_planning.md) §2 で調査済み)
