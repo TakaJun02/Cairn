@@ -1,146 +1,150 @@
 <template>
-  <div class="tw-py-4 tw-px-4 md:tw-px-8">
-    <div v-if="sender === 'user'" class="tw-flex tw-justify-end">
-      <div class="tw-max-w-xl">
-        <div class="tw-px-4 tw-py-3 tw-rounded-2xl tw-bg-blue-800 tw-text-white tw-rounded-br-none tw-shadow-sm">
-          <p class="tw-text-base tw-leading-relaxed tw-whitespace-pre-wrap">{{ content }}</p>
-        </div>
-      </div>
-    </div>
+  <div :class="sender === 'user' ? 'is-user flex justify-end' : 'is-ai flex flex-col gap-3.5'">
+    <!-- ユーザー発話 -->
+    <div
+      v-if="sender === 'user'"
+      class="max-w-[88%] whitespace-pre-wrap break-words rounded-[1.35rem] rounded-br-md border border-white/[0.075] bg-ink-high px-4 py-2.5 leading-7 shadow-soft sm:max-w-[78%]"
+    >{{ content }}</div>
 
-    <div v-else class="tw-max-w-4xl tw-mx-auto tw-space-y-3">
-      <div v-if="isPending" class="tw-flex tw-items-center tw-gap-4">
-        <div class="tw-relative tw-w-8 tw-h-8">
-          <svg class="tw-absolute tw-top-0 tw-left-0 tw-w-full tw-h-full tw-overflow-visible animate-gemini-spinner-container" viewBox="0 0 24 24">
+    <!-- アシスタント発話。吹き出しを持たない。 -->
+    <template v-else>
+      <div v-if="isPending" class="flex items-center gap-4">
+        <div class="relative h-8 w-8 shrink-0">
+          <svg class="animate-gemini-spinner-container absolute left-0 top-0 h-full w-full overflow-visible" viewBox="0 0 24 24">
             <defs>
               <linearGradient :id="gradientId" x1="0%" y1="0%" x2="100%" y2="100%">
-                <stop offset="0%" stop-color="#FF8A65" />
-                <stop offset="50%" stop-color="#FFEB3B" />
-                <stop offset="100%" stop-color="#69F0AE" />
+                <stop offset="0%" stop-color="#4f7df3" />
+                <stop offset="50%" stop-color="#2fc9b0" />
+                <stop offset="100%" stop-color="#cfe6ee" />
               </linearGradient>
             </defs>
             <circle cx="12" cy="12" r="11" fill="none" :stroke="`url(#${gradientId})`" stroke-width="2.5" class="animate-gemini-spinner-arc" stroke-linecap="round" stroke-dasharray="69.115"></circle>
           </svg>
-          <div class="tw-absolute tw-inset-0 tw-flex tw-items-center tw-justify-center">
-            <img src="/app-icon.png" alt="App Icon" class="tw-w-5 tw-h-5 tw-rounded-full animate-icon-rotate">
+          <div class="absolute inset-0 flex items-center justify-center">
+            <img src="/app-icon.png" alt="" class="animate-icon-rotate h-5 w-5 rounded-full">
           </div>
         </div>
-        <p class="tw-text-sm tw-text-gray-300">{{ statusText || pendingText }}</p>
+        <p class="text-sm text-text-muted">{{ statusText || pendingText }}</p>
       </div>
 
-      <div v-if="content || candidates || itinerary || profile">
-        <div class="tw-w-8 tw-h-8 tw-flex tw-items-center tw-justify-start tw-shrink-0">
-          <img src="/app-icon.png" alt="App Icon" class="tw-w-6 tw-h-6 tw-rounded-full">
+      <template v-if="content || candidates || itinerary || profileLabelList.length">
+        <div class="flex h-6 w-6 shrink-0 items-center justify-center">
+          <img src="/app-icon.png" alt="" class="h-6 w-6 rounded-full">
         </div>
 
         <div
           v-if="content"
-          class="tw-prose tw-prose-invert tw-prose-zinc lg:tw-prose-lg tw-max-w-none tw-pt-2 prose-p:tw-text-gray-50 prose-li:tw-text-gray-50 prose-headings:tw-text-white"
+          class="markdown-body"
           v-html="formattedContent"
         ></div>
 
-        <div v-if="candidates" class="tw-mt-4 tw-space-y-2">
-          <div class="tw-flex tw-items-center tw-gap-2">
-            <p class="tw-text-sm tw-font-semibold tw-text-white">おすすめ候補</p>
+        <div v-if="candidates">
+          <div class="mb-2.5 flex items-center gap-2">
+            <b class="font-display text-[13.5px] font-semibold text-text">おすすめ候補</b>
             <span
               v-if="candidates.phase === 'provisional'"
-              class="tw-rounded-full tw-bg-slate-700 tw-px-2 tw-py-0.5 tw-text-xs tw-text-slate-200"
-            >
-              候補
-            </span>
+              class="rounded-full border border-edge-strong bg-fill-hover px-2.5 py-0.5 text-[10.5px] text-text-muted"
+            >候補</span>
           </div>
-          <div class="tw-grid tw-gap-2 sm:tw-grid-cols-2">
+          <div class="grid gap-2 sm:grid-cols-2">
             <div
               v-for="item in candidates.items || []"
               :key="item.spot_id"
-              class="tw-rounded-xl tw-border tw-border-slate-600 tw-bg-slate-800/70 tw-p-3"
+              class="rounded-ui border border-edge bg-ink-surface p-3 transition-all duration-base ease-expressive hover:-translate-y-px hover:border-edge-strong hover:bg-ink-raised"
             >
-              <p class="tw-font-semibold tw-text-white">{{ candidateName(item) }}</p>
-              <p v-if="candidateReason(item)" class="tw-mt-1 tw-text-xs tw-leading-relaxed tw-text-slate-300">
-                {{ candidateReason(item) }}
-              </p>
+              <p class="font-medium text-text">{{ candidateName(item) }}</p>
+              <div v-if="candidateChips(item).length" class="mt-2.5 flex flex-wrap gap-1.5">
+                <span
+                  v-for="(chip, index) in candidateChips(item)"
+                  :key="index"
+                  class="rounded-full border border-edge bg-fill-hover px-2 py-0.5 text-[10px] text-text-muted"
+                >{{ chip }}</span>
+              </div>
             </div>
           </div>
         </div>
 
-        <div v-if="itinerary" class="tw-mt-4 tw-rounded-xl tw-border tw-border-slate-600 tw-bg-slate-800/70 tw-p-4">
-          <div class="tw-flex tw-flex-wrap tw-items-center tw-justify-between tw-gap-2">
-            <div class="tw-flex tw-items-center tw-gap-2">
-              <p class="tw-font-semibold tw-text-white">旅程 v{{ itinerary.version }}</p>
-              <span
-                v-if="itinerary.phase === 'provisional'"
-                class="tw-rounded-full tw-bg-slate-700 tw-px-2 tw-py-0.5 tw-text-xs tw-text-slate-200"
-              >
-                調整中
-              </span>
-              <details v-if="itineraryAssumptions.length" class="tw-relative" :title="itineraryAssumptions.join('、')">
-                <summary
-                  class="tw-inline-flex tw-cursor-pointer tw-list-none tw-items-center tw-rounded-full tw-bg-amber-900/60 tw-px-2 tw-py-0.5 tw-text-xs tw-text-amber-200"
-                >仮の前提あり</summary>
-                <ul class="tw-mt-1 tw-space-y-0.5 tw-rounded-lg tw-border tw-border-amber-700/60 tw-bg-slate-900/90 tw-p-2 tw-text-xs tw-text-amber-100">
-                  <li v-for="(assumption, index) in itineraryAssumptions" :key="index">{{ assumption }}</li>
-                </ul>
-              </details>
-            </div>
+        <div v-if="itinerary" class="rounded-ui-lg border border-edge-strong bg-ink-raised p-4 shadow-soft">
+          <div class="flex flex-wrap items-center gap-2">
+            <b class="font-display text-[15px] font-semibold tracking-[-0.02em] text-text">旅程 v{{ itinerary.version }}</b>
+            <span
+              v-if="itinerary.phase === 'provisional'"
+              class="rounded-full border border-edge-strong bg-fill-hover px-2.5 py-0.5 text-[10.5px] text-text-muted"
+            >調整中</span>
+            <details v-if="itineraryAssumptions.length" class="relative" :title="itineraryAssumptions.join('、')">
+              <!-- §11 是正: <summary> も押せる操作子であり 44px の対象。
+                   見た目のチップは 23px のまま、当たり判定だけ min-h-11 で
+                   広げる(背景は hover まで出さない = チップの背景をこの
+                   要素に持たせない)。
+                   2026-08-06(F4 是正): 当たり判定(summary, 角丸 0・44px)に
+                   フォーカス枠を出すと、中の小さな rounded-full ピルの外へ
+                   矩形の枠がはみ出す(コンポーザと同型の不具合)。枠は
+                   「見えている」内側の span へ出す(下の <style> 参照)。 -->
+              <summary
+                class="assumption-toggle inline-flex min-h-11 cursor-pointer list-none items-center"
+              ><span
+                class="inline-flex items-center rounded-full border border-warn/35 bg-warn/10 px-2.5 py-0.5 text-[10.5px] text-warn"
+              >仮の前提あり</span></summary>
+              <ul class="mt-1 space-y-0.5 rounded-ui-sm border border-edge-strong bg-ink-base/90 p-2 text-xs text-warn">
+                <li v-for="(assumption, index) in itineraryAssumptions" :key="index">{{ assumption }}</li>
+              </ul>
+            </details>
             <button
               v-if="itinerary.phase === 'final' && itinerary.version > 1"
               type="button"
               :disabled="isUndoing"
-              class="tw-rounded-lg tw-border tw-border-slate-500 tw-px-3 tw-py-1.5 tw-text-sm tw-text-slate-100 tw-transition-colors hover:tw-bg-slate-700 disabled:tw-cursor-not-allowed disabled:tw-opacity-50"
+              class="ml-auto flex min-h-11 items-center rounded-ui-sm border border-edge-strong px-3.5 text-[12.5px] text-text-muted transition-colors duration-fast hover:bg-fill-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
               @click="emit('undo', messageId)"
-            >
-              {{ isUndoing ? '戻しています…' : '元に戻す' }}
-            </button>
+            >{{ isUndoing ? '戻しています…' : '元に戻す' }}</button>
           </div>
 
-          <div class="tw-mt-3 tw-space-y-3">
-            <div v-for="(day, dayIndex) in itineraryDays" :key="`${day.date}-${dayIndex}`">
-              <p class="tw-text-sm tw-font-semibold tw-text-blue-200">
+          <div class="mt-4">
+            <div v-for="(day, dayIndex) in itineraryDays" :key="`${day.date}-${dayIndex}`" class="mt-4 first:mt-0">
+              <p class="mb-2 font-display text-[12.5px] font-semibold tracking-[0.02em] text-brand-signal">
                 {{ day.date || `${dayIndex + 1}日目` }}
               </p>
-              <ol class="tw-mt-1 tw-space-y-1">
+              <ol class="stop-list">
                 <li
                   v-for="item in day.items || []"
                   :key="`${dayIndex}-${item.seq}-${item.spot_id}`"
-                  class="tw-flex tw-items-baseline tw-gap-2 tw-text-sm tw-text-slate-200"
+                  class="stop-item"
                 >
-                  <span class="tw-w-12 tw-shrink-0 tw-text-xs tw-text-slate-400">{{ formatMinute(item.arrive_min) }}</span>
-                  <span>{{ spotName(item.spot_id) }}</span>
-                  <span v-if="item.stay_min" class="tw-text-xs tw-text-slate-400">{{ item.stay_min }}分</span>
+                  <span class="stop-item__time">{{ formatMinute(item.arrive_min) }}</span>
+                  <span class="stop-item__name">{{ spotName(item.spot_id) }}</span>
+                  <span v-if="item.stay_min" class="stop-item__stay">{{ item.stay_min }}分</span>
                 </li>
               </ol>
             </div>
           </div>
 
-          <ul v-if="diffLines.length" class="tw-mt-3 tw-space-y-1 tw-border-t tw-border-slate-700 tw-pt-3">
-            <li v-for="line in diffLines" :key="line" class="tw-text-xs tw-text-slate-300">{{ line }}</li>
+          <ul v-if="diffLines.length" class="mt-4 space-y-1 border-t border-edge pt-3 text-xs text-text-muted">
+            <li v-for="line in diffLines" :key="line">{{ line }}</li>
           </ul>
-          <ul v-if="itinerary.concessions?.length" class="tw-mt-3 tw-space-y-1">
-            <li v-for="(item, index) in itinerary.concessions" :key="index" class="tw-text-xs tw-text-amber-200">
+          <ul v-if="itinerary.concessions?.length" class="mt-3 space-y-1">
+            <li v-for="(item, index) in itinerary.concessions" :key="index" class="text-xs text-warn">
               {{ concessionText(item) }}
             </li>
           </ul>
-          <p v-if="undoError" class="tw-mt-2 tw-text-xs tw-text-red-300">{{ undoError }}</p>
+          <p v-if="undoError" class="mt-2 text-xs text-danger">{{ undoError }}</p>
         </div>
 
-        <div v-if="profile" class="tw-mt-3 tw-rounded-lg tw-border tw-border-slate-700 tw-bg-slate-800/50 tw-px-3 tw-py-2 tw-text-xs tw-text-slate-300">
-          希望条件を更新しました<span v-if="profileSummary">: {{ profileSummary }}</span>
-        </div>
+        <!-- P7: 希望条件は日本語ラベルのみ。全項目が空(対応表にない値含む)なら
+             何も描画しない([25 §3-5] / frontend_design_system.md §7.7)。 -->
+        <p v-if="profileLabelList.length" class="text-xs text-text-muted">
+          希望条件を更新しました: {{ profileLabelList.join(' / ') }}
+        </p>
+      </template>
 
-      </div>
-
-      <div v-if="notices?.length" class="tw-space-y-1">
+      <div v-if="notices?.length" class="space-y-1">
         <p
           v-for="(notice, index) in notices"
           :key="`${notice.code || 'notice'}-${index}`"
-          class="tw-text-xs"
-          :class="notice.degraded ? 'tw-text-amber-200' : 'tw-text-red-300'"
-        >
-          {{ notice.message }}
-        </p>
+          class="text-xs"
+          :class="notice.degraded ? 'text-warn' : 'text-danger'"
+        >{{ notice.message }}</p>
       </div>
-      <p v-if="error" class="tw-text-sm tw-text-red-300">{{ error }}</p>
-    </div>
+      <p v-if="error" class="text-sm text-danger">{{ error }}</p>
+    </template>
   </div>
 </template>
 
@@ -151,6 +155,7 @@ import DOMPurify from 'dompurify'
 import { useUserStore } from '@/stores/user'
 import { useNavStore } from '@/stores/nav'
 import { maskSpotIds, resolveCandidateName } from '@/lib/spotDisplay.js'
+import { profileLabels } from '@/lib/profileLabels.js'
 
 const props = defineProps({
   messageId: { type: [String, Number], required: true },
@@ -218,20 +223,18 @@ const formatMinute = (value) => {
   return `${String(hour).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`
 }
 
-const candidateReason = (item) => {
+// §7.5: タグ・所要時間・滞在目安を丸チップに分ける(現行は "/" 連結の 1 行)。
+const candidateChips = (item) => {
   const reason = item?.reason_materials || {}
-  const parts = []
-  if (Array.isArray(reason.matched_tags) && reason.matched_tags.length) {
-    parts.push(reason.matched_tags.join('・'))
+  const chips = []
+  if (Array.isArray(reason.matched_tags)) {
+    for (const tag of reason.matched_tags) {
+      if (tag) chips.push(tag)
+    }
   }
-  if (reason.travel_time_text) parts.push(reason.travel_time_text)
-  if (reason.stay_min) parts.push(`滞在目安 ${reason.stay_min}分`)
-  return parts.join(' / ')
-}
-
-const positionText = (position) => {
-  if (!position) return ''
-  return `${position.day}日目 ${position.position}番目`
+  if (reason.travel_time_text) chips.push(reason.travel_time_text)
+  if (reason.stay_min) chips.push(`滞在目安 ${reason.stay_min}分`)
+  return chips
 }
 
 const diffLines = computed(() => {
@@ -246,10 +249,14 @@ const diffLines = computed(() => {
   return lines
 })
 
-const profileSummary = computed(() => {
-  const values = [props.profile?.party, props.profile?.mobility, props.profile?.pace].filter(Boolean)
-  return values.join(' / ')
-})
+const positionText = (position) => {
+  if (!position) return ''
+  return `${position.day}日目 ${position.position}番目`
+}
+
+// P7 / §7.7: `party`/`mobility`/`pace` の生 enum を出さない。対応表に無い値・
+// 空値は落とし、全項目が落ちたら何も描画しない(`profile` は非表示)。
+const profileLabelList = computed(() => profileLabels(props.profile))
 
 const pendingText = computed(() => {
   const lang = userStore.user?.language || 'ja'
@@ -258,3 +265,63 @@ const pendingText = computed(() => {
   return 'お待ちください...'
 })
 </script>
+
+<style scoped>
+/* F4(frontend_design_system.md §11.1): 当たり判定を見た目より大きくした
+   要素は、フォーカス枠を「見えている部分」に出す。この <summary> は当たり
+   判定が 44px・角丸 0 だが、見えているのは中の rounded-full ピル(span)だけ
+   なので、既定の外周線(summary 自身)を消し、span 側へ移す。 */
+.assumption-toggle:focus-visible {
+  outline: none;
+}
+.assumption-toggle:focus-visible > span {
+  outline: 2px solid var(--color-signal-soft);
+  outline-offset: 3px;
+}
+
+/* 旅程の訪問順(§7.6)。左の縦線が行をつなぎ、「順路」であることを見た目で
+   表す(現行はただの箇条書き)。 */
+.stop-list {
+  list-style: none;
+  margin: 0 0 0 52px;
+  padding: 0;
+  border-left: 1px solid var(--color-edge);
+}
+.stop-item {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 0 7px 18px;
+  font-size: 13.5px;
+  color: var(--color-text);
+}
+.stop-item::before {
+  content: "";
+  position: absolute;
+  left: -4.5px;
+  top: 14px;
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background: var(--color-raised);
+  border: 1.5px solid var(--color-edge-strong);
+}
+.stop-item__time {
+  position: absolute;
+  left: -52px;
+  width: 44px;
+  text-align: right;
+  font-family: var(--font-display);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--color-text-dim);
+}
+.stop-item__name {
+  flex: 1;
+}
+.stop-item__stay {
+  font-size: 11.5px;
+  color: var(--color-text-dim);
+}
+</style>

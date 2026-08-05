@@ -54,6 +54,15 @@
     </div>
 
     <div v-if="isRouteReady" class="nav-container">
+      <!-- 観光モード中のバナー。地図には重ねず、地図の上の帯として表示する
+           (地図に重なる常設要素は現在地追従ボタン 1 つだけ、という条件を
+           満たすため)。 -->
+      <div v-if="isTourMode" class="tour-mode-bar" role="status">
+        <strong>観光モード</strong>
+        <span class="tour-mode-bar__status">{{ realtimeStatusText }}</span>
+        <button type="button" class="tour-mode-bar__exit" @click="leaveTourMode">観光モードを終了</button>
+      </div>
+
       <div class="map-wrapper">
         <NavMap
           ref="navMap"
@@ -143,94 +152,86 @@
         <div class="map-actions">
           <button
             type="button"
-            class="map-action-btn"
+            class="follow-btn"
             :class="{ 'is-following': isFollowMode }"
             :disabled="!currentPos"
             @click="isFollowMode ? disableFollowMode() : enableFollowMode()"
             :title="isFollowMode ? '追従を停止' : '現在地に追従'"
           >
-            <span class="map-action-btn__halo" aria-hidden="true"></span>
-            <svg class="icon-location" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <svg class="icon-location" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 19c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/>
               <path d="M12 8v8M8 12h8"/>
-              <circle class="icon-location-dot" cx="12" cy="12" r="2.5" fill="currentColor" />
+              <circle class="icon-location-dot" cx="12" cy="12" r="2.5" fill="currentColor" stroke="none" />
             </svg>
-            <span class="map-action-btn__label">Follow</span>
+            <span class="sr-only">現在地に追従</span>
           </button>
         </div>
-      </div>
 
-      <div class="top-left-ui-area">
-        <div class="controls">
-          <div v-if="isTourMode" class="tour-mode-banner" role="status">
-            <div>
-              <strong>観光モード</strong>
-              <span>{{ realtimeStatusText }}</span>
-            </div>
-            <button type="button" @click="leaveTourMode">観光モードを終了</button>
-          </div>
+        <!-- L-1 是正: legacy ルート `/nav` は NavWindow(⋯ トリガーの持ち主)
+             でラップされないため、単体表示のときだけここに同じトリガーを
+             出す。呼び出す先は既存の isControlsMenuOpen のまま。 -->
+        <button
+          v-if="isStandaloneNavView"
+          type="button"
+          class="flex h-11 w-11 items-center justify-center rounded-ui-sm border border-edge-strong bg-ink-raised/80 text-text-dim shadow-soft backdrop-blur transition-colors duration-fast hover:bg-fill-hover hover:text-text"
+          style="position: absolute; top: 12px; right: 12px; z-index: 950"
+          :aria-expanded="isControlsMenuOpen"
+          aria-label="メニュー"
+          @click.stop="isControlsMenuOpen = !isControlsMenuOpen"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7" /><circle cx="12" cy="12" r="1.7" /><circle cx="19" cy="12" r="1.7" /></svg>
+        </button>
 
-          <div v-if="!isNavigationReady || packJob" class="start-nav-panel">
+        <!-- ⋯ メニュー(NavWindow.vue のヘッダーから開閉)。「端末に取り込む」
+             「オフライン資材」「ライブ同期」「LoRa リンク」を 1 枚に畳む。
+             機能・発火条件は現行のまま。変えたのは配置と見せ方だけ。 -->
+        <div
+          v-if="isControlsMenuOpen"
+          class="controls-menu-scrim"
+          @click="isControlsMenuOpen = false"
+        ></div>
+        <div v-if="isControlsMenuOpen" class="controls-menu" role="group" aria-label="地図の設定">
+          <div v-if="!isNavigationReady || packJob" class="menu-section">
             <button
               v-if="!packJob || ['partial', 'failed'].includes(packJob.state)"
-              @click="startGuidance"
+              type="button"
+              class="menu-row"
               :disabled="isNavigating"
-              class="start-nav-button"
-              :class="{ 'is-loading': isNavigating }"
+              @click="startGuidance"
             >
-              <span class="start-nav-button__spark"></span>
-              <span class="start-nav-button__inner">
-                <svg
-                  class="start-nav-button__icon"
-                  width="20"
-                  height="20"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  aria-hidden="true"
-                >
-                  <path d="M12 2c2.5 2.5 4 5.5 4 8 0 4.5-4 8-4 8s-4-3.5-4-8c0-2.5 1.5-5.5 4-8Z" />
-                  <path d="M12 14v4" />
-                  <path d="M9 18h6" />
-                </svg>
-                <span class="start-nav-button__label">
-                  <template v-if="isNavigating">パックを生成中…</template>
-                  <template v-else-if="packJob?.state === 'partial'">不足分を再生成</template>
-                  <template v-else-if="packJob?.state === 'failed'">もう一度生成</template>
-                  <template v-else>端末に取り込む</template>
-                </span>
+              <span class="menu-row__label">
+                <template v-if="isNavigating">パックを生成中…</template>
+                <template v-else-if="packJob?.state === 'partial'">不足分を再生成</template>
+                <template v-else-if="packJob?.state === 'failed'">もう一度生成</template>
+                <template v-else>端末に取り込む</template>
               </span>
-              <span class="start-nav-button__progress" aria-hidden="true">
-                <span></span><span></span><span></span><span></span>
-              </span>
+              <!-- L-4 是正: 固定文字列だと partial/failed の状態でも
+                   「未取得」のまま実態と食い違う。packStateLabel(既存の
+                   computed。§8.3)を使う。 -->
+              <span class="menu-row__status">{{ packStateLabel }}</span>
             </button>
-            <div v-if="packJob" class="pack-progress" role="status" aria-live="polite">
-              <div class="pack-progress__header">
-                <span class="pack-state-badge" :class="`is-${packJob.state}`">
-                  {{ packStateLabel }}
-                </span>
-                <span class="pack-progress__elapsed">{{ packElapsedText }}</span>
+            <div v-if="packJob" class="menu-detail" role="status" aria-live="polite">
+              <div class="menu-detail__row">
+                <span class="menu-detail__badge" :class="`is-${packJob.state}`">{{ packStateLabel }}</span>
+                <span class="menu-detail__muted">{{ packElapsedText }}</span>
               </div>
-              <div class="pack-progress__counts">
-                <strong>{{ packProgress.done }} / {{ packProgress.total }}</strong>
+              <div class="menu-detail__row menu-detail__muted">
+                <strong class="menu-detail__count">{{ packProgress.done }} / {{ packProgress.total }}</strong>
                 <span>失敗 {{ packProgress.failed }} 件</span>
               </div>
-              <div class="pack-progress__bar" aria-hidden="true">
+              <div class="menu-detail__bar" aria-hidden="true">
                 <span :style="{ width: `${packProgressPercent}%` }"></span>
               </div>
-              <p v-if="packJob.state === 'ready'" class="pack-progress__message is-ready">
+              <p v-if="packJob.state === 'ready'" class="menu-detail__message">
                 端末への取り込み準備ができました
               </p>
-              <p v-else-if="packJob.state === 'partial'" class="pack-progress__message is-partial">
+              <p v-else-if="packJob.state === 'partial'" class="menu-detail__message is-warn">
                 一部の案内を作れませんでした（{{ packFailures.length }} 件）
               </p>
-              <p v-else-if="packJob.state === 'failed'" class="pack-progress__message is-failed">
+              <p v-else-if="packJob.state === 'failed'" class="menu-detail__message is-warn">
                 案内パックを作成できませんでした
               </p>
-              <details v-if="packFailures.length" class="pack-progress__missing">
+              <details v-if="packFailures.length" class="menu-detail__missing">
                 <summary>作れなかった案内の内訳</summary>
                 <ul>
                   <li v-for="(failure, index) in packFailures" :key="`${failure.spot_id}-${failure.variant}-${index}`">
@@ -241,142 +242,130 @@
                 </ul>
               </details>
             </div>
-            <div v-if="navError" class="error-box">
-              エラー: {{ navError }}
+            <p v-if="navError" class="menu-detail__message is-warn">エラー: {{ navError }}</p>
+          </div>
+
+          <div v-if="isNavigationReady" class="menu-section" role="status" aria-live="polite">
+            <div class="menu-row menu-row--static">
+              <span class="menu-row__label">オフライン資材</span>
+              <span class="menu-row__status">{{ packImportStateLabel }}</span>
+            </div>
+            <div class="menu-detail">
+              <div class="menu-detail__row menu-detail__muted">
+                <span>音声 {{ packImport.audio.done }} / {{ packImport.audio.total }}</span>
+                <span>タイル {{ packImport.tiles.done }} / {{ packImport.tiles.total }}</span>
+              </div>
+              <p v-if="packImport.verification" class="menu-detail__muted">
+                自己検証: {{ packImport.verification.cached }} / {{ packImport.verification.expected }} 本
+                <strong v-if="packImport.verification.missing.length" class="menu-detail__warn-text">
+                  （{{ packImport.verification.missing.length }} 本足りません）
+                </strong>
+                <span v-else>（完了）</span>
+              </p>
+              <p v-if="packImport.tiles.quotaExceeded" class="menu-detail__message is-warn">
+                保存容量の上限に達したため、表示件数の地点でタイル取得を停止しました。
+              </p>
+              <p v-if="packImport.verification && !packImport.verification.routeCached" class="menu-detail__message is-warn">
+                経路データが足りません。観光モードは開始できません。
+              </p>
+              <p v-if="packImport.error" class="menu-detail__message is-warn">{{ packImport.error }}</p>
+              <div class="menu-detail__actions">
+                <button type="button" class="menu-detail__btn" :disabled="isPackImporting" @click="verifyOfflineAssets">
+                  取り込みを再検証
+                </button>
+                <button
+                  v-if="!isTourMode"
+                  type="button"
+                  class="menu-detail__btn menu-detail__btn--primary"
+                  :disabled="!canEnterTourMode || isPackImporting"
+                  @click="beginTourMode"
+                >
+                  観光モードを開始
+                </button>
+              </div>
             </div>
           </div>
 
-          <div v-if="isNavigationReady" class="offline-pack-panel" role="status" aria-live="polite">
-            <div class="offline-pack-panel__header">
-              <strong>オフライン資材</strong>
-              <span>{{ packImportStateLabel }}</span>
-            </div>
-            <div class="offline-pack-panel__progress">
-              <span>音声 {{ packImport.audio.done }} / {{ packImport.audio.total }}</span>
-              <span>タイル {{ packImport.tiles.done }} / {{ packImport.tiles.total }}</span>
-            </div>
-            <p v-if="packImport.verification">
-              自己検証: {{ packImport.verification.cached }} / {{ packImport.verification.expected }} 本
-              <strong v-if="packImport.verification.missing.length" class="offline-pack-panel__warning">
-                （{{ packImport.verification.missing.length }} 本足りません）
-              </strong>
-              <strong v-else>（完了）</strong>
-            </p>
-            <p v-if="packImport.tiles.quotaExceeded" class="offline-pack-panel__warning">
-              保存容量の上限に達したため、表示件数の地点でタイル取得を停止しました。
-            </p>
-            <p v-if="packImport.verification && !packImport.verification.routeCached" class="offline-pack-panel__warning">
-              経路データが足りません。観光モードは開始できません。
-            </p>
-            <p v-if="packImport.error" class="offline-pack-panel__warning">{{ packImport.error }}</p>
-            <div class="offline-pack-panel__actions">
-              <button type="button" :disabled="isPackImporting" @click="verifyOfflineAssets">
-                取り込みを再検証
-              </button>
-              <button
-                v-if="!isTourMode"
-                type="button"
-                class="offline-pack-panel__primary"
-                :disabled="!canEnterTourMode || isPackImporting"
-                @click="beginTourMode"
-              >
-                観光モードを開始
-              </button>
-            </div>
-          </div>
-          
-          <div v-if="isRouteReady" class="control-buttons">
-            <button @click="togglePolling" class="control-btn data-sync-btn" :class="{'is-active': isPollingEnabled}" title="リアルタイム情報">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M3 3v6h6" />
-                <path d="M21 21v-6h-6" />
-                <path d="M21 3 14.12 9.88" />
-                <path d="M3 21 9.88 14.12" />
-              </svg>
-              <span class="data-sync-btn__label">Live Sync</span>
-            </button>
-            <div v-if="isNavigationReady" class="lora-panel" :class="{ 'is-connected': isLoraConnected, 'is-connecting': isLoraConnecting }">
-              <div class="lora-panel__icon" aria-hidden="true">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 2v4" />
-                  <path d="M5.5 10.5a8.5 8.5 0 0 1 13 0" />
-                  <path d="M8.5 13.5a4.5 4.5 0 0 1 7 0" />
-                  <circle cx="12" cy="18" r="2" />
-                </svg>
-              </div>
-              <div class="lora-panel__body">
-                <span class="lora-panel__label">LoRa Link</span>
-                <span class="lora-panel__status">{{ isLoraConnected ? 'Connected' : (isLoraConnecting ? 'Negotiating…' : 'Standby') }}</span>
-              </div>
-              <button
-                @click="isLoraConnected ? disconnectLoraDevice() : connectLoraDevice()"
-                :disabled="isLoraConnecting"
-                class="lora-toggle-btn"
-              >
-                <span class="lora-toggle-btn__dot" :class="{ 'is-active': isLoraConnected, 'is-busy': isLoraConnecting }"></span>
-                <span class="lora-toggle-btn__text">{{ isLoraConnected ? 'Disconnect' : 'Connect' }}</span>
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <div class="spot-list-panel">
-          <button @click="toggleSpotList" class="spot-list-toggle">
-            <div class="spot-list-toggle__left">
-              <span class="spot-list-toggle__eyebrow">Spots</span>
-              <span class="spot-list-toggle__title">Spots List</span>
-            </div>
-            <svg class="chevron-icon" :class="{'is-open': isSpotListVisible}" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="6 9 12 15 18 9"></polyline>
-            </svg>
+          <button
+            v-if="isRouteReady"
+            type="button"
+            class="menu-row"
+            :class="{ 'is-active': isPollingEnabled }"
+            @click="togglePolling"
+          >
+            <span class="menu-row__label">ライブ同期</span>
+            <span class="menu-row__status">
+              <b v-if="isPollingEnabled" class="menu-row__dot" aria-hidden="true"></b>
+              {{ isPollingEnabled ? '接続中' : '停止中' }}
+            </span>
           </button>
-          <div class="spot-list-content" :class="{'is-open': isSpotListVisible}">
-            <div class="spot-list-content-inner">
-              <ul>
-                <li v-for="(poi, index) in sortedWaypoints" :key="poi.spot_id">
-                  <button @click="focusOnSpot(poi)">
-                    <span class="order-index">{{ index + 1 }}</span>
-                    <span class="poi-label">
-                      <span v-if="isFacilitySpotId(poi.spot_id)" class="facility-chip" aria-hidden="true">🏢</span>
-                      {{ poiListLabel(poi) }}
-                    </span>
-                    <span class="rt-badges" v-if="isRouteReady && latestBySpot(poi.spot_id)">
-                      <span
-                        v-if="!isFacilitySpotId(poi.spot_id)"
-                        class="rt-badge weather"
-                        :title="weatherTitle(latestBySpot(poi.spot_id))"
-                      >{{ weatherEmoji(latestBySpot(poi.spot_id)?.w) }}</span>
-                      <span
-                        v-else
-                        class="rt-badge facility"
-                        title="施設"
-                        aria-label="施設"
-                      >🏢</span>
-                      <span
-                        class="rt-badge crowd"
-                        :class="crowdBadge(latestBySpot(poi.spot_id)).className"
-                        :title="crowdBadge(latestBySpot(poi.spot_id)).tooltip"
-                      >
-                        {{ crowdBadge(latestBySpot(poi.spot_id)).label }}
-                      </span>
-                    </span>
-                  </button>
-                </li>
-              </ul>
-              <div v-if="isNavigationReady && sortedAlongPois.length > 0" class="nearby-section">
-                <h3 class="nearby-title">Nearby Picks</h3>
-                <ul>
-                  <li v-for="poi in sortedAlongPois" :key="poi.spot_id">
-                    <button @click="focusOnSpot(poi)" class="nearby-button">
-                      <span v-if="isFacilitySpotId(poi.spot_id)" class="facility-chip" aria-hidden="true">🏢</span>
-                      {{ poiListLabel(poi) }}
-                    </button>
-                  </li>
-                </ul>
+
+          <div v-if="isNavigationReady" class="menu-section">
+            <div class="menu-row menu-row--static" :class="{ 'is-active': isLoraConnected }">
+              <span class="menu-row__label">LoRa リンク</span>
+              <span class="menu-row__status">
+                <b v-if="isLoraConnected" class="menu-row__dot" aria-hidden="true"></b>
+                {{ isLoraConnected ? '接続済み' : (isLoraConnecting ? '接続中…' : '待機中') }}
+              </span>
+            </div>
+            <div class="menu-detail">
+              <div class="menu-detail__actions">
+                <button
+                  type="button"
+                  class="menu-detail__btn"
+                  :disabled="isLoraConnecting"
+                  @click="isLoraConnected ? disconnectLoraDevice() : connectLoraDevice()"
+                >
+                  {{ isLoraConnected ? '切断する' : '接続する' }}
+                </button>
               </div>
             </div>
           </div>
         </div>
+      </div>
+
+      <!-- 旅程ストリップ(§8.3): Spots List カードを廃止し、ここに統合する。
+           訪問順に丸番号 + スポット名のチップを横スクロールで並べる。 -->
+      <div class="itinerary-strip" aria-label="訪問順">
+        <p class="itinerary-strip__label">訪問順</p>
+        <div v-if="sortedWaypoints.length" class="itinerary-strip__row">
+          <button
+            v-for="(poi, index) in sortedWaypoints"
+            :key="poi.spot_id"
+            type="button"
+            class="stop-chip"
+            @click="focusOnSpot(poi)"
+          >
+            <span class="stop-chip__num">{{ index + 1 }}</span>
+            <span v-if="isFacilitySpotId(poi.spot_id)" aria-hidden="true">🏢</span>
+            {{ poiListLabel(poi) }}
+            <span
+              v-if="isRouteReady && latestBySpot(poi.spot_id)"
+              class="stop-chip__rt"
+              :title="isFacilitySpotId(poi.spot_id) ? '施設' : weatherTitle(latestBySpot(poi.spot_id))"
+            >
+              {{ isFacilitySpotId(poi.spot_id) ? '🏢' : weatherEmoji(latestBySpot(poi.spot_id)?.w) }}
+              <span class="rt-badge crowd" :class="crowdBadge(latestBySpot(poi.spot_id)).className">{{ crowdBadge(latestBySpot(poi.spot_id)).label }}</span>
+            </span>
+          </button>
+        </div>
+        <p v-else class="itinerary-strip__empty">まだ旅程がありません</p>
+
+        <template v-if="isNavigationReady && sortedAlongPois.length > 0">
+          <p class="itinerary-strip__label itinerary-strip__label--secondary">近くのおすすめ</p>
+          <div class="itinerary-strip__row">
+            <button
+              v-for="poi in sortedAlongPois"
+              :key="poi.spot_id"
+              type="button"
+              class="stop-chip stop-chip--nearby"
+              @click="focusOnSpot(poi)"
+            >
+              <span v-if="isFacilitySpotId(poi.spot_id)" aria-hidden="true">🏢</span>
+              {{ poiListLabel(poi) }}
+            </button>
+          </div>
+        </template>
       </div>
 
       <div class="toast-stack">
@@ -396,7 +385,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useNavStore } from '@/stores/nav'
 import { useRouter } from 'vue-router'
@@ -422,6 +411,19 @@ import { usePosition } from '@/lib/usePosition.mock.js'
 const navStore = useNavStore()
 const rtStore = useRtStore()
 const router = useRouter()
+
+// 「⋯」メニューの開閉状態。トリガーは NavWindow.vue のヘッダーにあるため、
+// provide/inject で共有する(frontend_design_system.md §8.3/§8.4)。
+//
+// L-1 是正: legacy ルート `/nav` は NavView.vue を NavWindow でラップせずに
+// 直接マウントするため、provide が届かず、メニューを開くトリガー(⋯ ボタン)
+// がヘッダーにもそもそも存在しない。provide の有無を判定し、無ければこの
+// コンポーネント自身がトリガーを出す(呼び出す関数・状態は同じ
+// isControlsMenuOpen のまま。挙動は変えていない)。
+const NAV_CONTROLS_MENU_NOT_PROVIDED = Symbol('nav-controls-menu-not-provided')
+const injectedControlsMenuOpen = inject('navControlsMenuOpen', NAV_CONTROLS_MENU_NOT_PROVIDED)
+const isStandaloneNavView = injectedControlsMenuOpen === NAV_CONTROLS_MENU_NOT_PROVIDED
+const isControlsMenuOpen = isStandaloneNavView ? ref(false) : injectedControlsMenuOpen
 
 const {
   plan,
@@ -1178,9 +1180,9 @@ function poiKindLabel(poi) {
 function poiListLabel(poi) {
   // F9([25 §1-7] レビュー是正): 名前解決に失敗しても spot_id へは
   // フォールバックしない(frontend_nav.md §2.4)。
-  const base = poi?.name || '不明な地点'
-  const category = poi?.category ? `（${poi.category}）` : ''
-  return `${base}${category}`
+  // P7([frontend_design_system.md §7.7]): `poi.category` は `tourist_spot`
+  // のような内部 enum であり、画面に出さない。名前だけを返す。
+  return poi?.name || '不明な地点'
 }
 
 const spotNameMap = computed(() => {
@@ -1221,7 +1223,7 @@ function startLoraPolling() {
         await join()
         isLoraConnected.value = true
       } catch (e) {
-        pushToast('LoRa Error', 'Failed to re-join.', 6000)
+        pushToast('LoRa', '再接続に失敗しました。', 6000)
         await disconnectLoraDevice()
         return
       } finally {
@@ -1250,20 +1252,20 @@ async function connectLoraDevice() {
     await connect(
       (receivedData) => rtStore.applyDownlink(receivedData, plan.value?.manifest),
       () => {
-        pushToast('LoRa', 'Device disconnected.', 5000)
+        pushToast('LoRa', 'デバイスが切断されました。', 5000)
         disconnectLoraDevice()
       }
     )
     await join()
     isLoraConnected.value = true
-    pushToast('LoRa', 'Connected to device and joined network.')
+    pushToast('LoRa', 'デバイスに接続し、ネットワークに参加しました。')
     await new Promise((resolve) => setTimeout(resolve, 3000))
     if (isPollingEnabled.value) {
       rtStore.stopPolling()
       startLoraPolling()
     }
   } catch (error) {
-    alert(`LoRa connection error: ${error.message}`)
+    alert(`LoRa 接続エラー: ${error.message}`)
     await disconnect()
     isLoraConnected.value = false
   } finally {
@@ -1391,31 +1393,34 @@ function focusOnSpot(poi) {
 function weatherEmoji(w) { return { 0: '☀', 1: '☁', 2: '☂' }[w] || '▫' }
 function weatherTitle(doc) { if (!doc) return ''; const m = { 0: '晴れ', 1: '曇り', 2: '雨' }; return `現在: ${m[doc.w] ?? '-'}` }
 
+// P7/§6-2([frontend_design_system.md](../../Docs/30_design/frontend_design_system.md)):
+// `label` は画面に常時出る短いラベルなので日本語にする(`tooltip` はもともと
+// 日本語)。
 const CROWD_STATES = [
   {
     level: 0,
-    label: 'Clear Flow',
+    label: '空いてる',
     tooltip: '全く混んでいません',
     toast: '空いています',
     className: 'is-low'
   },
   {
     level: 1,
-    label: 'Moderate Crowd',
+    label: 'やや混雑',
     tooltip: 'やや混雑しています',
     toast: 'やや混雑しています',
     className: 'is-mid'
   },
   {
     level: 2,
-    label: 'Heavy Crowd',
+    label: '混雑',
     tooltip: 'かなり混雑しています',
     toast: '混雑しています',
     className: 'is-high'
   }
 ]
 const UNKNOWN_CROWD_STATE = {
-  label: 'Unknown',
+  label: '不明',
   tooltip: '混雑情報なし',
   toast: '混雑情報なし',
   className: 'is-unknown',
@@ -1423,19 +1428,19 @@ const UNKNOWN_CROWD_STATE = {
 
 const SITUATION_META = {
   weather_cloudy: {
-    title: 'Weather · Cloudy',
+    title: '天気 · 曇り',
     fallback: (spotName) => `${spotName}は現在、雲が広がっています。空模様の変化にご注意ください。`
   },
   weather_rain: {
-    title: 'Weather · Rain',
+    title: '天気 · 雨',
     fallback: (spotName) => `${spotName}では雨が降っています。足元が滑りやすいのでお気をつけください。`
   },
   congestion_mid: {
-    title: 'Crowd · Moderate',
+    title: '混雑 · やや混雑',
     fallback: (spotName) => `${spotName}は現在やや混雑しています。移動には少し時間に余裕を持ってください。`
   },
   congestion_high: {
-    title: 'Crowd · Heavy',
+    title: '混雑 · かなり混雑',
     fallback: (spotName) => `${spotName}は現在かなり混雑しています。ルートの変更もご検討ください。`
   },
 }
@@ -1579,9 +1584,13 @@ function latestBySpot(spotId) { return rtStore.getLatest?.(spotId) ?? null }
   color: #334155;
 }
 .debug-toggle {
-  position: fixed;
-  bottom: 20px;
-  left: 20px;
+  /* L-9 是正: `.nav-window`(親)の will-change: transform がこの要素の
+     containing block になるため、position: fixed は「ウィンドウの右下」
+     ではなく実質「ウィンドウ内」に閉じ込められる。bottom 起点だと旅程
+     ストリップの 1 番目のチップに重なっていた。地図左上へ移す。 */
+  position: absolute;
+  top: 12px;
+  left: 12px;
   z-index: 960;
   width: 44px;
   height: 44px;
@@ -1631,19 +1640,22 @@ function latestBySpot(spotId) { return rtStore.getLatest?.(spotId) ?? null }
     max-height: calc(100vh - 120px);
   }
   .debug-toggle {
-    left: 16px;
-    bottom: 16px;
+    left: 12px;
+    top: 12px;
   }
 }
 .nav-container {
   position: relative;
   width: 100%;
   height: 100%;
+  display: flex;
+  flex-direction: column;
 }
 .map-wrapper {
   position: relative;
   width: 100%;
-  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 /* 音声ガイドキャプション */
@@ -1832,729 +1844,336 @@ function latestBySpot(spotId) { return rtStore.getLatest?.(spotId) ?? null }
   }
 }
 
-/* 地図操作ボタン (現在地追従) - 右下 */
+/* 地図操作ボタン(現在地追従) - 右下。地図に重なる常設要素はこれ 1 つだけ
+   (frontend_design_system.md §8.3)。 */
 .map-actions {
   position: absolute;
-  top: 55%;
-  right: 40px;
-  transform: translateY(-50%);
+  right: 14px;
+  bottom: 14px;
   z-index: 900;
 }
-
-@media (max-width: 640px) {
-  .map-actions {
-    top: 70%;
-    right: 24px;
-  }
-  .map-action-btn {
-    width: 72px;
-    padding: 20px 12px 16px;
-  }
-  .map-action-btn__label {
-    font-size: 0.62rem;
-  }
-}
-.map-action-btn {
-  position: relative;
-  width: 86px;
-  padding: 24px 14px 18px;
-  border-radius: 24px;
+.follow-btn {
+  width: 44px;
+  height: 44px;
+  border-radius: 9999px;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  border: none;
-  background: linear-gradient(135deg, rgba(37, 99, 235, 0.95), rgba(59, 130, 246, 0.88));
-  color: #0f172a;
+  border: 1px solid var(--color-edge-strong);
+  background: rgba(24, 29, 33, 0.8);
+  backdrop-filter: blur(10px);
+  color: var(--color-text);
   cursor: pointer;
-  box-shadow: 0 22px 38px rgba(37, 99, 235, 0.35);
-  transition: all 0.2s ease-in-out;
-  overflow: hidden;
+  box-shadow: var(--shadow-raised);
+  transition: background-color var(--motion-base) var(--ease-standard), transform var(--motion-base) var(--ease-expressive);
 }
-.map-action-btn svg {
-  position: relative;
-  z-index: 1;
-  color: currentColor;
+.follow-btn:hover {
+  background: rgba(34, 42, 46, 0.9);
+  transform: translateY(-1px);
 }
-.map-action-btn__halo {
-  position: absolute;
-  inset: -40%;
-  background: radial-gradient(circle at 50% 40%, rgba(255, 255, 255, 0.45), transparent 65%);
-  opacity: 0;
-  transition: opacity 0.25s ease;
+.follow-btn.is-following {
+  color: var(--color-signal);
+  border-color: rgba(47, 201, 176, 0.45);
 }
-.map-action-btn:hover {
-  transform: translateY(-3px);
-  box-shadow: 0 28px 46px rgba(59, 130, 246, 0.45);
-}
-.map-action-btn:hover .map-action-btn__halo {
-  opacity: 0.6;
-}
-.map-action-btn.is-following {
-  background: linear-gradient(135deg, rgba(14, 165, 233, 0.95), rgba(16, 185, 129, 0.9));
-  color: #0f172a;
-  box-shadow: 0 26px 44px rgba(16, 185, 129, 0.38);
-}
-.map-action-btn.is-following .map-action-btn__label {
-  color: #0f172a;
-}
-.map-action-btn:disabled {
+.follow-btn:disabled {
   cursor: not-allowed;
-  opacity: 0.65;
-  box-shadow: none;
+  opacity: 0.5;
   transform: none;
 }
 .icon-location { transition: transform 0.4s cubic-bezier(0.68, -0.55, 0.27, 1.55); }
 .icon-location-dot { transform: scale(0); transition: transform 0.3s ease-in-out; transform-origin: center; }
-.map-action-btn.is-following .icon-location { transform: rotate(135deg); }
-.map-action-btn.is-following .icon-location-dot { transform: scale(1); }
-.map-action-btn__label {
-  margin-top: 10px;
-  font-size: 0.7rem;
-  letter-spacing: 0.24em;
-  text-transform: uppercase;
-  color: #e2e8f0;
-}
+.follow-btn.is-following .icon-location { transform: rotate(135deg); }
+.follow-btn.is-following .icon-location-dot { transform: scale(1); }
 
-/* 左上UIコンテナ */
-.top-left-ui-area {
+.sr-only {
   position: absolute;
-  top: 16px;
-  left: 16px;
-  z-index: 1000;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  align-items: flex-start;
-}
-.controls {
-  display: grid;
-  gap: 8px;
-  width: min(320px, calc(100vw - 32px));
-}
-.tour-mode-banner,
-.offline-pack-panel {
-  border-radius: 12px;
-  border: 1px solid rgba(45, 212, 191, 0.4);
-  background: rgba(15, 23, 42, 0.9);
-  color: #e2e8f0;
-  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.32);
-  backdrop-filter: blur(10px);
-}
-.tour-mode-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 10px 12px;
-}
-.tour-mode-banner div {
-  display: grid;
-  gap: 2px;
-}
-.tour-mode-banner strong { color: #5eead4; }
-.tour-mode-banner span { font-size: 0.72rem; color: #cbd5e1; }
-.tour-mode-banner button,
-.offline-pack-panel button {
-  border: 1px solid rgba(148, 163, 184, 0.35);
-  border-radius: 8px;
-  background: rgba(30, 41, 59, 0.8);
-  color: #e2e8f0;
-  padding: 6px 9px;
-  cursor: pointer;
-}
-.offline-pack-panel {
-  display: grid;
-  gap: 8px;
-  padding: 10px 12px;
-  font-size: 0.76rem;
-}
-.offline-pack-panel p { margin: 0; }
-.offline-pack-panel__header,
-.offline-pack-panel__progress,
-.offline-pack-panel__actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.offline-pack-panel__warning { color: #fcd34d; }
-.offline-pack-panel .offline-pack-panel__primary {
-  border-color: rgba(45, 212, 191, 0.55);
-  background: rgba(13, 148, 136, 0.85);
-  color: white;
-}
-.offline-pack-panel button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-/* 横並びコントロールバー */
-.controls .control-buttons {
-  display: flex;
-  flex-direction: row;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 8px 10px;
-  border-radius: 12px;
-  background: rgba(15, 23, 42, 0.75);
-  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.3);
-  backdrop-filter: blur(10px);
-  border: 1px solid rgba(148, 163, 184, 0.25);
-  max-width: min(320px, 100%);
-}
-.control-btn {
-  position: relative;
-  border: none;
-  border-radius: 10px;
-  background: linear-gradient(135deg, rgba(30, 64, 175, 0.9), rgba(59, 130, 246, 0.85));
-  color: #e2e8f0;
-  cursor: pointer;
-  padding: 8px 12px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.78rem;
-  letter-spacing: 0.02em;
-  transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.3s ease;
-  box-shadow: 0 8px 18px rgba(37, 99, 235, 0.26);
-  flex: 1 1 110px;
-}
-.control-btn svg { flex-shrink: 0; }
-.control-btn:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 10px 20px rgba(59, 130, 246, 0.34);
-}
-.control-btn.is-active {
-  background: linear-gradient(135deg, rgba(22, 163, 74, 0.92), rgba(34, 197, 94, 0.92));
-  box-shadow: 0 10px 22px rgba(34, 197, 94, 0.32);
-  color: #f0fdf4;
-}
-.control-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-  box-shadow: none;
-}
-
-.data-sync-btn {
-  min-width: 120px;
-  justify-content: center;
-  background: linear-gradient(135deg, rgba(29, 78, 216, 0.88), rgba(79, 70, 229, 0.88));
-  flex: 1 1 140px;
-}
-.control-btn.is-active.data-sync-btn {
-  background: linear-gradient(135deg, rgba(99, 102, 241, 0.95), rgba(168, 85, 247, 0.95));
-}
-.data-sync-btn__label {
-  font-weight: 600;
-  text-transform: uppercase;
-  font-size: 0.6rem;
-  letter-spacing: 0.1em;
-}
-
-.lora-panel {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  border-radius: 10px;
-  background: linear-gradient(135deg, rgba(17, 94, 89, 0.9), rgba(15, 23, 42, 0.92));
-  border: 1px solid rgba(45, 212, 191, 0.3);
-  color: #ccfbf1;
-  min-width: 150px;
-  box-shadow: 0 10px 20px rgba(14, 116, 144, 0.28);
-  transition: border-color 0.3s ease, box-shadow 0.3s ease;
-  flex: 1 1 160px;
-}
-.lora-panel.is-connecting {
-  border-color: rgba(56, 189, 248, 0.5);
-  box-shadow: 0 10px 20px rgba(56, 189, 248, 0.24);
-}
-.lora-panel.is-connected {
-  border-color: rgba(34, 197, 94, 0.55);
-  box-shadow: 0 10px 20px rgba(34, 197, 94, 0.26);
-}
-.lora-panel__icon {
-  width: 32px;
-  height: 32px;
-  border-radius: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(15, 118, 110, 0.3);
-  color: inherit;
-  box-shadow: inset 0 0 0 1px rgba(45, 212, 191, 0.28);
-}
-.lora-panel__body {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.2;
-  gap: 2px;
-}
-.lora-panel__label {
-  font-size: 0.6rem;
-  text-transform: uppercase;
-  letter-spacing: 0.16em;
-  opacity: 0.7;
-}
-.lora-panel__status {
-  font-size: 0.74rem;
-  font-weight: 600;
-}
-.lora-toggle-btn {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: none;
-  border-radius: 999px;
-  padding: 5px 10px;
-  background: rgba(15, 23, 42, 0.55);
-  color: #f8fafc;
-  font-size: 0.7rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  cursor: pointer;
-  transition: background 0.2s ease, transform 0.2s ease;
-}
-.lora-toggle-btn:hover {
-  transform: translateY(-2px);
-  background: rgba(15, 23, 42, 0.7);
-}
-.lora-toggle-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-  transform: none;
-}
-.lora-toggle-btn__dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.5);
-  position: relative;
-}
-.lora-toggle-btn__dot.is-active {
-  background: rgba(34, 197, 94, 0.95);
-  box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.2);
-}
-.lora-toggle-btn__dot.is-busy {
-  background: rgba(56, 189, 248, 0.95);
-  box-shadow: 0 0 0 4px rgba(56, 189, 248, 0.18);
-  animation: loraBlink 1.2s ease-in-out infinite;
-}
-.lora-toggle-btn__text {
-  text-transform: uppercase;
-  letter-spacing: 0.18em;
-}
-
-@keyframes loraBlink {
-  0%, 100% { opacity: 0.6; }
-  50% { opacity: 1; }
-}
-
-@media (max-width: 540px) {
-  .controls .control-buttons {
-    width: calc(100vw - 48px);
-  }
-  .control-btn,
-  .data-sync-btn,
-  .lora-panel {
-    flex: 1 1 100%;
-  }
-  .data-sync-btn,
-  .lora-panel {
-    min-width: auto;
-  }
-}
-
-.spot-list-panel {
-  width: 210px;
-  border-radius: 12px;
-  overflow: hidden;
-  background: rgba(15, 23, 42, 0.8);
-  backdrop-filter: blur(10px);
-  border: 1px solid rgba(148, 163, 184, 0.25);
-  box-shadow: 0 14px 24px rgba(15, 23, 42, 0.32);
-}
-.spot-list-toggle {
-  width: 100%;
-  padding: 10px 12px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  background: rgba(15, 23, 42, 0.55);
-  border: none;
-  cursor: pointer;
-  color: #e2e8f0;
-  transition: background 0.2s ease;
-}
-.spot-list-toggle:hover {
-  background: rgba(30, 41, 59, 0.65);
-}
-.spot-list-toggle__left {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  text-align: left;
-}
-.spot-list-toggle__eyebrow {
-  font-size: 0.56rem;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
-  opacity: 0.6;
-}
-.spot-list-toggle__title {
-  font-size: 0.86rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-}
-.chevron-icon {
-  transition: transform 0.3s ease;
-}
-.chevron-icon.is-open {
-  transform: rotate(180deg);
-}
-
-.spot-list-content {
-  max-height: 0;
-  overflow: hidden;
-  transition: max-height 0.35s ease;
-}
-.spot-list-content.is-open {
-  max-height: 60vh;
-  overflow-y: auto;
-}
-.spot-list-content-inner {
-  padding: 10px 12px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.spot-list-content-inner ul {
-  list-style: none;
+  width: 1px;
+  height: 1px;
   padding: 0;
-  margin: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.spot-list-content-inner li button {
-  width: 100%;
-  background: rgba(15, 23, 42, 0.55);
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  border-radius: 10px;
-  padding: 8px 10px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: #f8fafc;
-  font-size: 0.8rem;
-  cursor: pointer;
-  transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease;
-}
-.spot-list-content-inner li button:hover {
-  transform: translateY(-2px);
-  border-color: rgba(94, 234, 212, 0.6);
-  background: rgba(15, 118, 110, 0.55);
-}
-.order-index {
-  flex-shrink: 0;
-  width: 22px;
-  height: 22px;
-  border-radius: 5px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 700;
-  background: linear-gradient(135deg, rgba(56, 189, 248, 0.9), rgba(59, 130, 246, 0.9));
-  color: #0f172a;
-  box-shadow: 0 6px 12px rgba(56, 189, 248, 0.26);
-}
-.rt-badges {
-  margin-left: auto;
-  display: inline-flex;
-  gap: 3px;
-}
-.rt-badges .rt-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 18px;
-  min-height: 18px;
-  border-radius: 999px;
-  background: rgba(148, 163, 184, 0.25);
-  padding: 4px 8px;
-  font-size: 0.75rem;
-}
-.rt-badge.crowd.is-low {
-  background: rgba(34, 197, 94, 0.18);
-  color: #4ade80;
-  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.3);
-}
-.rt-badge.crowd.is-mid {
-  background: rgba(234, 179, 8, 0.18);
-  color: #facc15;
-  box-shadow: 0 0 0 1px rgba(234, 179, 8, 0.28);
-}
-.rt-badge.crowd.is-high {
-  background: rgba(248, 113, 113, 0.2);
-  color: #f87171;
-  box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.32);
-}
-.rt-badge.crowd.is-unknown {
-  background: rgba(148, 163, 184, 0.2);
-  color: #cbd5e1;
-}
-.nearby-section {
-  border-top: 1px solid rgba(148, 163, 184, 0.2);
-  padding-top: 12px;
-}
-.nearby-title {
-  font-size: 0.78rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: rgba(148, 197, 255, 0.8);
-  margin-bottom: 8px;
-}
-.nearby-button {
-  width: 100%;
-  border: 1px dashed rgba(148, 163, 184, 0.25);
-  border-radius: 10px;
-  background: rgba(15, 23, 42, 0.4);
-  padding: 8px 10px;
-  color: #e2e8f0;
-  font-size: 0.82rem;
-  cursor: pointer;
-  transition: border-color 0.2s ease, transform 0.2s ease;
-}
-.nearby-button:hover {
-  transform: translateY(-2px);
-  border-color: rgba(249, 115, 22, 0.65);
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
-.start-nav-panel {
-  width: min(290px, calc(100vw - 32px));
-  padding: 12px 14px 14px;
-  border-radius: 14px;
-  background: linear-gradient(135deg, rgba(15, 23, 42, 0.85), rgba(30, 64, 175, 0.92));
-  box-shadow: 0 16px 30px rgba(15, 23, 42, 0.42);
-  border: 1px solid rgba(99, 102, 241, 0.34);
-  color: #e2e8f0;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.start-nav-button {
-  position: relative;
-  overflow: hidden;
-  width: 100%;
-  border: none;
-  border-radius: 12px;
-  padding: 12px 14px;
-  background: linear-gradient(135deg, rgba(59, 130, 246, 0.95), rgba(14, 165, 233, 0.9));
-  color: #0f172a;
-  font-weight: 700;
-  font-size: 0.9rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  cursor: pointer;
+/* 観光モードの帯。地図の上部に定位置を持つ(地図には重ねない)。 */
+.tour-mode-bar {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 8px;
-  box-shadow: 0 12px 24px rgba(56, 189, 248, 0.34);
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  gap: 10px;
+  flex-shrink: 0;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--color-edge);
+  background: var(--color-raised);
+  color: var(--color-text);
+  font-size: 13px;
 }
-.start-nav-button:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 14px 28px rgba(56, 189, 248, 0.4);
+.tour-mode-bar__status {
+  color: var(--color-text-muted);
 }
-.start-nav-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.7;
-  transform: none;
-  box-shadow: none;
+.tour-mode-bar__exit {
+  margin-left: auto;
+  min-height: 44px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-edge-strong);
+  background: transparent;
+  color: var(--color-text-muted);
+  padding: 0 12px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background-color var(--motion-fast), color var(--motion-fast);
 }
-.start-nav-button__spark {
+.tour-mode-bar__exit:hover {
+  background: var(--color-fill-hover);
+  color: var(--color-text);
+}
+
+/* ⋯ メニュー(§8.3)。「端末に取り込む」「オフライン資材」「ライブ同期」
+   「LoRa リンク」を 1 枚のポップオーバーに畳む。 */
+.controls-menu-scrim {
   position: absolute;
-  inset: -40%;
-  background: radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.55), transparent 65%);
-  opacity: 0;
-  transition: opacity 0.3s ease;
+  inset: 0;
+  z-index: 940;
 }
-.start-nav-button:hover .start-nav-button__spark {
+.controls-menu {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 950;
+  width: min(300px, calc(100% - 24px));
+  max-height: calc(100% - 24px);
+  overflow-y: auto;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-edge-strong);
+  background: var(--color-raised);
+  box-shadow: var(--shadow-overlay);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.menu-section + .menu-section,
+.menu-section + button.menu-row,
+button.menu-row + .menu-section {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--color-edge);
+}
+.menu-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 44px;
+  border-radius: var(--radius-sm);
+  border: 0;
+  background: transparent;
+  color: var(--color-text-muted);
+  padding: 8px 11px;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--motion-fast), color var(--motion-fast);
+}
+.menu-row:hover:not(:disabled) {
+  background: var(--color-fill-hover);
+  color: var(--color-text);
+}
+.menu-row:disabled {
+  cursor: not-allowed;
   opacity: 0.6;
 }
-.start-nav-button__inner {
-  position: relative;
-  z-index: 1;
-  display: inline-flex;
+.menu-row--static {
+  cursor: default;
+}
+.menu-row--static:hover {
+  background: transparent;
+  color: var(--color-text-muted);
+}
+.menu-row.is-active .menu-row__label {
+  color: var(--color-text);
+}
+.menu-row__label {
+  flex: 1;
+}
+.menu-row__status {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--color-text-dim);
+  display: flex;
   align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+.menu-row__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: var(--color-signal);
+  display: block;
+}
+.menu-detail {
+  padding: 2px 11px 10px;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
+  font-size: 12px;
+  color: var(--color-text-muted);
 }
-.start-nav-button__icon {
-  filter: drop-shadow(0 4px 8px rgba(14, 165, 233, 0.3));
-}
-.start-nav-button__label {
-  font-size: 0.72rem;
-  letter-spacing: 0.16em;
-}
-.start-nav-button__progress {
-  position: absolute;
-  left: 10px;
-  right: 10px;
-  bottom: 8px;
-  height: 3px;
-  border-radius: 999px;
-  background: rgba(15, 23, 42, 0.25);
-  overflow: hidden;
-  opacity: 0;
-  transition: opacity 0.2s ease;
-}
-.start-nav-button__progress span {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 40%;
-  min-width: 60px;
-  background: linear-gradient(135deg, rgba(56, 189, 248, 0.9), rgba(14, 165, 233, 0.9));
-  border-radius: inherit;
-  transform: translateX(-100%);
-  animation: startProgress 1.8s ease-in-out infinite;
-}
-.start-nav-button__progress span:nth-child(2) { animation-delay: 0.22s; }
-.start-nav-button__progress span:nth-child(3) { animation-delay: 0.44s; }
-.start-nav-button__progress span:nth-child(4) { animation-delay: 0.66s; }
-
-.start-nav-button.is-loading .start-nav-button__progress {
-  opacity: 1;
-}
-.start-nav-button.is-loading {
-  background: linear-gradient(135deg, rgba(14, 165, 233, 0.92), rgba(125, 211, 252, 0.95));
-  color: #0c4a6e;
-}
-
-@keyframes startProgress {
-  0% { transform: translateX(-100%); }
-  50% { transform: translateX(30%); }
-  100% { transform: translateX(120%); }
-}
-
-.start-nav-status {
+.menu-detail__row {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
-  border-radius: 10px;
-  background: rgba(15, 23, 42, 0.6);
-  border: 1px solid rgba(148, 163, 184, 0.3);
-  font-size: 0.82rem;
-  color: #e0f2fe;
+  flex-wrap: wrap;
 }
-.start-nav-status__pulse {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: rgba(56, 189, 248, 0.95);
-  box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.4);
-  animation: statusPulse 1.6s ease-out infinite;
+.menu-detail__muted {
+  color: var(--color-text-dim);
 }
-.start-nav-status__text {
-  letter-spacing: 0.06em;
+.menu-detail__count {
+  color: var(--color-text);
+  font-family: var(--font-display);
 }
-
-.pack-progress {
-  display: grid;
-  gap: 9px;
-  padding: 10px;
-  border-radius: 10px;
-  background: rgba(15, 23, 42, 0.68);
-  border: 1px solid rgba(148, 163, 184, 0.3);
-  color: #e2e8f0;
-  font-size: 0.78rem;
+.menu-detail__badge {
+  border-radius: 9999px;
+  border: 1px solid var(--color-edge-strong);
+  background: var(--color-fill-hover);
+  padding: 2px 9px;
+  font-size: 10.5px;
+  color: var(--color-text-muted);
 }
-.pack-progress__header,
-.pack-progress__counts {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.pack-progress__elapsed {
-  color: #bae6fd;
-  font-variant-numeric: tabular-nums;
-}
-.pack-state-badge {
-  display: inline-flex;
-  align-items: center;
-  min-height: 22px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: rgba(56, 189, 248, 0.18);
-  color: #7dd3fc;
-  font-weight: 700;
-}
-.pack-state-badge.is-partial {
-  background: rgba(245, 158, 11, 0.2);
-  color: #fcd34d;
-}
-.pack-state-badge.is-failed {
-  background: rgba(248, 113, 113, 0.2);
-  color: #fca5a5;
-}
-.pack-state-badge.is-ready {
-  background: rgba(52, 211, 153, 0.2);
-  color: #6ee7b7;
-}
-.pack-progress__bar {
-  height: 5px;
+.menu-detail__bar {
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--color-fill-hover);
   overflow: hidden;
-  border-radius: 999px;
-  background: rgba(148, 163, 184, 0.24);
 }
-.pack-progress__bar span {
+.menu-detail__bar span {
   display: block;
   height: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, #38bdf8, #818cf8);
-  transition: width 0.25s ease;
+  background: var(--aurora-copy);
+  transition: width var(--motion-base) var(--ease-standard);
 }
-.pack-progress__message {
-  margin: 0;
-  line-height: 1.45;
+.menu-detail__message {
+  color: var(--color-text-muted);
 }
-.pack-progress__message.is-ready { color: #6ee7b7; }
-.pack-progress__message.is-partial { color: #fcd34d; }
-.pack-progress__message.is-failed { color: #fca5a5; }
-.pack-progress__missing summary {
+.menu-detail__message.is-warn,
+.menu-detail__warn-text {
+  color: var(--color-warn);
+}
+.menu-detail__missing summary {
   cursor: pointer;
-  color: #bae6fd;
+  color: var(--color-text-muted);
 }
-.pack-progress__missing ul {
-  max-height: 110px;
-  margin: 7px 0 0;
-  padding-left: 18px;
-  overflow-y: auto;
-  color: #cbd5e1;
+.menu-detail__missing ul {
+  margin-top: 6px;
+  padding-left: 16px;
+  color: var(--color-text-dim);
+}
+.menu-detail__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.menu-detail__btn {
+  min-height: 44px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-edge-strong);
+  background: transparent;
+  color: var(--color-text-muted);
+  padding: 0 12px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background-color var(--motion-fast), color var(--motion-fast);
+}
+.menu-detail__btn:hover:not(:disabled) {
+  background: var(--color-fill-hover);
+  color: var(--color-text);
+}
+.menu-detail__btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.menu-detail__btn--primary {
+  border-color: rgba(47, 201, 176, 0.45);
+  color: var(--color-signal-soft);
 }
 
-@keyframes statusPulse {
-  0% {
-    transform: scale(0.9);
-    box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.5);
-  }
-  70% {
-    transform: scale(1.05);
-    box-shadow: 0 0 0 10px rgba(56, 189, 248, 0);
-  }
-  100% {
-    transform: scale(0.9);
-    box-shadow: 0 0 0 0 rgba(56, 189, 248, 0);
-  }
+/* 旅程ストリップ(§8.3)。Spots List カードを廃止し、ここへ統合する。 */
+.itinerary-strip {
+  flex-shrink: 0;
+  border-top: 1px solid var(--color-edge);
+  background: rgba(24, 29, 33, 0.7);
+  backdrop-filter: blur(10px);
+  padding: 11px 14px;
+}
+.itinerary-strip__label {
+  font-size: 10px;
+  font-family: var(--font-display);
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--color-text-dim);
+  margin-bottom: 9px;
+}
+.itinerary-strip__label--secondary {
+  margin-top: 10px;
+}
+.itinerary-strip__row {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+.itinerary-strip__empty {
+  font-size: 12px;
+  color: var(--color-text-dim);
+}
+.stop-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  min-height: 44px;
+  border-radius: 9999px;
+  border: 1px solid var(--color-edge);
+  background: var(--color-fill-hover);
+  padding: 5px 14px 5px 6px;
+  font-size: 12.5px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color var(--motion-base), color var(--motion-base), background-color var(--motion-base);
+}
+.stop-chip:hover {
+  border-color: var(--color-edge-strong);
+  color: var(--color-text);
+}
+.stop-chip--nearby {
+  padding-left: 12px;
+}
+.stop-chip__num {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  border-radius: 9999px;
+  background: var(--color-high);
+  display: grid;
+  place-items: center;
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+.stop-chip__rt {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 2px;
 }
 
-/* その他 */
-.error-box { background: #fef2f2; color: #b91c1c; padding: 8px; border-radius: 4px; margin-top: 8px; font-size: 0.9rem; }
 .toast-stack { position: absolute; right: 12px; z-index: 1100; display: flex; flex-direction: column; gap: 8px; bottom: 90px; }
 .toast { background: rgba(15, 23, 42, 0.9); color: #f8fafc; padding: 12px 16px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); width: 280px; }
 .toast-body { font-size: 0.9rem; margin-top: 4px; opacity: 0.9; }

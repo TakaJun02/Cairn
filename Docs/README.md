@@ -43,6 +43,8 @@
 > **注意 1: Phase 2 の一部は Phase 1 の前提である。**Phase 1 の ILS ソルバーは `static.travel_times` を必要とするので、**OSRM の再ビルドと `build-geo` / `build-travel-times` だけは Phase 1 の着手前に済ませる**([90_backlog.md §C-0](90_backlog.md))。
 >
 > **注意 2: フロントエンドは差分改修に限る**([ADR-0017](adr/0017-frontend-incremental-change.md)、2026-08-01 のユーザー指示)。**`NavView.vue` の分割と SW の作り直しは撤回済み。**触ってよい範囲は [frontend_nav.md](30_design/frontend_nav.md) が正。
+>
+> **ただし表示層(見た目)は例外である**([ADR-0023](adr/0023-frontend-design-system.md)、2026-08-05 のユーザー指示)。**デザインシステム「Chokai Signal」を導入し、チャット画面とガイダンスマップの見た目を作り直す。**トークン・各画面の仕様・受け入れ条件は [frontend_design_system.md](30_design/frontend_design_system.md) が正。**動作ロジック(`stores/` / `lib/` / `sw.js`)には触らない**(同 §12)。
 
 > **⚠ 文書中の `spot_id` の例は実データと一致しない**(2026-08-01、実装中に確認)。各文書が例として繰り返し使う「鶴間池 = `spot_012`」「元滝伏流水 = `spot_007`」は**説明用の仮の値**である。実データは **`spot_012` = 元滝伏流水 / `spot_007` = 法体の滝**で、**「鶴間池」は 43 件に存在しない。**例は形を示すためのものなので文書は直さないが、**テストの期待値や検証に例の id をそのまま使わないこと。**
 
@@ -58,7 +60,8 @@
 | **パック成果物・variant・manifest** | **[30_design/packs_pipeline.md](30_design/packs_pipeline.md)** |
 | **地図データの作り方・compose の OSRM** | **[50_operations/osrm.md](50_operations/osrm.md)** |
 | **LoRa のペイロードと配信規則** | **[30_design/realtime_lora.md](30_design/realtime_lora.md)** |
-| **フロントで触ってよい範囲** | **[30_design/frontend_nav.md](30_design/frontend_nav.md)** |
+| **フロントで触ってよい範囲(機能)** | **[30_design/frontend_nav.md](30_design/frontend_nav.md)** |
+| **フロントの見た目(トークン・画面仕様・受け入れ条件)** | **[30_design/frontend_design_system.md](30_design/frontend_design_system.md)** |
 | 全体構成・依存ルール | **[20_architecture.md](20_architecture.md)** |
 | 決定の理由 | **[adr/](adr/)** |
 
@@ -85,6 +88,10 @@
 | [0017](adr/0017-frontend-incremental-change.md) | フロントエンドは差分改修に限る(**Phase 4**。20 §10 を一部撤回) |
 | [0018](adr/0018-ask-user-resumable-tool.md) | ~~`ask_user` の中断・復帰方式~~ (**廃止: ADR-0019**。「結果を返す 1 つの Tool・`kind` 2 用途」の核は引き継ぎ) |
 | [0019](adr/0019-react-main-agent-subagents.md) | **ReAct メインエージェント + サブエージェント構成へ完全作り替え**(`ask_user` は HITL の通常ツール。**0008・0009・0018 を置き換え**) |
+| [0020](adr/0020-routes-early-commit.md) | 経路の早期コミット |
+| [0021](adr/0021-edit-turn-default-lock.md) | 編集ターンの既定ロック |
+| [0022](adr/0022-plan-turn-explicit-candidate-pool.md) | 計画ターンの明示的候補プール |
+| [0023](adr/0023-frontend-design-system.md) | **フロントにデザインシステム「Chokai Signal」を導入し表示層を作り直す**(0017 の「デザインシステムを導入しない」の 1 行を撤回) |
 
 ---
 

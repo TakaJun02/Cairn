@@ -1,5 +1,5 @@
 <script setup>
-import { ref, watch, nextTick, onMounted, computed } from 'vue'
+import { ref, watch, nextTick, onMounted, onBeforeUnmount, computed, inject } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useUserStore } from '@/stores/user'
 import { useChatStore } from '@/stores/chat'
@@ -14,12 +14,22 @@ import OC_ChatInput from '@/components/OC_ChatInput.vue';
 
 const userStore = useUserStore()
 const chatStore = useChatStore()
-const { messages, isLoading, isSessionLoaded, isUndoing, currentPrompt, isAnswering } = storeToRefs(chatStore)
+const { messages, isLoading, isUndoing, currentPrompt, isAnswering } = storeToRefs(chatStore)
 
-const messagesContainer = ref(null);
+const scrollEl = ref(null);
 
 const chatInputText = ref('');
 const isPromptDismissed = ref(false);
+const isAtBottom = ref(true);
+
+// AppShell(共通祖先)から中継される、サイドバーの例文カードの下書き
+// (§5: 押すと入力欄に入る)。
+const composerDraft = inject('composerDraft', ref(''));
+watch(composerDraft, (text) => {
+  if (!text) return;
+  chatInputText.value = text;
+  composerDraft.value = '';
+});
 
 const isAskUserFormVisible = computed(() => Boolean(currentPrompt.value) && !isPromptDismissed.value);
 
@@ -41,27 +51,40 @@ const placeholderText = computed(() => {
   }
 });
 
-// --- Suggestion prompts ---
+// --- 空状態の見出し・提案ピル(§7.1) ---
+const emptyHeadingLines = computed(() => {
+  const lang = userStore.user?.language || 'ja';
+  const name = userStore.userName;
+  switch (lang) {
+    case 'en':
+      return { name: `Hi ${name},`, rest: 'where in Mt. Chokai shall we go?' };
+    case 'zh':
+      return { name: `${name}，`, rest: '鸟海山，我们去哪里？' };
+    default: // 'ja'
+      return { name: `${name}さん、`, rest: '鳥海山のどこへ行きましょうか' };
+  }
+});
+
 const suggestionTemplates = computed(() => {
   const lang = userStore.user?.language || 'ja';
   switch (lang) {
     case 'en':
       return [
-        { title: 'Recommend spots', description: 'Show me some interesting places.', fullText: 'Show recommended spots' },
-        { title: 'Add to plan', description: 'Add a specific spot to my itinerary.', fullText: 'Add (Spot Name) to the plan' },
-        { title: 'Find restaurants', description: 'Help me find a place to eat.', fullText: 'Where can I eat?' },
+        'Show recommended spots',
+        'I want to visit waterfalls and springs',
+        'Plan a half-day trip',
       ];
     case 'zh':
       return [
-        { title: '推荐景点', description: '告诉我一些有趣的地方。', fullText: '推荐一些景点' },
-        { title: '添加到计划', description: '将特定景点添加到我的行程中。', fullText: '将（景点名称）添加到计划中' },
-        { title: '寻找餐厅', description: '帮我找个吃饭的地方。', fullText: '告诉我可以在哪里吃饭' },
+        '推荐一些景点',
+        '想去瀑布和涌泉',
+        '制定半天的行程',
       ];
     default: // 'ja'
       return [
-        { title: 'おすすめを教えて', description: '周辺の面白い場所を教えて。', fullText: 'おすすめのスポットを教えて' },
-        { title: 'プランに追加', description: '特定のスポットを計画に加えて。', fullText: '（スポット名）をプランに追加して' },
-        { title: '食事場所を探す', description: '近くで食事ができる場所は？', fullText: '食事ができるところを教えて' },
+        'おすすめのスポットを教えて',
+        '滝や湧水を巡りたい',
+        '半日で回れるプランを作って',
       ];
   }
 });
@@ -93,58 +116,50 @@ function handleUndo(messageId) {
   void chatStore.undoItinerary(messageId)
 }
 
-// Function to scroll to the bottom of the messages container
-const scrollToBottom = () => {
-  nextTick(() => {
-    if (messagesContainer.value) {
-      messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
-    }
-  });
-};
+// 会話が下端付近にあるときだけ自動追従する。ユーザーが読み返すために上へ
+// スクロールしている間は追従しない(§7.2 最新へ戻るボタン)。
+const AT_BOTTOM_THRESHOLD = 64;
 
-// Watch for changes in the number of messages and scroll to bottom
+function updateIsAtBottom() {
+  const el = scrollEl.value;
+  if (!el) return;
+  const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+  isAtBottom.value = distance < AT_BOTTOM_THRESHOLD;
+}
+
+function scrollToBottom(smooth = false) {
+  nextTick(() => {
+    const el = scrollEl.value;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+    isAtBottom.value = true;
+  });
+}
+
+function handleScrollToLatestClick() {
+  scrollToBottom(true);
+}
+
 watch(() => messages.value.length, () => {
-  scrollToBottom();
+  if (isAtBottom.value) scrollToBottom();
 });
 
 watch(() => messages.value.at(-1)?.content, () => {
-  scrollToBottom();
+  if (isAtBottom.value) scrollToBottom();
 });
 
-watch(currentPrompt, () => {
+watch(currentPrompt, (prompt) => {
   isPromptDismissed.value = false;
+  if (prompt) scrollToBottom();
 });
 
-watch(isSessionLoaded, (isLoaded) => {
-  if (isLoaded && messages.value.length === 0) {
-    console.log('[ChatView] Session loaded and chat is empty. Adding welcome message.');
-    const lang = userStore.user?.language || 'ja';
-    let welcomeMessage = '';
-
-    switch (lang) {
-      case 'en':
-        welcomeMessage = `Hello, ${userStore.userName}. This app helps you create sightseeing plans for Mt. Chokai and find information about nearby spots through a conversation with an AI. To get started, try asking, "Show me some recommended spots"!`;
-        break;
-      case 'zh':
-        welcomeMessage = `你好, ${userStore.userName}。通过与AI对话，您可以使用此应用程序创建鸟海山的观光计划，并查找附近景点的信息。首先，让我们试着问“请告诉我推荐的景点”！`;
-        break;
-      default: // 'ja'
-        welcomeMessage = `こんにちは、${userStore.userName}さん。このアプリは、AIとの対話を通じて鳥海山の観光プランを作成したり、周辺のスポット情報を調べたりすることができます。まずは「おすすめのスポットを教えて」と聞いてみましょう！`;
-        break;
-    }
-
-    messages.value.push({
-      id: 'initial-welcome',
-      content: welcomeMessage,
-      sender: 'ai',
-      timestamp: new Date(),
-    });
-  }
-});
-
-// When the component is first mounted
 onMounted(() => {
-  scrollToBottom(); // Also scroll to bottom on initial load
+  scrollToBottom();
+  scrollEl.value?.addEventListener('scroll', updateIsAtBottom, { passive: true });
+});
+
+onBeforeUnmount(() => {
+  scrollEl.value?.removeEventListener('scroll', updateIsAtBottom);
 });
 
 </script>
@@ -153,68 +168,122 @@ onMounted(() => {
   <!-- The NavWindow component is preserved here, outside the new chat UI div -->
   <NavWindow />
 
-  <div class="tw-relative tw-w-full tw-h-full tw-flex tw-flex-col bg-noise">
-    <!-- Message List Area -->
-    <div class="tw-flex-1 tw-overflow-y-auto tw-pb-28 tw-overscroll-y-contain tw-touch-action-pan-y" ref="messagesContainer">
-      <OC_ChatMessages
-        :messages="messages"
-        :is-undoing="isUndoing"
-        @undo="handleUndo"
-      />
-    </div>
+  <div class="relative flex h-full w-full flex-col overflow-hidden">
+    <div class="ambient-glow" :class="{ 'is-receded': messages.length > 0 }"></div>
 
-    <!-- Floating Suggestion Cards -->
-    <div
-      v-if="!isAskUserFormVisible"
-      class="tw-absolute tw-bottom-[100px] sm:tw-bottom-[88px] tw-left-0 tw-w-full tw-z-10 tw-transition-all tw-touch-action-none"
-    >
-      <div class="no-scrollbar tw-flex tw-gap-3 tw-overflow-x-auto tw-px-4">
-        <div
-          v-for="suggestion in suggestionTemplates"
-          :key="suggestion.title"
-          @click="applySuggestion(suggestion.fullText)"
-          role="button"
-          tabindex="0"
-          class="tw-flex-shrink-0 tw-w-48 tw-p-3 tw-border tw-border-gray-300/80 tw-rounded-xl tw-bg-white/80 tw-backdrop-blur-md tw-shadow-sm hover:tw-shadow-lg hover:tw-border-gray-400/90 hover:-tw-translate-y-0.5 tw-transition-all tw-cursor-pointer focus:tw-outline-none focus:tw-ring-2 focus:tw-ring-blue-500"
-        >
-          <p class="tw-font-semibold tw-text-sm tw-text-gray-800">{{ suggestion.title }}</p>
-          <p class="tw-text-xs tw-text-gray-600 tw-mt-1">{{ suggestion.description }}</p>
+    <!-- 会話領域(スクロールするのはここだけ) -->
+    <div ref="scrollEl" class="relative z-[1] flex-1 overflow-y-auto">
+      <!-- 空状態(§7.1): 提案はここにしか出ない。会話に重ならない。
+           M-1 是正: コンポーザが absolute のため、空状態にもその高さぶんの
+           下端余白が要る(§7.3)。min-h-full + pb で確保し、収まらない
+           場合は親(scrollEl)がスクロールできるようにする。 -->
+      <div v-if="messages.length === 0" class="mx-auto flex min-h-full max-w-3xl flex-col justify-center px-5 pb-[150px]">
+        <div class="empty-item-enter">
+          <!-- N-1: アイコンの背後に色を敷かない。中立な暗い面(--color-raised)
+               に置き、細い --color-edge の枠で浮かせる(§2.1)。 -->
+          <div class="flex h-14 w-14 items-center justify-center rounded-ui border border-edge bg-ink-raised shadow-soft">
+            <img src="/app-icon.png" alt="" class="h-8 w-8 rounded-full">
+          </div>
+        </div>
+        <!-- N-2: 名前の行と定型文の行を別ブロックにして text-wrap: balance を
+             それぞれ独立に効かせる。1 つの balance を両行にまたがせると、
+             名前が長いときに定型文側で 1 文字だけの孤立行が生まれる
+             (例: 「行きましょう / か」)。 -->
+        <h2 class="empty-item-enter mt-6 text-[clamp(2rem,5vw,3.6rem)] font-semibold leading-[1.12] tracking-[-0.05em] text-text/90">
+          <span class="aurora-copy" style="display: block; text-wrap: balance">{{ emptyHeadingLines.name }}</span>
+          <span style="display: block; text-wrap: balance">{{ emptyHeadingLines.rest }}</span>
+        </h2>
+        <div class="empty-item-enter mt-7 flex flex-wrap gap-2.5">
+          <button
+            v-for="suggestion in suggestionTemplates"
+            :key="suggestion"
+            type="button"
+            class="group inline-flex min-h-11 max-w-full items-center gap-3 rounded-full border border-edge-strong bg-ink-surface/65 px-4 py-2 text-[13.5px] text-text/80 shadow-hairline transition-all duration-base ease-expressive hover:-translate-y-0.5 hover:bg-ink-raised hover:text-text"
+            @click="applySuggestion(suggestion)"
+          >
+            {{ suggestion }}
+            <svg class="h-4 w-4 shrink-0 text-brand-soft opacity-60 transition-all duration-fast group-hover:translate-x-[-2px] group-hover:translate-y-[2px] group-hover:opacity-100" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20 5v6a5 5 0 0 1-5 5H5M9 12l-4 4 4 4" />
+            </svg>
+          </button>
         </div>
       </div>
+
+      <template v-else>
+        <OC_ChatMessages
+          :messages="messages"
+          :is-undoing="isUndoing"
+          @undo="handleUndo"
+        />
+        <!-- §7.4: 質問は会話の流れの中のカード。コンポーザの上に貼り付く帯ではない。 -->
+        <div v-if="isAskUserFormVisible" class="mx-auto max-w-3xl px-4 pb-8">
+          <OC_AskUserForm
+            :prompt="currentPrompt"
+            :is-sending="isAnswering"
+            @select-option="handlePromptOption"
+            @answer="handlePromptAnswer"
+            @dismiss="handlePromptDismiss"
+          />
+        </div>
+        <div class="h-[150px]" aria-hidden="true"></div>
+      </template>
     </div>
 
-    <!-- Input Area -->
-    <div class="tw-shrink-0 tw-touch-action-none">
-      <OC_AskUserForm
-        v-if="isAskUserFormVisible"
-        :prompt="currentPrompt"
-        :is-sending="isAnswering"
-        @select-option="handlePromptOption"
-        @answer="handlePromptAnswer"
-        @dismiss="handlePromptDismiss"
-      />
-      <OC_ChatInput
-        v-model="chatInputText"
-        @sendMessage="handleSendMessage"
-        @stop="chatStore.stopStreaming"
-        :is-sending="isChatInputBlocked"
-        :placeholder="placeholderText"
-      />
+    <!-- コンポーザ(§7.3) -->
+    <div class="composer-dock pointer-events-none absolute inset-x-0 bottom-0 z-[6] pb-4 pt-11" style="background: linear-gradient(to bottom, transparent, rgba(var(--color-canvas-rgb), .92) 34%, var(--color-canvas) 68%)">
+      <div class="relative mx-auto max-w-3xl px-4">
+        <Transition name="pop-fade">
+          <button
+            v-if="!isAtBottom && messages.length > 0"
+            type="button"
+            class="pointer-events-auto absolute left-1/2 top-[-3.5rem] flex h-11 w-11 -translate-x-1/2 items-center justify-center rounded-full border border-edge-strong bg-ink-raised/70 text-text shadow-glass backdrop-blur-md transition-transform duration-base ease-expressive hover:-translate-y-0.5"
+            aria-label="最新のメッセージへ戻る"
+            @click="handleScrollToLatestClick"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 5v14M5 12l7 7 7-7" />
+            </svg>
+          </button>
+        </Transition>
+        <div class="pointer-events-auto">
+          <OC_AskUserForm
+            v-if="isAskUserFormVisible && messages.length === 0"
+            :prompt="currentPrompt"
+            :is-sending="isAnswering"
+            class="mb-2"
+            @select-option="handlePromptOption"
+            @answer="handlePromptAnswer"
+            @dismiss="handlePromptDismiss"
+          />
+          <OC_ChatInput
+            v-model="chatInputText"
+            @sendMessage="handleSendMessage"
+            @stop="chatStore.stopStreaming"
+            :is-sending="isChatInputBlocked"
+            :placeholder="placeholderText"
+          />
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
-<style>
-/* Utility to hide the scrollbar */
-.no-scrollbar::-webkit-scrollbar {
-    display: none;
-}
-.no-scrollbar {
-    -ms-overflow-style: none;  /* IE and Edge */
-    scrollbar-width: none;  /* Firefox */
+<style scoped>
+.aurora-copy {
+  display: inline-block;
+  background: var(--aurora-copy);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
 
-.bg-noise {
-  background-color: #1f2937; /* gray-800 */
+.pop-fade-enter-active,
+.pop-fade-leave-active {
+  transition: opacity var(--motion-base) var(--ease-standard), transform var(--motion-base) var(--ease-expressive);
+}
+.pop-fade-enter-from,
+.pop-fade-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 4px);
 }
 </style>

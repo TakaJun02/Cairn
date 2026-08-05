@@ -5,9 +5,7 @@ import piniaPluginPersistedstate from 'pinia-plugin-persistedstate'
 import { useNavStore } from '@/stores/nav'
 import router from './router'
 import App from './App.vue'
-import './assets/base.css'
-import './assets/main.css'
-import './assets/tailwind.css'
+import './assets/design-system.css'
 
 const app = createApp(App)
 const pinia = createPinia()

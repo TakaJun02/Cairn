@@ -1,6 +1,7 @@
 # ADR-0017: フロントエンドは差分改修に限る(全面リライト・NavView 分割をしない)
 
-- 状態: **決定 (2026-08-01、ユーザー指示)**
+- 状態: **決定 (2026-08-01、ユーザー指示)。一部撤回 (2026-08-05)**
+- ⚠ **[ADR-0023](0023-frontend-design-system.md) が「影響」節の「新規に足す UI は既存のスタイルに合わせる。新しいデザインシステムを導入しない」の 1 行を撤回した**(2026-08-05、ユーザー指示)。**それ以外の決定 —— `NavView.vue` の分割見送り、Service Worker の作り直し見送り、リファクタリング目的の変更の禁止、動いているモジュールへの不介入 —— は今も有効**である。表示層の作り直しの範囲は [30_design/frontend_design_system.md](../30_design/frontend_design_system.md) が正
 - 日付: 2026-08-01
 - 関係: **[20_architecture.md §10](../20_architecture.md) のフロントエンド節を一部撤回する**
 - 設計: [30_design/frontend_nav.md](../30_design/frontend_nav.md) / [30_design/offline_field_mode.md](../30_design/offline_field_mode.md)
