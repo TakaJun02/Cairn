@@ -58,7 +58,10 @@ onBeforeUnmount(() => {
 // --- UI用ヘルパー関数 ---
 function baseDisplayName(poi) {
   const names = poi?.official_name || poi?.names || {}
-  return names[lang.value] || names.ja || poi?.name || poi?.spot_id
+  // F9([25 §1-7] レビュー是正): 名前解決に失敗しても spot_id へは
+  // フォールバックしない。中立表記「不明な地点」を使う
+  // (frontend_nav.md §2.4)。
+  return names[lang.value] || names.ja || poi?.name || '不明な地点'
 }
 
 function displayName(p) {
@@ -67,7 +70,7 @@ function displayName(p) {
 
 function nameById(id) {
   const p = pois.value.find((x) => x.spot_id === id)
-  return p ? displayName(p) : id
+  return p ? displayName(p) : '不明な地点'
 }
 
 // --- 選択・並べ替えロジック ---

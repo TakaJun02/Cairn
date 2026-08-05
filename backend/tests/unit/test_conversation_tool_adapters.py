@@ -29,7 +29,7 @@ from app.domains.geo.repo import ApproachRecord, RouteRecord, SpotRecord
 from app.domains.itinerary.repo_types import ItineraryVersion, PlanningData
 from app.domains.itinerary.service import ItineraryService, SolverConfig
 from app.domains.itinerary.solver import PlanningSpot, TravelTimeMatrix
-from app.domains.itinerary.types import Diff, Itinerary
+from app.domains.itinerary.types import Concession, Diff, Itinerary, PredEnum
 from app.domains.itinerary.types import ToolError as ItineraryToolError
 
 
@@ -833,3 +833,63 @@ async def test_emit_itinerary_state_with_empty_assumptions() -> None:
     await provisional_sink(itinerary, Diff())
 
     assert sink.events[0].data["assumptions"] == []
+
+
+# ---------------------------------------------------------------------------
+# [25 §1-7]: `_emit_itinerary_state` の送出層マスク(旧形式 spot_id 入り
+# 譲歩文への防御)。
+# ---------------------------------------------------------------------------
+
+
+async def test_emit_itinerary_state_masks_legacy_spot_id_in_concessions() -> None:
+    """旧形式(spot_id 入り)で永続化済みの `message_ja` を、送出直前に
+
+    表示名(引ければ)・中立表記(引けなければ)へ置換する。トップレベルの
+    `concessions` と `itinerary.concessions` の両方が対象(chat_sse.md §1.2)。
+    """
+
+    sink = MemoryEventSink()
+    adapter = ToolAdapters(
+        cast(AsyncSession, None),
+        event_sink=sink,
+        settings=get_settings(),
+        spot_names={"spot_014": "元滝伏流水"},
+        thread_id=1,
+        user_id=42,
+    )
+    legacy_concession = Concession(
+        constraint_id="c_001",
+        pred=PredEnum.REQUIRE,
+        args={"target": "spot_014"},
+        violation=1.0,
+        message_ja="必須希望の「spot_014」を旅程に入れられませんでした",
+    )
+    unknown_concession = Concession(
+        constraint_id="c_002",
+        pred=PredEnum.REQUIRE,
+        args={"target": "spot_999"},
+        violation=1.0,
+        message_ja="必須希望の「spot_999」を旅程に入れられませんでした",
+    )
+    itinerary = Itinerary(
+        days=[],
+        version=5,
+        concessions=[legacy_concession, unknown_concession],
+    )
+
+    provisional_sink = adapter._provisional_itinerary_sink()
+    await provisional_sink(itinerary, Diff())
+
+    assert len(sink.events) == 1
+    payload = sink.events[0].data
+    for concessions in (payload["concessions"], payload["itinerary"]["concessions"]):
+        assert len(concessions) == 2
+        assert concessions[0]["message_ja"] == (
+            "必須希望の「元滝伏流水」を旅程に入れられませんでした"
+        )
+        assert concessions[1]["message_ja"] == (
+            "必須希望の「(名称未登録の地点)」を旅程に入れられませんでした"
+        )
+        for concession in concessions:
+            assert "spot_014" not in concession["message_ja"]
+            assert "spot_999" not in concession["message_ja"]

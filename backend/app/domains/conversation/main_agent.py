@@ -54,6 +54,7 @@ from app.domains.conversation.guards import (
     has_repeated_ngram,
 )
 from app.domains.conversation.history import estimate_tokens
+from app.domains.conversation.itinerary_digest import UNNAMED_SPOT_JA
 from app.domains.conversation.itinerary_subagent import (
     active_constraint_ids,
     run_edit_itinerary,
@@ -740,7 +741,7 @@ def _apply_recommend_result(state: TurnState, result: ToolResult) -> None:
         references.append(
             CandidateReference(
                 spot_id=spot_id,
-                name_ja=state.spot_names.get(spot_id, spot_id),
+                name_ja=state.spot_names.get(spot_id, UNNAMED_SPOT_JA),
                 rank=int(value.get("rank", index)),
             )
         )
@@ -784,7 +785,9 @@ def _format_recommend_digest(
             if not isinstance(value, dict):
                 continue
             spot_id = value.get("spot_id")
-            name = spot_names.get(spot_id, spot_id) if isinstance(spot_id, str) else "?"
+            name = (
+                spot_names.get(spot_id, UNNAMED_SPOT_JA) if isinstance(spot_id, str) else "?"
+            )
             rank = value.get("rank", "?")
             reason = value.get("reason_materials", {}) or {}
             tags = reason.get("matched_tags", [])

@@ -27,6 +27,7 @@ from app.domains.conversation.events import (
     state_event,
 )
 from app.domains.conversation.guards import filter_unresolvable_ask_user_options
+from app.domains.conversation.itinerary_digest import UNNAMED_SPOT_JA, mask_concession_list
 from app.domains.conversation.itinerary_selector import (
     LLMItinerarySelector,
     SelectorGenerationPort,
@@ -160,7 +161,7 @@ class ToolAdapters:
                         {
                             "spot_id": candidate.spot_id,
                             "name_ja": self.spot_names.get(
-                                candidate.spot_id, candidate.spot_id
+                                candidate.spot_id, UNNAMED_SPOT_JA
                             ),
                             "reason_materials": candidate.reason_materials.model_dump(
                                 mode="json"
@@ -703,6 +704,16 @@ class ToolAdapters:
         # chat_sse.md §1.2 の契約どおり、state:itinerary のトップレベルにも
         # そのまま複製する(2026-08-04 追加。provisional/final とも。
         # Docs/30_design/agent_react_architecture.md §5)。
+        # 2026-08-04 追加([25 §1-7]): `concessions[].message_ja` は発生源
+        # (predicates.py)で表示名を組む契約だが、旧形式(spot_id 入り)で
+        # 永続化済みの版が undo/GET と同じ経路で再浮上しうるため、送出直前に
+        # トップレベル・`itinerary.concessions` の両方をマスクする(送出層の防御)。
+        masked_concessions = mask_concession_list(concessions, self.spot_names)
+        itinerary = dict(itinerary)
+        if isinstance(itinerary.get("concessions"), list):
+            itinerary["concessions"] = mask_concession_list(
+                itinerary["concessions"], self.spot_names
+            )
         await emit(
             self.event_sink,
             state_event(
@@ -711,7 +722,7 @@ class ToolAdapters:
                 version=itinerary["version"],
                 itinerary=itinerary,
                 diff=diff,
-                concessions=concessions,
+                concessions=masked_concessions,
                 assumptions=itinerary.get("assumptions", []),
             ),
         )

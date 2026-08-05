@@ -55,7 +55,7 @@
               :key="item.spot_id"
               class="tw-rounded-xl tw-border tw-border-slate-600 tw-bg-slate-800/70 tw-p-3"
             >
-              <p class="tw-font-semibold tw-text-white">{{ item.name_ja || spotName(item.spot_id) }}</p>
+              <p class="tw-font-semibold tw-text-white">{{ candidateName(item) }}</p>
               <p v-if="candidateReason(item)" class="tw-mt-1 tw-text-xs tw-leading-relaxed tw-text-slate-300">
                 {{ candidateReason(item) }}
               </p>
@@ -117,7 +117,7 @@
           </ul>
           <ul v-if="itinerary.concessions?.length" class="tw-mt-3 tw-space-y-1">
             <li v-for="(item, index) in itinerary.concessions" :key="index" class="tw-text-xs tw-text-amber-200">
-              {{ item.message_ja || '一部の希望条件を調整しました。' }}
+              {{ concessionText(item) }}
             </li>
           </ul>
           <p v-if="undoError" class="tw-mt-2 tw-text-xs tw-text-red-300">{{ undoError }}</p>
@@ -150,6 +150,7 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { useUserStore } from '@/stores/user'
 import { useNavStore } from '@/stores/nav'
+import { maskSpotIds, resolveCandidateName } from '@/lib/spotDisplay.js'
 
 const props = defineProps({
   messageId: { type: [String, Number], required: true },
@@ -186,9 +187,28 @@ const itineraryAssumptions = computed(() => {
   return Array.isArray(values) ? values : []
 })
 
-const spotName = (spotId) => {
+// [25 §1-7](frontend_nav.md §2.4): 名前解決に失敗しても spot_id へは
+// フォールバックしない。中立表記「不明な地点」を使う。
+const resolveSpotName = (spotId) => {
   const spot = navStore.spots.find((value) => value.spot_id === spotId)
-  return spot?.name_ja || spot?.name || spotId
+  return spot?.name_ja || spot?.name || null
+}
+
+const spotName = (spotId) => resolveSpotName(spotId) || '不明な地点'
+
+// F7([25 §1-7] レビュー是正): 旧形式の永続 meta では `presented[].name_ja`
+// (candidateReference)に生の spot_id がそのまま入っていることがあり、
+// truthy なので `item.name_ja || spotName(...)` を素通りしていた。
+// 純関数 `resolveCandidateName`(spotDisplay.js。単体テスト済み)に
+// 切り出し、live SSE 経路・復元経路の両方をこの 1 箇所でカバーする。
+const candidateName = (item) => resolveCandidateName(item, resolveSpotName)
+
+// 譲歩(concessions[].message_ja)はサーバー契約上 spot_id を含まないが、
+// 旧形式で永続化済みの版への表示前フィルタとして通す(frontend_nav.md §2.4)。
+const concessionText = (item) => {
+  const message = item?.message_ja
+  if (!message) return '一部の希望条件を調整しました。'
+  return maskSpotIds(message, resolveSpotName)
 }
 
 const formatMinute = (value) => {

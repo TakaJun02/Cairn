@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 import pytest
 
+from app.domains.conversation.guards import _FORBIDDEN_SPOT_ID_RE
 from app.domains.itinerary.predicates import (
     PENALTIES,
     normalize_constraints,
@@ -229,3 +230,119 @@ def test_unknown_predicate_and_missing_target_become_unmodeled() -> None:
     assert result.constraints[0].args["to"] == 660
     assert [item.pred for item in result.unmodeled] == ["future_pred", "require"]
     assert all(item.handling == "unmodeled" for item in result.unmodeled)
+
+
+# ---------------------------------------------------------------------------
+# [25 §1-7]: 譲歩メッセージは spot_id を露出せず表示名で組む。
+# ---------------------------------------------------------------------------
+
+
+def test_require_message_uses_display_name_when_target_is_spot_id() -> None:
+    spots = {"spot_014": {"tags_ja": ["滝"], "name_ja": "元滝伏流水"}}
+    with predicate_context(spots):
+        violation, message = PENALTIES[PredEnum.REQUIRE](
+            _itinerary([]), {"target": "spot_014"}
+        )
+
+    assert violation == 1.0
+    assert "元滝伏流水" in message
+    assert "spot_014" not in message
+
+
+def test_require_message_keeps_tag_name_unchanged() -> None:
+    with predicate_context(SPOTS):
+        _, message = PENALTIES[PredEnum.REQUIRE](_itinerary([]), {"target": "滝"})
+
+    assert "滝" in message
+
+
+def test_require_message_falls_back_to_neutral_label_when_name_ja_is_empty() -> None:
+    spots = {"spot_014": {"tags_ja": ["滝"], "name_ja": ""}}
+    with predicate_context(spots):
+        _, message = PENALTIES[PredEnum.REQUIRE](_itinerary([]), {"target": "spot_014"})
+
+    assert "指定の場所" in message
+    assert "spot_014" not in message
+
+
+def test_require_message_falls_back_to_neutral_label_when_name_ja_is_absent() -> None:
+    """`name_ja` キー自体が無い(素の Mapping)スポットでも id へフォールバックしない。"""
+
+    with predicate_context(SPOTS):
+        _, message = PENALTIES[PredEnum.REQUIRE](_itinerary([]), {"target": "spot_a"})
+
+    assert "指定の場所" in message
+    assert "spot_a" not in message
+
+
+def test_before_message_uses_display_names_for_a_and_b() -> None:
+    spots = {
+        "spot_a": {"tags_ja": [], "name_ja": "元滝伏流水"},
+        "spot_b": {"tags_ja": [], "name_ja": "丸池様"},
+    }
+    with predicate_context(spots):
+        _, message = PENALTIES[PredEnum.BEFORE](
+            _itinerary([]), {"a": "spot_a", "b": "spot_b"}
+        )
+
+    assert "元滝伏流水" in message
+    assert "丸池様" in message
+    assert "spot_a" not in message
+    assert "spot_b" not in message
+
+
+def test_same_day_message_uses_display_names_for_a_and_b() -> None:
+    spots = {
+        "spot_a": {"tags_ja": [], "name_ja": "元滝伏流水"},
+        "spot_b": {"tags_ja": [], "name_ja": "丸池様"},
+    }
+    with predicate_context(spots):
+        _, message = PENALTIES[PredEnum.SAME_DAY](
+            _itinerary([]), {"a": "spot_a", "b": "spot_b"}
+        )
+
+    assert "元滝伏流水" in message
+    assert "丸池様" in message
+    assert "spot_a" not in message
+    assert "spot_b" not in message
+
+
+# ---------------------------------------------------------------------------
+# F10([25 §1-7] レビュー是正): PENALTIES 網羅テスト。target/a/b を引数に
+# 取る述語(13 種。not_consecutive を含む)は、それらに spot_id を渡しても
+# message_ja に spot_id トークンを露出しない(`predicates._display` が
+# 名前解決/中立表記に落とすため)。day_part_load/max_leg_min/mode_pref/
+# lunch_break の 4 述語は message_ja が target/a/b を参照しない(仕様上
+# spot_id を含み得ない)ためスキップする。
+# ---------------------------------------------------------------------------
+
+_TARGET_ARGS_BY_PRED: dict[str, dict[str, object]] = {
+    "weight": {"target": "spot_t1", "w": 1},
+    "require": {"target": "spot_t1"},
+    "exclude": {"target": "spot_t1"},
+    "count_at_most": {"target": "spot_t1", "n": 0},
+    "count_at_least": {"target": "spot_t1", "n": 1},
+    "first": {"target": "spot_t1"},
+    "last": {"target": "spot_t1"},
+    "not_consecutive": {"target": "spot_t1"},
+    "time_window": {"target": "spot_t1", "from": 540, "to": 600},
+    "stay_at_least": {"target": "spot_t1", "min": 10},
+    "before": {"a": "spot_t1", "b": "spot_t2"},
+    "same_day": {"a": "spot_t1", "b": "spot_t2"},
+    "different_day": {"a": "spot_t1", "b": "spot_t2"},
+}
+
+_NAMED_SPOTS = {
+    "spot_t1": {"tags_ja": [], "name_ja": "地点イチ"},
+    "spot_t2": {"tags_ja": [], "name_ja": "地点ニ"},
+}
+
+
+@pytest.mark.parametrize("pred", sorted(_TARGET_ARGS_BY_PRED))
+def test_target_a_b_predicates_never_leak_spot_id_in_message(pred: str) -> None:
+    args = _TARGET_ARGS_BY_PRED[pred]
+    with predicate_context(_NAMED_SPOTS):
+        _, message = PENALTIES[PredEnum(pred)](_itinerary([]), args)
+
+    assert message
+    assert not _FORBIDDEN_SPOT_ID_RE.search(message)
