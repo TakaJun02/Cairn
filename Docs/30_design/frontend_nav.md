@@ -12,6 +12,17 @@
 
 **この文書は変更インベントリである。**画面の作り直しを設計する文書ではない([ADR-0017](../adr/0017-frontend-incremental-change.md))。観光フェーズの動作は [offline_field_mode.md](offline_field_mode.md) が持つ。
 
+> **2026-08-05 追記 — 見た目はこの文書の管轄外になった。**[ADR-0023](../adr/0023-frontend-design-system.md) によりデザインシステム「Chokai Signal」を導入し、表示層(テンプレートとスタイル)を作り直した。**トークン・各画面の見た目・受け入れ条件は [frontend_design_system.md](frontend_design_system.md) が正。**
+>
+> 本書は引き続き**機能の変更インベントリ**として有効である。両者の境界は次のとおり:
+>
+> | | 正 |
+> | --- | --- |
+> | どの機能を足すか・どの契約につなぐか・**どのモジュールに触らないか** | **本書** |
+> | どう見えるか(色・余白・書体・配置・モーション) | **[frontend_design_system.md](frontend_design_system.md)** |
+>
+> **「触らない」の一覧は両者で一致している**(本書 §1 と設計システム §12)。表示層の作り直しは `stores/` / `lib/` / `public/sw.js` の呼び出し方を変えていない。
+
 ### 0.1 原則
 
 | # | 原則 |

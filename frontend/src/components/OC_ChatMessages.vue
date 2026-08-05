@@ -1,5 +1,9 @@
 <template>
-  <div class="tw-p-4 tw-space-y-6">
+  <TransitionGroup
+    tag="div"
+    name="message-list"
+    class="relative mx-auto flex max-w-3xl flex-col gap-8 px-4 py-6"
+  >
     <OC_ChatMessage
       v-for="message in messages"
       :key="message.id"
@@ -17,7 +21,7 @@
       :is-undoing="isUndoing"
       @undo="$emit('undo', $event)"
     />
-  </div>
+  </TransitionGroup>
 </template>
 
 <script setup>

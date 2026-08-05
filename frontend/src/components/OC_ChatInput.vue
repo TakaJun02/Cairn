@@ -1,41 +1,37 @@
 <template>
   <div
-    class="tw-bg-slate-50/90 tw-backdrop-blur-lg"
-    style="box-shadow: 0 -8px 32px -10px rgba(0, 0, 0, 0.08);"
+    class="composer-shell flex items-end gap-2 rounded-[1.6rem] border border-edge-strong bg-ink-raised p-2 shadow-soft transition-colors duration-base focus-within:border-white/[0.32] focus-within:bg-ink-high"
+    :class="{ 'is-streaming': isSending }"
   >
-    <div class="tw-max-w-4xl tw-mx-auto tw-px-4 tw-py-3">
-      <div class="tw-relative tw-flex tw-items-end tw-gap-2">
-        <textarea
-          ref="textarea"
-          v-model="value"
-          @input="adjustTextareaHeight"
-          @keydown.enter.prevent="handleEnter"
-          :placeholder="placeholder"
-          class="tw-flex-1 tw-bg-slate-100 focus:tw-bg-slate-200/60 tw-rounded-2xl tw-border-none focus:tw-ring-0 tw-resize-none tw-py-2.5 tw-px-4 tw-text-base tw-text-gray-800 placeholder:tw-text-gray-500 tw-transition-colors tw-duration-200"
-          rows="1"
-          style="max-height: 200px;"
-        ></textarea>
-        <button
-          @click="handlePrimaryAction"
-          :disabled="!props.isSending && value.trim() === ''"
-          class="tw-w-9 tw-h-9 tw-rounded-full tw-flex-shrink-0 tw-flex tw-items-center tw-justify-center tw-transition-all tw-duration-200 tw-mb-0.5"
-          :class="props.isSending
-            ? 'tw-bg-red-600 tw-text-white hover:tw-bg-red-500 active:tw-scale-90'
-            : value.trim() === ''
-              ? 'tw-text-slate-400 tw-cursor-not-allowed'
-              : 'tw-bg-slate-800 tw-text-white hover:tw-bg-slate-700 active:tw-scale-90'"
-          :aria-label="props.isSending ? '応答を停止' : 'メッセージを送信'"
-        >
-          <svg v-if="props.isSending" class="tw-h-4 tw-w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-            <rect x="6" y="6" width="12" height="12" rx="1"></rect>
-          </svg>
-          <svg v-else xmlns="http://www.w3.org/2000/svg" class="tw-h-5 tw-w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="12" y1="5" x2="12" y2="19"></line>
-            <polyline points="19 12 12 19 5 12"></polyline>
-          </svg>
-        </button>
-      </div>
-    </div>
+    <textarea
+      ref="textarea"
+      v-model="value"
+      @input="adjustTextareaHeight"
+      @keydown="handleKeydown"
+      @compositionstart="isComposing = true"
+      @compositionend="isComposing = false"
+      :placeholder="placeholder"
+      class="min-h-11 max-h-[164px] flex-1 resize-none overflow-y-auto bg-transparent px-3 py-2 text-[15px] leading-6 text-text outline-none placeholder:text-white/45"
+      rows="1"
+    ></textarea>
+    <button
+      @click="handlePrimaryAction"
+      :disabled="!props.isSending && value.trim() === ''"
+      class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full transition-all duration-base ease-expressive"
+      :class="props.isSending
+        ? 'bg-ink-high text-text hover:-translate-y-0.5'
+        : value.trim() === ''
+          ? 'cursor-not-allowed bg-white/[0.07] text-white/25'
+          : 'bg-ink-paper text-paper-ink hover:-translate-y-0.5'"
+      :aria-label="props.isSending ? '応答を停止' : 'メッセージを送信'"
+    >
+      <svg v-if="props.isSending" class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <rect x="6" y="6" width="12" height="12" rx="1"></rect>
+      </svg>
+      <svg v-else width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 19V5M5 12l7-7 7 7" />
+      </svg>
+    </button>
   </div>
 </template>
 
@@ -59,6 +55,9 @@ const props = defineProps({
 
 const emit = defineEmits(['sendMessage', 'stop', 'update:modelValue'])
 const textarea = ref(null)
+// IME(日本語・中国語等)の変換確定 Enter が送信に食われないようにする
+// (frontend_design_system.md §7.3。現行の `@keydown.enter.prevent` はバグ)。
+const isComposing = ref(false)
 
 const value = computed({
   get: () => props.modelValue,
@@ -72,8 +71,13 @@ const adjustTextareaHeight = () => {
   element.style.height = `${element.scrollHeight}px`
 }
 
-const handleEnter = (event) => {
+const handleKeydown = (event) => {
+  if (event.key !== 'Enter') return
+  // ブラウザによっては isComposing が正しく立たない古い実装があるため、
+  // keyCode 229(IME 変換中の共通コード)も合わせて見る。
+  if (event.isComposing || isComposing.value || event.keyCode === 229) return
   if (event.shiftKey || props.isSending) return
+  event.preventDefault()
   handleSendMessage()
 }
 

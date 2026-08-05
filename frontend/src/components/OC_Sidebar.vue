@@ -1,70 +1,78 @@
 <template>
-  <aside class="tw-bg-gray-900 tw-w-full tw-h-full tw-flex tw-flex-col tw-border-r tw-border-gray-700 tw-pb-2">
-    <!-- Header -->
-    <div class="tw-p-4 tw-flex tw-items-center tw-space-x-3 tw-shrink-0 tw-border-b tw-border-gray-700">
-      <img src="/app-icon.png" alt="App Icon" class="tw-w-8 tw-h-8 tw-rounded-md" />
-      <h2 class="tw-font-bold tw-text-xl tw-text-white">Chokai Guide</h2>
+  <aside class="flex h-full w-full flex-col bg-ink-surface">
+    <!-- 上段: 銘 -->
+    <div class="flex items-center gap-3 border-b border-edge p-4">
+      <!-- N-1: アイコンの背後に色を敷かない。中立な暗い面(--color-raised)に
+           置き、細い --color-edge の枠で浮かせる(§2.1)。 -->
+      <img src="/app-icon.png" alt="" class="h-11 w-11 shrink-0 rounded-ui border border-edge bg-ink-raised object-contain p-1 shadow-soft" />
+      <div class="min-w-0">
+        <p class="truncate font-display text-base font-semibold tracking-[-0.025em] text-text">
+          Chokai Guide
+        </p>
+        <p class="mt-0.5 text-[11px] text-text-dim">鳥海山エリア観光ガイド</p>
+      </div>
       <button
-        @click="$emit('close')"
-        class="lg:tw-hidden tw-ml-auto tw-flex tw-items-center tw-justify-center tw-w-8 tw-h-8 tw-text-slate-300 hover:tw-bg-gray-700 tw-rounded-full tw-transition-colors"
+        type="button"
+        class="ml-auto flex h-11 w-11 shrink-0 items-center justify-center rounded-ui-sm text-text-dim transition-colors duration-fast hover:bg-fill-hover hover:text-text lg:hidden"
         aria-label="サイドバーを閉じる"
+        @click="$emit('close')"
       >
-        <svg xmlns="http://www.w3.org/2000/svg" class="tw-h-5 tw-w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
-          <path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7" />
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M15 19l-7-7 7-7" />
         </svg>
       </button>
     </div>
 
-    <!-- App Usage Guide -->
-    <div class="tw-flex-1 tw-overflow-y-auto tw-p-4">
-      <div class="tw-space-y-4 tw-text-sm tw-text-gray-200">
-        <h3 class="tw-font-semibold tw-text-base tw-text-white">{{ usageGuide.title }}</h3>
-        <p>{{ usageGuide.description }}</p>
-        <div>
-          <p class="tw-mb-2">{{ usageGuide.prompt_intro }}</p>
-          <ul class="tw-space-y-2">
-            <li class="tw-p-3 tw-bg-gray-800/50 tw-rounded-lg tw-border tw-border-gray-700">
-              <p class="tw-font-mono tw-text-gray-100">{{ usageGuide.prompt_1 }}</p>
-            </li>
-            <li class="tw-p-3 tw-bg-gray-800/50 tw-rounded-lg tw-border tw-border-gray-700">
-              <p class="tw-font-mono tw-text-gray-100">{{ usageGuide.prompt_2 }}</p>
-            </li>
-          </ul>
-        </div>
-        <p>
-          {{ usageGuide.map_info_1 }}<span class="tw-font-bold tw-text-blue-300">{{ usageGuide.map_info_highlight }}</span>{{ usageGuide.map_info_2 }}
-        </p>
-      </div>
+    <!-- 中段: 使い方 -->
+    <div class="flex-1 overflow-y-auto px-3.5 py-[18px]">
+      <p class="px-1.5 pb-2 text-xs font-medium text-text-dim">使い方</p>
+      <p class="px-1.5 pb-[14px] text-[12.5px] leading-relaxed text-text-muted">
+        {{ usageGuide.description }}
+      </p>
+
+      <p class="px-1.5 pb-2 text-xs font-medium text-text-dim">{{ usageGuide.prompt_intro }}</p>
+      <button
+        v-for="example in examples"
+        :key="example"
+        type="button"
+        class="mb-2 block w-full min-h-11 rounded-ui-sm border border-edge bg-fill-hover px-3 py-2.5 text-left text-[12.5px] text-text transition-all duration-base ease-standard hover:-translate-y-px hover:border-edge-strong hover:bg-fill-active"
+        @click="applyExample(example)"
+      >
+        {{ example }}
+      </button>
+
+      <p class="mt-[14px] px-1.5 text-[12.5px] leading-relaxed text-text-muted">
+        {{ usageGuide.map_info_1 }}<span class="font-medium text-brand-soft">{{ usageGuide.map_info_highlight }}</span>{{ usageGuide.map_info_2 }}
+      </p>
     </div>
 
-    <!-- User Info Area -->
-    <div class="tw-shrink-0 tw-p-2">
-      <div class="tw-p-2 tw-rounded-lg hover:tw-bg-gray-800 tw-transition-colors">
-        <div class="tw-flex tw-items-center tw-space-x-3">
-          <!-- User Icon -->
-          <div class="tw-w-10 tw-h-10 tw-rounded-full tw-bg-slate-700 tw-flex tw-items-center tw-justify-center tw-text-white tw-font-semibold tw-text-lg">
+    <!-- 下段: ユーザー -->
+    <div class="border-t border-edge p-3">
+      <div class="flex items-center gap-3 p-1.5">
+        <div class="relative h-9 w-9 shrink-0 rounded-full border border-edge-strong bg-ink-high">
+          <span class="flex h-full w-full items-center justify-center font-display text-sm font-semibold text-text">
             {{ userInitial }}
-          </div>
-          <!-- Username -->
-          <span class="tw-flex-1 tw-font-semibold tw-text-white">{{ userStore.userName }}</span>
-          <!-- Logout Button -->
-          <button
-            @click="handleLogout"
-            class="tw-p-2 tw-text-slate-300 hover:tw-text-red-400 hover:tw-bg-red-500/20 tw-rounded-full tw-transition-colors"
-            aria-label="ログアウト"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" class="tw-h-6 tw-w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-            </svg>
-          </button>
+          </span>
+          <span class="absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-ink-surface bg-brand-signal"></span>
         </div>
+        <span class="min-w-0 flex-1 truncate text-[13.5px] font-medium text-text">{{ userStore.userName }}</span>
+        <button
+          type="button"
+          class="flex h-11 w-11 shrink-0 items-center justify-center rounded-ui-sm text-text-dim transition-colors duration-fast hover:bg-fill-hover hover:text-text"
+          aria-label="ログアウト"
+          @click="handleLogout"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 8l-4 4 4 4M6 12h10" />
+          </svg>
+        </button>
       </div>
     </div>
   </aside>
 </template>
 
 <script setup>
-import { computed } from 'vue';
+import { computed, inject, ref } from 'vue';
 import { useUserStore } from '@/stores/user';
 import { useChatStore } from '@/stores/chat';
 import { useRouter } from 'vue-router';
@@ -73,6 +81,9 @@ const emit = defineEmits(['close']);
 const userStore = useUserStore();
 const chatStore = useChatStore();
 const router = useRouter();
+
+// AppShell(共通祖先)が持つ、コンポーザへの下書き中継(§5: 例文は押すと入力欄に入る)。
+const composerDraft = inject('composerDraft', ref(''));
 
 const usageGuide = computed(() => {
   const lang = userStore.user?.language || 'ja';
@@ -84,9 +95,9 @@ const usageGuide = computed(() => {
         prompt_intro: "Try asking things like:",
         prompt_1: "Show recommended spots",
         prompt_2: "Add (spot name) to the plan",
-        map_info_1: "The plan is reflected on the ",
+        map_info_1: "The plan built up through the conversation is reflected on the ",
         map_info_highlight: "Guidance Map",
-        map_info_2: " on the right."
+        map_info_2: " at the top."
       };
     case 'zh':
       return {
@@ -95,7 +106,7 @@ const usageGuide = computed(() => {
         prompt_intro: "请试着像这样提问：",
         prompt_1: "推荐一些景点",
         prompt_2: "将（景点名称）添加到计划中",
-        map_info_1: "每次对话决定的计划将反映在",
+        map_info_1: "对话中逐步确定的计划会反映在上方的",
         map_info_highlight: "导航地图",
         map_info_2: "上。"
       };
@@ -106,12 +117,19 @@ const usageGuide = computed(() => {
         prompt_intro: "次のように話しかけてみてください。",
         prompt_1: "おすすめのスポットを教えて",
         prompt_2: "〇〇をプランに追加して",
-        map_info_1: "会話ごとに決まっていく計画は、画面右の",
+        map_info_1: "会話ごとに決まっていく計画は、上部の",
         map_info_highlight: "ガイダンスマップ",
         map_info_2: "に反映されます。"
       };
   }
 });
+
+const examples = computed(() => [usageGuide.value.prompt_1, usageGuide.value.prompt_2]);
+
+function applyExample(text) {
+  composerDraft.value = text;
+  emit('close');
+}
 
 const userInitial = computed(() => {
   return userStore.userName ? userStore.userName.charAt(0).toUpperCase() : '?';

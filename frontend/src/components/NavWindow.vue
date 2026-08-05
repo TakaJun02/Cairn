@@ -1,8 +1,23 @@
 <!-- frontend/src/components/NavWindow.vue -->
 <script setup>
-import { useNavWindow } from '@/lib/useNavWindow'
+import { inject, provide, ref } from 'vue'
 import NavView from '@/views/NavView.vue' // NavViewは常に表示されるので直接インポート
+import { useNavWindow } from '@/lib/useNavWindow'
 
+// ガイダンスマップの開閉状態は AppShell.vue が 1 度だけ生成し、ここへ
+// provide で渡す(ヘッダーのトグルピルと実ウィンドウで同じ state を共有する
+// ため。§8.4 / AppShell.vue のコメント参照)。`lib/useNavWindow.js` 自体は
+// 変更していない。
+//
+// L-1 是正: `/plan`(legacy ルート。PlanView.vue が NavWindow を単体で
+// マウントする)は AppShell の外(router の兄弟ルート)にあり、provide が
+// 届かない。inject の既定値を空オブジェクトのままにすると `hasRoute` が
+// undefined になり、ガイダンスマップが常に消える。provide が無いときは
+// このコンポーネント自身で `useNavWindow()` を呼んでフォールバックする
+// (座標計算ロジック自体は変更していない)。
+const NAV_WINDOW_NOT_PROVIDED = Symbol('nav-window-not-provided')
+const injectedNavWindow = inject('navWindow', NAV_WINDOW_NOT_PROVIDED)
+const navWindow = injectedNavWindow === NAV_WINDOW_NOT_PROVIDED ? useNavWindow() : injectedNavWindow
 const {
   hasRoute,
   isNavWindowVisible,
@@ -11,31 +26,33 @@ const {
   toggleNavWindow,
   openNavFullScreen,
   startDrag,
-} = useNavWindow()
+} = navWindow
+
+// 「⋯」メニュー(§8.3: 端末取り込み・オフライン資材・ライブ同期・LoRa を畳む)
+// の開閉状態。中身は NavView.vue が持つ(state がそちらにあるため)ので、
+// provide/inject で共有する。
+const isControlsMenuOpen = ref(false)
+provide('navControlsMenuOpen', isControlsMenuOpen)
+
+function handleClose() {
+  isControlsMenuOpen.value = false
+  toggleNavWindow?.()
+}
+
+function handleMenuToggle() {
+  isControlsMenuOpen.value = !isControlsMenuOpen.value
+}
 </script>
 
 <template>
-  <Teleport to="body">
-    <button
-      v-if="hasRoute"
-      type="button"
-      :class="[
-        'nav-window__floating-toggle',
-        isNavWindowVisible ? 'nav-window__floating-toggle--open' : 'nav-window__floating-toggle--closed'
-      ]"
-      :aria-expanded="isNavWindowVisible ? 'true' : 'false'"
-      @click="toggleNavWindow"
-    >
-      <span class="sr-only">{{ isNavWindowVisible ? 'ナビを隠す' : 'ナビを表示' }}</span>
-    </button>
-  </Teleport>
   <Teleport to="body">
     <div
       v-if="hasRoute"
       :class="[
         'nav-window',
+        'rounded-ui-lg border border-edge-strong bg-ink-surface shadow-glass backdrop-blur-xl overflow-hidden flex flex-col',
         {
-          'nav-window--fullscreen': isNavWindowFullScreen,
+          'nav-window--fullscreen rounded-none border-0 shadow-none': isNavWindowFullScreen,
           'nav-window--visible': isNavWindowVisible && !isNavWindowFullScreen,
           'nav-window--hidden': !isNavWindowVisible && !isNavWindowFullScreen
         }
@@ -46,25 +63,52 @@ const {
       :style="navWindowStyle"
     >
       <header
-        :class="['nav-window__header', { 'nav-window__header--fullscreen': isNavWindowFullScreen }]"
-        @pointerdown="startDrag"
+        :class="['flex h-12 shrink-0 items-center gap-2.5 border-b border-edge bg-ink-raised px-4', { 'cursor-default': isNavWindowFullScreen }]"
       >
-        <span class="nav-window__title">Guidance Map</span>
-        <div class="nav-window__controls">
+        <!-- ドラッグの把手は把手 + 銘の範囲だけに限る(ボタン群は含めない)。
+             ヘッダー全体に pointerdown を付けると、`startDrag` の
+             `setPointerCapture` がその後の click をヘッダーへ奪ってしまい、
+             内側のボタンが一切反応しなくなる(実機確認 2026-08-05)。
+             `useNavWindow.startDrag` 自体は変更していない。 -->
+        <div
+          :class="['flex flex-1 cursor-grab items-center gap-2.5 active:cursor-grabbing', { 'cursor-default': isNavWindowFullScreen }]"
+          style="touch-action: none"
+          @pointerdown="startDrag"
+        >
+          <span class="grip-handle text-text-dim" aria-hidden="true">
+            <i></i><i></i><i></i>
+          </span>
+          <span class="font-display text-sm font-semibold tracking-[-0.02em] text-text">ガイダンスマップ</span>
+        </div>
+        <div class="ml-auto flex shrink-0 items-center gap-0.5">
           <button
             type="button"
-            :class="[
-              'nav-window__control',
-              'nav-window__control--fullscreen',
-              { 'is-fullscreen': isNavWindowFullScreen }
-            ]"
+            class="flex h-11 w-11 shrink-0 items-center justify-center rounded-ui-sm text-text-dim transition-colors duration-fast hover:bg-fill-hover hover:text-text"
+            :aria-expanded="isControlsMenuOpen"
+            aria-label="メニュー"
+            @click.stop="handleMenuToggle"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7" /><circle cx="12" cy="12" r="1.7" /><circle cx="19" cy="12" r="1.7" /></svg>
+          </button>
+          <button
+            type="button"
+            class="flex h-11 w-11 shrink-0 items-center justify-center rounded-ui-sm text-text-dim transition-colors duration-fast hover:bg-fill-hover hover:text-text"
+            aria-label="全画面"
             @click.stop="openNavFullScreen"
           >
-            <span class="sr-only">{{ isNavWindowFullScreen ? 'ウィンドウ化' : '全画面表示' }}</span>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4H4v5M15 4h5v5M15 20h5v-5M9 20H4v-5" /></svg>
+          </button>
+          <button
+            type="button"
+            class="flex h-11 w-11 shrink-0 items-center justify-center rounded-ui-sm text-text-dim transition-colors duration-fast hover:bg-fill-hover hover:text-text"
+            aria-label="閉じる"
+            @click.stop="handleClose"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
         </div>
       </header>
-      <div class="nav-window__body">
+      <div class="nav-window__body min-h-0 flex-1">
         <NavView />
       </div>
     </div>
@@ -72,149 +116,22 @@ const {
 </template>
 
 <style scoped>
-/* Styles for screen-reader-only content */
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
-}
-
-/* New styles for the floating toggle button */
-.nav-window__floating-toggle {
-  position: fixed;
-  top: 92px; /* Adjusted position */
-  right: 16px; /* Positioned fully inside the screen */
-  z-index: 1300;
+.grip-handle {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 56px; /* Adjusted width */
-  height: 56px; /* Made it a square/circle */
-  padding: 0;
-  border-radius: 18px; /* Rounded square */
-  border: none;
-  background: linear-gradient(145deg, #3b82f6, #818cf8); /* Bright blue/purple gradient */
-  color: white;
-  cursor: pointer;
-  box-shadow: -2px 4px 16px rgba(59, 130, 246, 0.3);
-  transition: all 0.3s ease;
-  animation: pulse-glow 2.5s infinite ease-in-out;
+  flex-direction: column;
+  gap: 2.5px;
 }
-
-.nav-window__floating-toggle:hover {
-  transform: translateY(-3px) scale(1.05);
-  box-shadow: -4px 10px 24px rgba(99, 102, 241, 0.4);
-}
-
-.nav-window__floating-toggle:active {
-  transform: translateY(0) scale(0.98);
-}
-
-/* Pulse animation for the button */
-@keyframes pulse-glow {
-  0%, 100% {
-    box-shadow: -2px 4px 16px rgba(59, 130, 246, 0.3);
-    transform: scale(1);
-  }
-  50% {
-    box-shadow: -4px 8px 28px rgba(99, 102, 241, 0.5);
-    transform: scale(1.05);
-  }
-}
-
-/* Arrow icon inside the button */
-.nav-window__floating-toggle::before {
-  content: '';
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 18px;
-  height: 18px;
-  border: 2.5px solid white;
-  border-left: 0;
-  border-bottom: 0;
-  transform-origin: center;
-  transform: translate(-60%, -50%) rotate(45deg); /* Centered and pointing right (for open state) */
-  transition: transform 0.3s cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.nav-window__floating-toggle--closed::before {
-  transform: translate(-40%, -50%) rotate(-135deg); /* Centered and pointing left (for closed state) */
-}
-
-/* --- The rest of the styles for the window are kept as they were --- */
-
-.nav-window__controls {
-  display: flex;
-  align-items: center;
-}
-
-.nav-window__control {
-  width: 36px;
-  height: 36px;
-  border-radius: 12px;
-  border: 1px solid rgba(15, 23, 42, 0.2);
-  background: rgba(15, 23, 42, 0.1);
-  color: rgba(15, 23, 42, 0.9);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 1.15rem;
-  transition: background-color 0.2s ease, border-color 0.2s ease, transform 0.35s ease, box-shadow 0.2s ease;
-}
-
-.nav-window__control:hover {
-  background: rgba(37, 99, 235, 0.2);
-  border-color: rgba(37, 99, 235, 0.5);
-  box-shadow: 0 3px 12px rgba(37, 99, 235, 0.28);
-}
-
-.nav-window__control:focus-visible {
-  outline: 2px solid rgba(168, 213, 255, 0.9);
-  outline-offset: 2px;
-}
-
-.nav-window__control:active {
-  transform: scale(0.94);
-}
-
-.nav-window__control--fullscreen {
-  transform: scale(1);
-}
-
-.nav-window__control--fullscreen::before {
-  content: '⤢';
-  line-height: 1;
-}
-
-.nav-window__control--fullscreen.is-fullscreen {
-  transform: rotate(180deg) scale(1.08);
-}
-
-.nav-window__control--fullscreen.is-fullscreen::before {
-  content: '⤡';
-  transform: rotate(-180deg);
-  display: inline-block;
+.grip-handle i {
+  display: block;
+  width: 11px;
+  height: 1.5px;
+  border-radius: 2px;
+  background: currentColor;
 }
 
 .nav-window {
   position: fixed;
   z-index: 1200;
-  background: rgba(255, 255, 255, 0.96);
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.28);
-  border-radius: 14px;
-  display: flex;
-  flex-direction: column;
-  overflow: visible;
-  backdrop-filter: blur(6px);
   transition:
     transform 0.32s ease,
     opacity 0.24s ease,
@@ -225,13 +142,6 @@ const {
   will-change: width, height, top, left, transform;
 }
 
-.nav-window--fullscreen {
-  border-radius: 0;
-  border: none;
-  box-shadow: none;
-  backdrop-filter: none;
-}
-
 .nav-window--visible {
   pointer-events: auto;
 }
@@ -240,47 +150,10 @@ const {
   pointer-events: none;
 }
 
-.nav-window__header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 18px;
-  background: linear-gradient(135deg, rgba(15, 23, 42, 0.85), rgba(30, 64, 175, 0.82));
-  border-bottom: 1px solid rgba(59, 130, 246, 0.25);
-  border-radius: 18px 18px 0 0;
-  box-shadow: 0 18px 34px rgba(15, 23, 42, 0.35);
-  backdrop-filter: blur(14px);
-  cursor: grab;
-  user-select: none;
-  gap: 12px;
-  touch-action: none;
-}
-
-.nav-window__header:active {
-  cursor: grabbing;
-}
-
-.nav-window__header--fullscreen {
-  cursor: default;
-  background: linear-gradient(135deg, rgba(15, 23, 42, 0.92), rgba(15, 118, 110, 0.78));
-  border-radius: 0;
-}
-
-.nav-window__title {
-  font-size: 1rem;
-  font-weight: 700;
-  letter-spacing: 0.26em;
-  text-transform: uppercase;
-  color: #e2e8f0;
-}
-
 .nav-window__body {
-  flex: 1;
-  min-height: 0;
-  background: #f8fafc;
+  background: var(--color-canvas);
   display: flex;
   flex-direction: column;
-  border-radius: 0 0 14px 14px;
   overflow: hidden;
 }
 
