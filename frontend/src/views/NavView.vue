@@ -234,7 +234,7 @@
                 <summary>作れなかった案内の内訳</summary>
                 <ul>
                   <li v-for="(failure, index) in packFailures" :key="`${failure.spot_id}-${failure.variant}-${index}`">
-                    {{ failure.spot_id || 'パック全体' }}
+                    {{ packFailureLabel(failure) }}
                     <template v-if="failure.variant"> / {{ failure.variant }}</template>
                     — {{ failure.reason }}
                   </li>
@@ -474,6 +474,16 @@ let nextPassByIndex = 0
 
 const packProgress = computed(() => packJob.value?.progress || { done: 0, total: 0, failed: 0 })
 const packFailures = computed(() => packMetadata.value?.missing || packJob.value?.failures || [])
+// F9([25 §1-7] レビュー是正): spot_id 自体が無いときは「パック全体」の
+// まま(変更しない)。spot_id はあるが nav ストアの spots で名前解決
+// できないときは spot_id へフォールバックせず「不明な地点」にする
+// (frontend_nav.md §2.4)。
+function packFailureLabel(failure) {
+  const spotId = failure?.spot_id
+  if (!spotId) return 'パック全体'
+  const spot = navStore.spots.find((value) => value.spot_id === spotId)
+  return spot?.name_ja || spot?.name || '不明な地点'
+}
 const packProgressPercent = computed(() => {
   const total = Number(packProgress.value.total) || 0
   if (total <= 0) return 0
@@ -1043,7 +1053,9 @@ function enqueueArrivalGuidance(spot, arrivalKey) {
   if (!manifest) return
   const cycle = (arrivalCycles.get(arrivalKey) || 0) + 1
   arrivalCycles.set(arrivalKey, cycle)
-  const spotName = spot.name_ja || spot.name || spot.spot_id
+  // F9([25 §1-7] レビュー是正): 名前解決に失敗しても spot_id へは
+  // フォールバックしない(frontend_nav.md §2.4)。
+  const spotName = spot.name_ja || spot.name || '不明な地点'
   const variants = playbackVariants(manifest, rtStore.getLatest(spot.spot_id))
 
   for (const variant of variants) {
@@ -1164,7 +1176,9 @@ function poiKindLabel(poi) {
 }
 
 function poiListLabel(poi) {
-  const base = poi?.name || poi?.spot_id || '(unknown)'
+  // F9([25 §1-7] レビュー是正): 名前解決に失敗しても spot_id へは
+  // フォールバックしない(frontend_nav.md §2.4)。
+  const base = poi?.name || '不明な地点'
   const category = poi?.category ? `（${poi.category}）` : ''
   return `${base}${category}`
 }

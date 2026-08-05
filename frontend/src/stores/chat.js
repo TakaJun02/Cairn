@@ -87,7 +87,7 @@ function restoredCandidates(meta = {}) {
       .sort((a, b) => (a?.rank ?? 0) - (b?.rank ?? 0))
       .map((item) => ({
         spot_id: item?.spot_id,
-        name_ja: item?.name_ja || item?.spot_id,
+        name_ja: item?.name_ja || '不明な地点',
         reason_materials: {},
       }))
     return { kind: 'candidates', phase: 'final', items }
@@ -100,7 +100,7 @@ function restoredCandidates(meta = {}) {
     phase: 'final',
     items: ids.map((spotId, index) => ({
       spot_id: spotId,
-      name_ja: names[index] || spotId,
+      name_ja: names[index] || '不明な地点',
       reason_materials: {},
     })),
   }

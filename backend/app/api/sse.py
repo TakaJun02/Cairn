@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.api.schemas.chat import ChatEvent, DoneChatEvent, ErrorChatEvent
 from app.domains.conversation.events import ConversationEvent
+from app.domains.conversation.itinerary_digest import UNNAMED_SPOT_JA
 
 HEARTBEAT_FRAME = b": keep-alive\n\n"
 _STREAM_END = object()
@@ -339,7 +340,9 @@ def _candidate_payload(
         items.append(
             {
                 "spot_id": spot_id,
-                "name_ja": name if isinstance(name, str) else spot_names.get(spot_id, spot_id),
+                "name_ja": (
+                    name if isinstance(name, str) else spot_names.get(spot_id, UNNAMED_SPOT_JA)
+                ),
                 "reason_materials": reason_mapping,
             }
         )

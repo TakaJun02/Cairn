@@ -205,6 +205,20 @@ class ItineraryRepository:
             update(Thread).where(Thread.user_id == user_id).values(pending_constraints=[])
         )
 
+    async def load_spot_names(self) -> dict[str, str]:
+        """spot_id → name_ja だけを引く軽量版(2026-08-04、[25 §1-7])。
+
+        `load_planning_data` は spots 全カラム + travel_times 全件を読む
+        ため、譲歩文の名前解決だけが目的の呼び出し元(undo/redo・GET の
+        送出層)には過剰である。ここでは `Spot.spot_id`/`Spot.name_ja` の
+        2 列だけを選択する。
+        """
+
+        rows = (
+            await self.session.execute(select(Spot.spot_id, Spot.name_ja))
+        ).all()
+        return {row.spot_id: row.name_ja for row in rows}
+
     async def load_planning_data(self) -> PlanningData:
         spot_rows = (
             await self.session.execute(
@@ -215,6 +229,7 @@ class ItineraryRepository:
                     Spot.open_hours,
                     Spot.season_closed_months,
                     Spot.kind,
+                    Spot.name_ja,
                 ).order_by(Spot.spot_id)
             )
         ).all()
@@ -236,6 +251,7 @@ class ItineraryRepository:
                 open_hours=row.open_hours,
                 season_closed_months=tuple(row.season_closed_months),
                 kind=row.kind,
+                name_ja=row.name_ja,
             )
             for row in spot_rows
         }

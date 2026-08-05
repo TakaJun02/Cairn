@@ -90,6 +90,8 @@ event: done    { ... }        # 必ず 1 回、最後に
 - `provisional` が来て `final` が来ないことがある(リランクが縮退したとき)。**その場合は `provisional` をそのまま確定として扱う。**判別は `error{code:"rerank_degraded"}` で行う
 - **`itinerary`(final)の `route_id` は送出時点で解決可能**(2026-08-04 追加、[ADR-0020](../adr/0020-routes-early-commit.md))。`itinerary.days[].items[].leg_from_prev.route_id` が指す行は、イベント送出前に commit 済みであり、直後の `GET /api/v1/routes/{route_id}` は 200 を返す。これはサーバー側の契約である(クライアントの 404 再試行は防御にすぎない)
 - **`assumptions`**(2026-08-04 追加): その版の旅程が依って立つ**未確認の前提**(日付・起点など)の日本語短文リスト。空配列なら前提なし。UI はこれが非空のとき「仮の前提あり」を表示する([frontend_nav.md §2.4](../30_design/frontend_nav.md))。undo/redo・`GET /api/v1/itinerary` の応答にも同じフィールドが載る(版に紐づいて永続化される)
+- **`concessions[].message_ja` は表示用の完成文であり、`spot_id` を含まない**(2026-08-04 追加、[25 §1-7](../25_known_issues.md)。サーバー契約): スポットへの言及は表示名で行う。トップレベルの `concessions` と `itinerary.concessions` の両方、および undo/redo・`GET /api/v1/itinerary`・**`GET /api/v1/thread`(§3.1)の `itinerary.concessions`** も同じ契約。旧形式(spot_id 入り)で永続化済みの版は、送出層が表示名へ置換してから出す
+- **`candidates` の `items[].name_ja` は表示名であり、`spot_id` へフォールバックしない**(2026-08-05 追加、同上): 名前が解決できないときは中立表記(`(名称未登録の地点)`)を入れる。`spot_id` フィールドは機械用でありクライアントは表示しない([frontend_nav.md §2.4](../30_design/frontend_nav.md))
 
 #### `token` — 応答本文
 

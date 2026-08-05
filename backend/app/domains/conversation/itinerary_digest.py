@@ -12,13 +12,52 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from app.domains.conversation.guards import _FORBIDDEN_SPOT_ID_RE
 from app.domains.itinerary.types import Diff, Itinerary, Mode
 
 _MODE_JA = {Mode.CAR: "車", Mode.FOOT: "徒歩"}
 
+# 名前解決に失敗した要素の中立表記。id へフォールバックしない
+# (2026-08-04、[25 §1-7](../../../../Docs/25_known_issues.md))。
+UNNAMED_SPOT_JA = "(名称未登録の地点)"
+
 
 def _name(spot_names: Mapping[str, str], spot_id: str) -> str:
-    return spot_names.get(spot_id, spot_id)
+    return spot_names.get(spot_id, UNNAMED_SPOT_JA)
+
+
+def mask_spot_ids(text: str, spot_names: Mapping[str, str]) -> str:
+    """文中の `spot_` トークンを表示名(引けなければ中立表記)へ置換する。
+
+    譲歩文(`Concession.message_ja`)の唯一の生成点(`predicates.py`)は表示名で
+    メッセージを組むが、旧形式(spot_id 入り)で永続化済みの版が undo/GET で
+    再浮上する経路への防御として、整形・送出層でも同じ変換をかける
+    ([25 §1-7](../../../../Docs/25_known_issues.md))。正規表現は
+    `guards._FORBIDDEN_SPOT_ID_RE` と同一パターンを共有する(重複定義しない)。
+    """
+
+    return _FORBIDDEN_SPOT_ID_RE.sub(
+        lambda match: spot_names.get(match.group(0), UNNAMED_SPOT_JA), text
+    )
+
+
+def mask_concession_list(
+    concessions: Sequence[Mapping[str, Any]], spot_names: Mapping[str, str]
+) -> list[dict[str, Any]]:
+    """Concession 辞書列の `message_ja` をまとめてマスクする(送出層の共通処理)。
+
+    `state:itinerary`/undo・redo・`GET /api/v1/itinerary` の送出層
+    (`tool_adapters.py` / `api/routers/itinerary.py`)が使う。
+    """
+
+    masked: list[dict[str, Any]] = []
+    for concession in concessions:
+        item = dict(concession)
+        message = item.get("message_ja")
+        if isinstance(message, str):
+            item["message_ja"] = mask_spot_ids(message, spot_names)
+        masked.append(item)
+    return masked
 
 
 def _fmt_minute(value: int) -> str:
@@ -66,7 +105,7 @@ def format_itinerary_digest(
         if itinerary.concessions:
             lines.append("譲歩:")
             for concession in itinerary.concessions:
-                lines.append(f"  ・{concession.message_ja}")
+                lines.append(f"  ・{mask_spot_ids(concession.message_ja, spot_names)}")
         if itinerary.assumptions:
             lines.append("仮の前提: " + "、".join(itinerary.assumptions))
 

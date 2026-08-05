@@ -19,6 +19,7 @@ from app.db_models import (
     User,
 )
 from app.domains.conversation.history_summary import HistorySummaryState
+from app.domains.conversation.itinerary_digest import UNNAMED_SPOT_JA
 from app.domains.conversation.state import (
     CandidateReference,
     ContextSnapshot,
@@ -381,7 +382,7 @@ def _assistant_meta(state: TurnState) -> dict[str, Any]:
         "itinerary_version": itinerary.version if itinerary is not None else None,
         "itinerary_spot_ids": itinerary_ids,
         "itinerary_spot_names": [
-            state.spot_names.get(spot_id, spot_id) for spot_id in itinerary_ids
+            state.spot_names.get(spot_id, UNNAMED_SPOT_JA) for spot_id in itinerary_ids
         ],
         "qa_spot_id": qa_spot_id,
         "qa_spot_name": state.spot_names.get(qa_spot_id or "") if qa_spot_id else None,

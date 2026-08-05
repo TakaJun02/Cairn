@@ -20,6 +20,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from app.domains.conversation.itinerary_digest import UNNAMED_SPOT_JA, mask_spot_ids
+
 DEFAULT_HISTORY_BUDGET_TOKENS = 1_700
 DEFAULT_RAW_TURN_COUNT = 2
 DEFAULT_CANDIDATE_LIST_LIMIT = 3
@@ -137,9 +139,15 @@ def summarize_assistant_event(meta: Mapping[str, Any]) -> str:
     if candidate_line:
         summaries.append(candidate_line)
 
-    qa_name = meta.get("qa_spot_name") or meta.get("qa_spot_id")
-    if isinstance(qa_name, str) and qa_name:
-        summaries.append(f"[QA回答: {qa_name}]")
+    qa_spot_name = meta.get("qa_spot_name")
+    qa_spot_id = meta.get("qa_spot_id")
+    if isinstance(qa_spot_name, str) and qa_spot_name:
+        summaries.append(f"[QA回答: {qa_spot_name}]")
+    elif isinstance(qa_spot_id, str) and qa_spot_id:
+        # 2026-08-04([25 §1-7] レビュー是正): name が無い/空でも spot_id
+        # へフォールバックしない。中立表記(itinerary_digest.UNNAMED_SPOT_JA)
+        # を使う。
+        summaries.append(f"[QA回答: {UNNAMED_SPOT_JA}]")
 
     itinerary_version = meta.get("itinerary_version")
     itinerary_names = _string_list(meta.get("itinerary_spot_names"))
@@ -148,12 +156,15 @@ def summarize_assistant_event(meta: Mapping[str, Any]) -> str:
         summaries.append(f"[旅程更新 v{itinerary_version}{suffix}]")
 
     if summaries:
-        return " ".join(summaries)
-
-    tools = _string_list(meta.get("tools"))
-    if tools:
-        return f"[応答: {' → '.join(tools)}]"
-    return "[応答]"
+        text = " ".join(summaries)
+    else:
+        tools = _string_list(meta.get("tools"))
+        text = f"[応答: {' → '.join(tools)}]" if tools else "[応答]"
+    # 2026-08-04([25 §1-7] レビュー是正・防御2層目): 永続化済みの旧形式
+    # meta(`qa_spot_name`/`candidate_names`/`itinerary_spot_names` 等)に
+    # spot_id がそのまま入っている場合の防御として、LLM コンテキストへ
+    # 載せる直前でもう一度マスクする。`meta` 自体は書き換えない。
+    return mask_spot_ids(text, {})
 
 
 def group_turns(messages: Sequence[HistoryMessage]) -> list[Turn]:
@@ -280,7 +291,13 @@ def _candidate_line(meta: Mapping[str, Any]) -> str | None:
     candidates = names or ids
     if not candidates:
         return None
-    return f"[推薦{len(candidates)}件: {' / '.join(candidates)}]"
+    line = f"[推薦{len(candidates)}件: {' / '.join(candidates)}]"
+    # 2026-08-04([25 §1-7] レビュー是正・防御2層目): `names` が空で `ids`
+    # (生の spot_id)を直接使う経路、および旧形式で `names` 自体に spot_id
+    # が入っている経路の両方に対する防御。この行は③候補提示リストの
+    # 機械要約として LLM コンテキストへ直接載る(`_collect_candidate_lines`
+    # 経由)ため、ここでマスクする。
+    return mask_spot_ids(line, {})
 
 
 def _presented_names_and_ids(meta: Mapping[str, Any]) -> tuple[list[str], list[str]]:

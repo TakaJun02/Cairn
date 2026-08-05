@@ -41,6 +41,10 @@ class PlanningSpot:
     open_hours: Any = None
     season_closed_months: tuple[int, ...] = ()
     kind: str = "poi"
+    # 譲歩メッセージ(predicates.py)を表示名で組むための追加フィールド
+    # (2026-08-04、[25 §1-7](../../../../Docs/25_known_issues.md))。既存テストは
+    # 位置引数で `PlanningSpot` を生成しているため、末尾にデフォルト付きで追加する。
+    name_ja: str = ""
 
 
 @dataclass(frozen=True, slots=True)

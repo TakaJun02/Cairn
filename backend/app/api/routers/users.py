@@ -1,11 +1,13 @@
 """研究参加者の登録・ログイン・状態復元 API。"""
 
-from typing import Annotated
+import logging
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.auth import get_current_user, get_user_repository
 from app.api.routers.chat import get_ask_registry
+from app.api.routers.itinerary import get_itinerary_repository
 from app.api.schemas.users import (
     CurrentItineraryResponse,
     LoginResponse,
@@ -15,6 +17,8 @@ from app.api.schemas.users import (
     UserNameRequest,
 )
 from app.domains.conversation.ask_registry import AskUserRegistry
+from app.domains.conversation.itinerary_digest import mask_concession_list
+from app.domains.itinerary.repo import ItineraryRepository
 from app.domains.users import (
     UserAlreadyExistsError,
     UserData,
@@ -22,6 +26,8 @@ from app.domains.users import (
     login_user,
     register_user,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["users"])
 
@@ -68,12 +74,13 @@ async def get_thread(
     current_user: Annotated[UserData, Depends(get_current_user)],
     repository: Annotated[UserRepository, Depends(get_user_repository)],
     ask_registry: Annotated[AskUserRegistry, Depends(get_ask_registry)],
+    itinerary_repository: Annotated[ItineraryRepository, Depends(get_itinerary_repository)],
 ) -> ThreadResponse:
     thread = await repository.get_thread(current_user.id)
     itinerary = (
         CurrentItineraryResponse(
             version=thread.itinerary.version,
-            itinerary=thread.itinerary.body,
+            itinerary=await _masked_itinerary_body(thread.itinerary.body, itinerary_repository),
         )
         if thread.itinerary is not None
         else None
@@ -96,3 +103,31 @@ async def get_thread(
 
 def _login_response(user: UserData) -> LoginResponse:
     return LoginResponse(user_id=user.id, user_name=user.user_name, token=user.api_token)
+
+
+async def _masked_itinerary_body(
+    body: Any, itinerary_repository: ItineraryRepository
+) -> Any:
+    """`body["concessions"][].message_ja` をマスクしてから返す。
+
+    2026-08-04 追加([25 §1-7] レビュー是正): `GET /thread` は旧形式で
+    永続化済みの旅程本文をそのまま返しており、`chat_sse.md §1.2` の
+    サーバー契約(`concessions[].message_ja` は spot_id を含まない)から
+    唯一漏れていた経路だった。`body` が dict でない・`concessions` キーが
+    無い場合は防御的にスキップする。`concessions` が空なら名前ロードも
+    スキップする。元の `body` は書き換えず、浅いコピーを返す。
+    """
+
+    if not isinstance(body, dict):
+        return body
+    concessions = body.get("concessions")
+    if not isinstance(concessions, list) or not concessions:
+        return body
+    spot_names: dict[str, str] = {}
+    try:
+        spot_names = await itinerary_repository.load_spot_names()
+    except Exception:  # noqa: BLE001 - 名前解決の失敗で GET /thread を落とさない
+        logger.warning("spot_names のロードに失敗しました。中立表記で続行します", exc_info=True)
+    masked = dict(body)
+    masked["concessions"] = mask_concession_list(concessions, spot_names)
+    return masked

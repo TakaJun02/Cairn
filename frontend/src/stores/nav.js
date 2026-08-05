@@ -118,8 +118,10 @@ export const useNavStore = defineStore('nav', () => {
 
   const spotInfo = (spotId) => {
     const spot = spots.value.find((value) => value.spot_id === spotId)
-    if (!spot) return { spot_id: spotId, name: spotId }
-    const name = spot.name_ja || spot.name || spotId
+    // [25 §1-7](frontend_nav.md §2.4): 名前解決に失敗しても spot_id へは
+    // フォールバックしない。
+    if (!spot) return { spot_id: spotId, name: '不明な地点' }
+    const name = spot.name_ja || spot.name || '不明な地点'
     return {
       ...spot,
       name,
@@ -329,10 +331,10 @@ export const useNavStore = defineStore('nav', () => {
     const visitSpots = (itinerarySpotIds.length ? itinerarySpotIds : [...visitById.keys()])
       .map((spotId) => visitById.get(spotId))
       .filter(Boolean)
-      .map((spot) => ({ ...spot, name: spot.name_ja || spot.spot_id }))
+      .map((spot) => ({ ...spot, name: spot.name_ja || '不明な地点' }))
     const alongPois = (manifest.along || []).map((spot, index) => ({
       ...spot,
-      name: spot.name_ja || spot.spot_id,
+      name: spot.name_ja || '不明な地点',
       order_index: index,
     }))
     const assets = [...(manifest.spots || []), ...(manifest.along || [])].flatMap((spot) =>

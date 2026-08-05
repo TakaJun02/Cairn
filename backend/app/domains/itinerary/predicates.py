@@ -27,6 +27,7 @@ from app.domains.itinerary.types import (
 class PredicateSpot(Protocol):
     spot_id: str
     tags_ja: Sequence[str]
+    name_ja: str
 
 
 SpotContext: TypeAlias = Mapping[str, PredicateSpot | Mapping[str, Any]]
@@ -96,41 +97,47 @@ def penalty_weight(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float
 
     count = len(_target_items(itinerary, _target(args)))
     bonus = float(args["w"]) * count
-    return -bonus, f"{args['target']}の希望を訪問効用へ反映しました"
+    return -bonus, f"{_display(str(args['target']))}の希望を訪問効用へ反映しました"
 
 
 def penalty_require(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
     violation = float(not _target_items(itinerary, _target(args)))
-    return violation, f"必須希望の「{args['target']}」を旅程に入れられませんでした"
+    return violation, f"必須希望の「{_display(str(args['target']))}」を旅程に入れられませんでした"
 
 
 def penalty_exclude(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
     violation = float(len(_target_items(itinerary, _target(args))))
-    return violation, f"除外希望の「{args['target']}」が旅程に含まれています"
+    return violation, f"除外希望の「{_display(str(args['target']))}」が旅程に含まれています"
 
 
 def penalty_count_at_most(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
     count = len(_target_items(itinerary, _target(args)))
     violation = float(max(0, count - int(args["n"])))
-    return violation, f"{args['target']}の訪問が希望上限を{int(violation)}件超えています"
+    return (
+        violation,
+        f"{_display(str(args['target']))}の訪問が希望上限を{int(violation)}件超えています",
+    )
 
 
 def penalty_count_at_least(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
     count = len(_target_items(itinerary, _target(args)))
     violation = float(max(0, int(args["n"]) - count))
-    return violation, f"{args['target']}の訪問が希望数より{int(violation)}件不足しています"
+    return (
+        violation,
+        f"{_display(str(args['target']))}の訪問が希望数より{int(violation)}件不足しています",
+    )
 
 
 def penalty_first(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
     items = _all_items(itinerary)
     violation = float(not items or not _matches(items[0][2].spot_id, _target(args)))
-    return violation, f"{args['target']}を旅程の最初にできませんでした"
+    return violation, f"{_display(str(args['target']))}を旅程の最初にできませんでした"
 
 
 def penalty_last(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
     items = _all_items(itinerary)
     violation = float(not items or not _matches(items[-1][2].spot_id, _target(args)))
-    return violation, f"{args['target']}を旅程の最後にできませんでした"
+    return violation, f"{_display(str(args['target']))}を旅程の最後にできませんでした"
 
 
 def penalty_before(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
@@ -140,7 +147,10 @@ def penalty_before(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float
         violation = 1.0
     else:
         violation = float(min(positions_a) >= max(positions_b))
-    return violation, f"{args['a']}を{args['b']}より前に配置できませんでした"
+    return (
+        violation,
+        f"{_display(str(args['a']))}を{_display(str(args['b']))}より前に配置できませんでした",
+    )
 
 
 def penalty_not_consecutive(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
@@ -151,7 +161,7 @@ def penalty_not_consecutive(itinerary: Itinerary, args: Mapping[str, Any]) -> tu
             _matches(left.spot_id, target) and _matches(right.spot_id, target)
             for left, right in zip(day.items, day.items[1:], strict=False)
         )
-    return float(pairs), f"{args['target']}に当たる場所が{pairs}組連続しています"
+    return float(pairs), f"{_display(target)}に当たる場所が{pairs}組連続しています"
 
 
 def penalty_same_day(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
@@ -161,14 +171,20 @@ def penalty_same_day(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[flo
         violation = 0.0
     else:
         violation = float(days_a.isdisjoint(days_b))
-    return violation, f"{args['a']}と{args['b']}を同じ日にできませんでした"
+    return (
+        violation,
+        f"{_display(str(args['a']))}と{_display(str(args['b']))}を同じ日にできませんでした",
+    )
 
 
 def penalty_different_day(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
     days_a = _target_days(itinerary, str(args["a"]))
     days_b = _target_days(itinerary, str(args["b"]))
     violation = float(len(days_a & days_b))
-    return violation, f"{args['a']}と{args['b']}が同じ日に{int(violation)}組あります"
+    return (
+        violation,
+        f"{_display(str(args['a']))}と{_display(str(args['b']))}が同じ日に{int(violation)}組あります",
+    )
 
 
 def penalty_time_window(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
@@ -178,7 +194,10 @@ def penalty_time_window(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[
     for _, _, item in _target_items(itinerary, _target(args)):
         violation += max(0, start - item.arrive_min)
         violation += max(0, item.depart_min - end)
-    return float(violation), f"{args['target']}の希望時間帯から合計{violation}分外れています"
+    return (
+        float(violation),
+        f"{_display(str(args['target']))}の希望時間帯から合計{violation}分外れています",
+    )
 
 
 def penalty_stay_at_least(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
@@ -186,7 +205,10 @@ def penalty_stay_at_least(itinerary: Itinerary, args: Mapping[str, Any]) -> tupl
     violation = sum(
         max(0, minimum - item.stay_min) for _, _, item in _target_items(itinerary, _target(args))
     )
-    return float(violation), f"{args['target']}の滞在時間が合計{violation}分不足しています"
+    return (
+        float(violation),
+        f"{_display(str(args['target']))}の滞在時間が合計{violation}分不足しています",
+    )
 
 
 def penalty_day_part_load(itinerary: Itinerary, args: Mapping[str, Any]) -> tuple[float, str]:
@@ -451,6 +473,27 @@ def _matches(spot_id: str, target: str) -> bool:
     if spot_id == target:
         return True
     return target in _tags_for_spot(spot_id, _SPOTS.get() or {})
+
+
+def _display(value: str) -> str:
+    """譲歩メッセージの文面用に、spot_id なら表示名、タグ名ならそのまま返す。
+
+    [25 §1-7](../../../../Docs/25_known_issues.md) / [recommendation_planning.md
+    §4.4 経路 1](../../../../Docs/30_design/recommendation_planning.md)。
+    `_tags_for_spot` と同様、Mapping と属性アクセスの両方に対応する。
+    `name_ja` が引けない・空のときは spot_id へフォールバックせず
+    中立表記「指定の場所」にする。
+    """
+
+    spots = _SPOTS.get() or {}
+    spot = spots.get(value)
+    if spot is None:
+        return value
+    if isinstance(spot, Mapping):
+        name = spot.get("name_ja", "")
+    else:
+        name = getattr(spot, "name_ja", "")
+    return name if name else "指定の場所"
 
 
 def _tags_for_spot(spot_id: str, spots: SpotContext) -> Sequence[str]:
