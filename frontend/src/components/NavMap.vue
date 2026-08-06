@@ -50,6 +50,7 @@ let routeLayer = null;
 let poiMarkers = [];
 let isProgrammaticMove = false;
 let programmaticResetTimer = null;
+let containerResizeObserver = null;
 
 const scheduleProgrammaticReset = (delay = 800) => {
   if (programmaticResetTimer) {
@@ -232,7 +233,22 @@ const setupMap = () => {
 
     drawRoute();
     drawPois();
-    
+
+    // ガイダンスマップの全画面トグル(NavWindow.vue)はコンテナのサイズを
+    // CSS トランジション(width/height, 0.38s)で変化させるだけで、window の
+    // resize イベントは発生しない。Leaflet はマウント時のコンテナサイズしか
+    // 見ていないため、このままだと切替後にグレーの未描画領域が残る
+    // (実機確認 2026-08-06)。ResizeObserver でコンテナ自体の実サイズ変化を
+    // 監視し、変化のたびに invalidateSize() を呼んで追従させる。トランジション
+    // 中は複数回発火するが、最終的に遷移後のサイズでも呼ばれるため通常の
+    // ウィンドウリサイズと同様に正しいサイズへ収束する。
+    if (typeof ResizeObserver !== 'undefined') {
+      containerResizeObserver = new ResizeObserver(() => {
+        map.value?.invalidateSize();
+      });
+      containerResizeObserver.observe(mapContainer.value);
+    }
+
     // ★★★ デバッグ中はNavViewから位置情報を受け取るため、ここでの位置情報追跡は不要
     // startTracking();
   }
@@ -261,6 +277,10 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  if (containerResizeObserver) {
+    containerResizeObserver.disconnect();
+    containerResizeObserver = null;
+  }
   if (map.value) {
     map.value.remove();
     map.value = null;
