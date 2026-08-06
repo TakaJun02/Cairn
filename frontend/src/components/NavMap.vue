@@ -124,11 +124,19 @@ const drawRoute = () => {
     map.value.removeLayer(routeLayer);
   }
   if (props.plan && props.plan.route) {
+    // frontend_design_system.md §8.3.1-4 / §12.1: 地図は明るい図版なので、
+    // 経路線は「濃くする」で可読性を上げる(白い縁取り=casing は不採用。
+    // §12.1 に理由あり: Leaflet は 1 本の path に 2 つの stroke を持てず、
+    // 同じ GeoJSON を上へもう 1 層描くことになりレイヤのライフサイクルが
+    // 増えるため)。色は design-system.css のトークンに揃える
+    // (#2f4fd8 = §8.3.1 表の「深い藍」。#12756a = --color-signal-deep と
+    // 同値。Leaflet の SVG 属性へ渡す値なので、ここでは色トークンを
+    // 直接 hex で複製する)。
     const styleFunction = (feature) => {
       const mode = feature?.properties?.mode;
-      if (mode === 'car') return { color: '#007bff', weight: 5, opacity: 0.7 };
-      if (mode === 'foot') return { color: '#ff8c00', weight: 4, opacity: 0.8, dashArray: '5, 10' };
-      return { color: '#ff0000', weight: 5, opacity: 0.7 };
+      if (mode === 'car') return { color: '#2f4fd8', weight: 5, opacity: 0.95 };
+      if (mode === 'foot') return { color: '#12756a', weight: 4, opacity: 0.95, dashArray: '5, 10' };
+      return { color: '#2f4fd8', weight: 5, opacity: 0.95 };
     };
     routeLayer = L.geoJSON(props.plan.route, { style: styleFunction }).addTo(map.value);
     markProgrammaticMove();
@@ -136,21 +144,66 @@ const drawRoute = () => {
   }
 };
 
+// frontend_design_system.md §8.3.1-5 / §12.1: POI マーカーのアイコンを
+// Leaflet 既定の無番号ピンから、番号入りの divIcon へ差し替える。番号・色は
+// NavView.vue の旅程ストリップ(`sortedWaypoints` のバッジ)と一致させ、
+// 地図とストリップを目で結ぶ。along_pois(近くのおすすめ)はストリップ側にも
+// 番号が無いので、ここでも無番号の小さな点にする。
+const POI_ICON_SIZE = 26;
+const poiIconCache = new Map();
+
+function numberedPoiIcon(number) {
+  const cached = poiIconCache.get(number);
+  if (cached) return cached;
+  const icon = L.divIcon({
+    className: 'poi-marker poi-marker--numbered',
+    html: `<div class="poi-marker-badge">${number}</div>`,
+    iconSize: [POI_ICON_SIZE, POI_ICON_SIZE],
+    iconAnchor: [POI_ICON_SIZE / 2, POI_ICON_SIZE / 2],
+  });
+  poiIconCache.set(number, icon);
+  return icon;
+}
+
+let plainPoiIcon = null;
+function nearbyPoiIcon() {
+  if (!plainPoiIcon) {
+    plainPoiIcon = L.divIcon({
+      className: 'poi-marker poi-marker--plain',
+      html: '<div class="poi-marker-dot"></div>',
+      iconSize: [14, 14],
+      iconAnchor: [7, 7],
+    });
+  }
+  return plainPoiIcon;
+}
+
 const drawPois = () => {
   poiMarkers.forEach(marker => map.value.removeLayer(marker));
   poiMarkers = [];
   if (!props.plan) return;
 
-  const addPoiMarker = (poi) => {
+  const addPoiMarker = (poi, icon) => {
     if (!poi || typeof poi.lat !== 'number' || typeof poi.lon !== 'number') return;
     const marker = L.marker([poi.lat, poi.lon], {
       interactive: false,
+      icon,
     }).addTo(map.value);
     poiMarkers.push(marker);
   };
 
-  if (props.plan.waypoints_info) props.plan.waypoints_info.forEach(addPoiMarker);
-  if (props.plan.along_pois) props.plan.along_pois.forEach(addPoiMarker);
+  // 番号は配列の並び順で 1 から振る。NavView.vue の `sortedWaypoints` は
+  // `nearest_idx` で安定ソートするが、その値は現状どの経路でも設定されない
+  // ため、実質この waypoints_info の並び順と常に一致する(同じ配列を
+  // 参照しているため、番号の対応が崩れない)。
+  if (props.plan.waypoints_info) {
+    props.plan.waypoints_info.forEach((poi, index) => {
+      addPoiMarker(poi, numberedPoiIcon(index + 1));
+    });
+  }
+  if (props.plan.along_pois) {
+    props.plan.along_pois.forEach((poi) => addPoiMarker(poi, nearbyPoiIcon()));
+  }
 };
 
 const setupMap = () => {
@@ -245,6 +298,36 @@ watch(() => props.plan, () => {
 
 .leaflet-control-attribution a {
   color: rgba(148, 197, 255, 0.85);
+}
+
+/* POI マーカー(frontend_design_system.md §8.3.1-5 / §12.1)。
+   番号入りバッジは旅程ストリップの `.stop-chip__num`(NavView.vue)と
+   同じ色・同じ数字にして、地図とストリップを目で結ぶ。--color-signal-deep
+   は明るい地図面の上で使う碧(§3.2)。 */
+.poi-marker-badge {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 9999px;
+  background: var(--color-signal-deep, #12756a);
+  color: var(--color-paper, #eef2f4);
+  border: 2px solid var(--color-paper, #eef2f4);
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.35);
+  font-family: var(--font-display, "Space Grotesk", sans-serif);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+.poi-marker-dot {
+  width: 10px;
+  height: 10px;
+  margin: 2px;
+  border-radius: 9999px;
+  background: var(--color-signal-deep, #12756a);
+  border: 2px solid var(--color-paper, #eef2f4);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.3);
 }
 
 /* 現在地マーカーのスタイル */

@@ -173,13 +173,14 @@
         <button
           v-if="isStandaloneNavView"
           type="button"
-          class="flex h-11 w-11 items-center justify-center rounded-ui-sm border border-edge-strong bg-ink-raised/80 text-text-dim shadow-soft backdrop-blur transition-colors duration-fast hover:bg-fill-hover hover:text-text"
+          class="relative flex h-11 w-11 items-center justify-center rounded-ui-sm border border-edge-strong bg-ink-raised/80 text-text-dim shadow-soft backdrop-blur transition-colors duration-fast hover:bg-fill-hover hover:text-text"
           style="position: absolute; top: 12px; right: 12px; z-index: 950"
           :aria-expanded="isControlsMenuOpen"
           aria-label="メニュー"
           @click.stop="isControlsMenuOpen = !isControlsMenuOpen"
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7" /><circle cx="12" cy="12" r="1.7" /><circle cx="19" cy="12" r="1.7" /></svg>
+          <span v-if="isMapStatusActive" class="menu-trigger-dot" aria-hidden="true"></span>
         </button>
 
         <!-- ⋯ メニュー(NavWindow.vue のヘッダーから開閉)。「端末に取り込む」
@@ -324,11 +325,14 @@
         </div>
       </div>
 
-      <!-- 旅程ストリップ(§8.3): Spots List カードを廃止し、ここに統合する。
-           訪問順に丸番号 + スポット名のチップを横スクロールで並べる。 -->
+      <!-- 旅程ストリップ(frontend_design_system.md §8.3.1、2026-08-06 改訂):
+           Spots List カードを廃止し、ここに統合する。訪問順に丸番号 +
+           スポット名のチップを横スクロールで並べる。「訪問順」は行内の
+           小さな前置きラベルにして 1 段に畳む(§8.3.1-6)。面は地図の
+           明るさに合わせる(§8.3.1-1)。 -->
       <div class="itinerary-strip" aria-label="訪問順">
-        <p class="itinerary-strip__label">訪問順</p>
         <div v-if="sortedWaypoints.length" class="itinerary-strip__row">
+          <span class="itinerary-strip__prefix">訪問順</span>
           <button
             v-for="(poi, index) in sortedWaypoints"
             :key="poi.spot_id"
@@ -351,21 +355,19 @@
         </div>
         <p v-else class="itinerary-strip__empty">まだ旅程がありません</p>
 
-        <template v-if="isNavigationReady && sortedAlongPois.length > 0">
-          <p class="itinerary-strip__label itinerary-strip__label--secondary">近くのおすすめ</p>
-          <div class="itinerary-strip__row">
-            <button
-              v-for="poi in sortedAlongPois"
-              :key="poi.spot_id"
-              type="button"
-              class="stop-chip stop-chip--nearby"
-              @click="focusOnSpot(poi)"
-            >
-              <span v-if="isFacilitySpotId(poi.spot_id)" aria-hidden="true">🏢</span>
-              {{ poiListLabel(poi) }}
-            </button>
-          </div>
-        </template>
+        <div v-if="isNavigationReady && sortedAlongPois.length > 0" class="itinerary-strip__row itinerary-strip__row--secondary">
+          <span class="itinerary-strip__prefix">近くのおすすめ</span>
+          <button
+            v-for="poi in sortedAlongPois"
+            :key="poi.spot_id"
+            type="button"
+            class="stop-chip stop-chip--nearby"
+            @click="focusOnSpot(poi)"
+          >
+            <span v-if="isFacilitySpotId(poi.spot_id)" aria-hidden="true">🏢</span>
+            {{ poiListLabel(poi) }}
+          </button>
+        </div>
       </div>
 
       <div class="toast-stack">
@@ -424,6 +426,15 @@ const NAV_CONTROLS_MENU_NOT_PROVIDED = Symbol('nav-controls-menu-not-provided')
 const injectedControlsMenuOpen = inject('navControlsMenuOpen', NAV_CONTROLS_MENU_NOT_PROVIDED)
 const isStandaloneNavView = injectedControlsMenuOpen === NAV_CONTROLS_MENU_NOT_PROVIDED
 const isControlsMenuOpen = isStandaloneNavView ? ref(false) : injectedControlsMenuOpen
+
+// frontend_design_system.md §8.3.1-7: ⋯ ボタンの状態ドット。中身(ライブ
+// 同期・パック取得・LoRa)は本コンポーネントが知っているが、ボタン自体は
+// NavWindow.vue のヘッダーにあるため、isControlsMenuOpen と同じ「親が ref を
+// 作って渡し、子が書き込む」型で共有する(provide/inject は親→子方向にしか
+// 流れないが、同一の ref オブジェクトを介せば子から親へも値を伝えられる)。
+const NAV_MAP_STATUS_NOT_PROVIDED = Symbol('nav-map-status-not-provided')
+const injectedMapStatusActive = inject('navMapStatusActive', NAV_MAP_STATUS_NOT_PROVIDED)
+const mapStatusActiveRef = injectedMapStatusActive === NAV_MAP_STATUS_NOT_PROVIDED ? ref(false) : injectedMapStatusActive
 
 const {
   plan,
@@ -556,6 +567,15 @@ const hideDebugPanel = () => {
   isDebugPanelVisible.value = false
 }
 const isPollingEnabled = ref(false)
+
+// frontend_design_system.md §8.3.1-7: 「ライブ同期が接続 / パック取得中 /
+// LoRa 接続」のいずれかが真のとき、⋯ ボタンにドットを出す。中身は開かないと
+// 読めなくてよいが、「何か動いている」ことは閉じていても分かるようにする。
+const isMapStatusActive = computed(() => (
+  isPollingEnabled.value || isNavigating.value || isPackImporting.value || isLoraConnected.value
+))
+watch(isMapStatusActive, (value) => { mapStatusActiveRef.value = value }, { immediate: true })
+
 const didPrecacheTiles = ref(false)
 const cachedPlanKey = ref(null)
 const precacheInFlight = ref(false)
@@ -2102,35 +2122,45 @@ button.menu-row + .menu-section {
   color: var(--color-signal-soft);
 }
 
-/* 旅程ストリップ(§8.3)。Spots List カードを廃止し、ここへ統合する。 */
+/* 旅程ストリップ(frontend_design_system.md §8.3.1、2026-08-06 改訂)。
+   地図に接する面は「地図の明るさ」に合わせる(P1 の例外。§2/§8.3.1)。
+   旧実装(git show HEAD~2:frontend/src/views/NavView.vue)の Spots List
+   パネルが使っていた白地・濃紺文字の考え方を、こちらのトークンで引き継ぐ。 */
 .itinerary-strip {
   flex-shrink: 0;
   border-top: 1px solid var(--color-edge);
-  background: rgba(24, 29, 33, 0.7);
-  backdrop-filter: blur(10px);
-  padding: 11px 14px;
-}
-.itinerary-strip__label {
-  font-size: 10px;
-  font-family: var(--font-display);
-  text-transform: uppercase;
-  letter-spacing: 0.16em;
-  color: var(--color-text-dim);
-  margin-bottom: 9px;
-}
-.itinerary-strip__label--secondary {
-  margin-top: 10px;
+  background: var(--color-paper);
+  padding: 10px 14px;
 }
 .itinerary-strip__row {
   display: flex;
+  align-items: center;
   gap: 8px;
   overflow-x: auto;
   padding-bottom: 2px;
 }
+/* §8.3.1-6: 「訪問順」は行内の小さな前置きラベルに畳む(1 件でも 2 段
+   取らないようにする)。 */
+.itinerary-strip__prefix {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-family: var(--font-display);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: rgb(var(--color-paper-ink-rgb) / 0.55);
+  white-space: nowrap;
+}
+.itinerary-strip__row--secondary {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgb(var(--color-paper-ink-rgb) / 0.08);
+}
 .itinerary-strip__empty {
   font-size: 12px;
-  color: var(--color-text-dim);
+  color: rgb(var(--color-paper-ink-rgb) / 0.6);
 }
+/* §8.3.1-3: チップ本体は明るい面に載る形へ(白に近い地 + paper-ink の文字 +
+   薄い枠)。hover で枠を signal-deep に。 */
 .stop-chip {
   display: inline-flex;
   align-items: center;
@@ -2138,40 +2168,59 @@ button.menu-row + .menu-section {
   flex: 0 0 auto;
   min-height: 44px;
   border-radius: 9999px;
-  border: 1px solid var(--color-edge);
-  background: var(--color-fill-hover);
+  border: 1px solid rgb(var(--color-paper-ink-rgb) / 0.14);
+  background: #ffffff;
   padding: 5px 14px 5px 6px;
   font-size: 12.5px;
-  color: var(--color-text-muted);
+  color: var(--color-paper-ink);
   cursor: pointer;
   white-space: nowrap;
   transition: border-color var(--motion-base), color var(--motion-base), background-color var(--motion-base);
 }
 .stop-chip:hover {
-  border-color: var(--color-edge-strong);
-  color: var(--color-text);
+  border-color: var(--color-signal-deep);
+}
+/* 明るい地の上では既定の --color-signal-soft の外周線が 1.6:1 前後しか
+   出ない(§3.2)。ここだけ signal-deep に差し替える(F1 の「1 つの言語」は
+   保つ。色調だけを地の明るさに合わせる)。 */
+.stop-chip:focus-visible {
+  outline-color: var(--color-signal-deep);
 }
 .stop-chip--nearby {
   padding-left: 12px;
 }
+/* §8.3.1-2: 番号バッジは signal-deep で塗り、数字は paper。地図側の
+   divIcon(NavMap.vue の `.poi-marker-badge`)と同じ色・同じ数字にする。 */
 .stop-chip__num {
   width: 22px;
   height: 22px;
   flex: 0 0 22px;
   border-radius: 9999px;
-  background: var(--color-high);
+  background: var(--color-signal-deep);
   display: grid;
   place-items: center;
   font-family: var(--font-display);
   font-size: 11px;
   font-weight: 600;
-  color: var(--color-text);
+  color: var(--color-paper);
 }
 .stop-chip__rt {
   display: inline-flex;
   align-items: center;
   gap: 4px;
   margin-left: 2px;
+}
+
+/* §8.3.1-7: ⋯ ボタンの状態ドット。 */
+.menu-trigger-dot {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  background: var(--color-signal);
+  box-shadow: 0 0 0 2px var(--color-raised);
 }
 
 .toast-stack { position: absolute; right: 12px; z-index: 1100; display: flex; flex-direction: column; gap: 8px; bottom: 90px; }

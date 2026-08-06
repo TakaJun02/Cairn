@@ -130,7 +130,6 @@ body{background:var(--color-canvas);color:var(--color-text);font-family:var(--fo
 .sec-h b{font-size:13.5px;font-family:var(--font-display);font-weight:600}
 .badge{border-radius:9999px;border:1px solid var(--color-edge-strong);background:var(--color-fill-hover);
   padding:2px 9px;font-size:10.5px;color:var(--color-text-muted)}
-.badge-warn{border-color:rgba(232,181,103,.35);background:rgba(232,181,103,.1);color:var(--color-warn)}
 .cands{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .cand{border-radius:var(--radius-md);border:1px solid var(--color-edge);background:var(--color-panel);
   padding:13px 14px;transition:border-color var(--motion-base),background-color var(--motion-base),transform var(--motion-base) var(--ease-expressive)}
@@ -140,29 +139,46 @@ body{background:var(--color-canvas);color:var(--color-text);font-family:var(--fo
 .chip{border-radius:9999px;border:1px solid var(--color-edge);background:var(--color-fill-hover);
   padding:2px 8px;font-size:10.5px;color:var(--color-text-muted)}
 
-/* ---- 旅程カード ---- */
+/* ---- 旅程カード(§7.6.4〜7.6.5 の形) ---- */
 .itin{border-radius:var(--radius-lg);border:1px solid var(--color-edge-strong);
-  background:var(--color-raised);box-shadow:var(--shadow-raised);padding:18px}
-.itin-h{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
-.itin-h b{font-family:var(--font-display);font-size:15px;font-weight:650;letter-spacing:-.02em}
-.btn-ghost{margin-left:auto;min-height:36px;border-radius:var(--radius-sm);
+  background:var(--color-raised);box-shadow:var(--shadow-raised);padding:20px}
+.btn-ghost{min-height:44px;border-radius:var(--radius-sm);
   border:1px solid var(--color-edge-strong);background:transparent;color:var(--color-text-muted);
   padding:0 14px;font:inherit;font-size:12.5px;cursor:pointer;transition:background-color var(--motion-fast),color var(--motion-fast)}
 .btn-ghost:hover{background:var(--color-fill-hover);color:var(--color-text)}
-.day{margin-top:16px}
-.day-h{font-family:var(--font-display);font-size:12.5px;font-weight:600;color:var(--color-signal);
-  letter-spacing:.02em;margin-bottom:8px}
-.stops{list-style:none;padding:0;margin:0;border-left:1px solid var(--color-edge);margin-left:52px}
-.stop{position:relative;display:flex;align-items:baseline;gap:10px;padding:7px 0 7px 18px;font-size:13.5px}
-.stop::before{content:"";position:absolute;left:-4.5px;top:14px;width:8px;height:8px;border-radius:9999px;
-  background:var(--color-raised);border:1.5px solid var(--color-edge-strong)}
-.stop.on::before{background:var(--color-signal);border-color:var(--color-signal)}
-.stop .t{position:absolute;left:-52px;width:44px;text-align:right;font-family:var(--font-display);
-  font-variant-numeric:tabular-nums;font-size:12px;color:var(--color-text-dim)}
-.stop .n{flex:1}
-.stop .s{font-size:11.5px;color:var(--color-text-dim)}
-.itin-f{margin-top:16px;padding-top:13px;border-top:1px solid var(--color-edge);
-  font-size:12px;color:var(--color-text-muted);display:flex;flex-direction:column;gap:4px}
+.day+.day{margin-top:20px;border-top:1px solid var(--color-edge);padding-top:20px}
+.day-hd{display:flex;align-items:baseline;justify-content:space-between;column-gap:12px;row-gap:4px;flex-wrap:wrap}
+.day-hd-l{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.day-k{font-family:var(--font-display);font-size:11px;font-weight:500;letter-spacing:.14em;color:var(--color-signal)}
+.day-t{font-family:var(--font-display);font-size:16px;font-weight:600}
+.day-sum{font-family:var(--font-display);font-size:12px;font-variant-numeric:tabular-nums;color:var(--color-text-muted)}
+.assump{margin-top:10px;display:flex;gap:8px;border-radius:var(--radius-sm);
+  background:rgba(232,181,103,.07);border:1px solid rgba(232,181,103,.14);
+  padding:8px 12px;font-size:12px;line-height:1.55;color:var(--color-warn)}
+.assump p{margin:0}
+.stops{list-style:none;padding:0;margin:14px 0 0}
+.stop,.mv{position:relative;display:grid;grid-template-columns:46px 22px 1fr;column-gap:12px}
+.stop{padding:4px 0}
+.stop::before,.mv::before{content:"";position:absolute;left:68px;top:0;bottom:0;width:1px;background:var(--color-edge-strong)}
+.stop.first::before{top:14px}
+.stop.last::before{bottom:auto;height:14px}
+.stop.first.last::before{display:none}
+.stop .t{padding-top:3px;text-align:right;font-family:var(--font-display);
+  font-variant-numeric:tabular-nums;font-size:13px;color:var(--color-text-muted)}
+.stop .pin{position:relative;z-index:1;margin-top:3px;width:22px;height:22px;border-radius:9999px;
+  display:grid;place-items:center;font-family:var(--font-display);font-size:11px;font-weight:600;
+  background:var(--color-high);border:1px solid var(--color-edge-strong);color:var(--color-text-muted)}
+.stop.first .pin{background:var(--color-signal);border-color:var(--color-signal);color:var(--color-paper-ink)}
+.stop .n{font-size:15px;font-weight:600;line-height:1.5;padding-top:2px}
+.stop .s{font-size:12px;color:var(--color-text-dim)}
+.mv span{grid-column:3;padding:3px 0;font-size:11.5px;color:var(--color-text-dim)}
+.itin-f{margin-top:20px;padding-top:14px;border-top:1px solid var(--color-edge);
+  display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+.itin-f .fi{flex:1;display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:var(--color-text-muted);min-width:230px}
+.itin-f .fi p{margin:0}
+.itin-f .fl{color:var(--color-text-dim)}
+.itin-f .fa{display:flex;align-items:center;gap:10px}
+.itin-v{font-family:var(--font-display);font-size:11px;color:var(--color-text-dim)}
 
 /* ---- 質問フォーム ---- */
 .ask{border-radius:var(--radius-lg);border:1px solid var(--color-edge-strong);background:var(--color-raised);
@@ -374,23 +390,52 @@ body{background:var(--color-canvas);color:var(--color-text);font-family:var(--fo
         <div class="row-ai">
           <div class="ai-mark">⛰</div>
           <div class="itin">
-            <div class="itin-h">
-              <b>旅程 v2</b>
-              <span class="badge badge-warn">仮の前提あり</span>
-              <button class="btn-ghost">元に戻す</button>
-            </div>
             <div class="day">
-              <div class="day-h">1 日目</div>
+              <div class="day-hd">
+                <div class="day-hd-l">
+                  <span class="day-k">DAY 1</span>
+                  <b class="day-t">8月7日(金)</b>
+                </div>
+                <span class="day-sum">4か所 · 9:30 → 13:20</span>
+              </div>
+              <div class="assump">
+                <span aria-hidden="true">⚠</span>
+                <div>
+                  <p>日付は明日(8月7日(金))と仮定しています</p>
+                  <p>出発地点は宿泊先と仮定しています</p>
+                </div>
+              </div>
               <ol class="stops">
-                <li class="stop on"><span class="t">09:30</span><span class="n">元滝伏流水</span><span class="s">40 分</span></li>
-                <li class="stop"><span class="t">10:40</span><span class="n">胴腹滝</span><span class="s">20 分</span></li>
-                <li class="stop"><span class="t">11:45</span><span class="n">丸池様</span><span class="s">25 分</span></li>
-                <li class="stop"><span class="t">12:50</span><span class="n">釜磯の湧水</span><span class="s">30 分</span></li>
+                <li class="stop first">
+                  <span class="t">9:30</span><span class="pin">1</span>
+                  <div><div class="n">元滝伏流水</div><div class="s">滞在 40分</div></div>
+                </li>
+                <li class="mv"><span>↓ 移動 30分</span></li>
+                <li class="stop">
+                  <span class="t">10:40</span><span class="pin">2</span>
+                  <div><div class="n">胴腹滝</div><div class="s">滞在 20分</div></div>
+                </li>
+                <li class="mv"><span>↓ 移動 45分</span></li>
+                <li class="stop">
+                  <span class="t">11:45</span><span class="pin">3</span>
+                  <div><div class="n">丸池様</div><div class="s">滞在 25分</div></div>
+                </li>
+                <li class="mv"><span>↓ 移動 40分</span></li>
+                <li class="stop last">
+                  <span class="t">12:50</span><span class="pin">4</span>
+                  <div><div class="n">釜磯の湧水</div><div class="s">滞在 30分</div></div>
+                </li>
               </ol>
             </div>
             <div class="itin-f">
-              <span>追加: 元滝伏流水、丸池様</span>
-              <span style="color:var(--color-warn)">歩行を抑えるため、鶴間池の展望台は外しました。</span>
+              <div class="fi">
+                <p><span class="fl">追加:</span> 元滝伏流水、丸池様</p>
+                <p style="color:var(--color-warn)">歩行を抑えるため、鶴間池の展望台は外しました。</p>
+              </div>
+              <div class="fa">
+                <button class="btn-ghost">元に戻す</button>
+                <span class="itin-v">v2</span>
+              </div>
             </div>
           </div>
         </div>
