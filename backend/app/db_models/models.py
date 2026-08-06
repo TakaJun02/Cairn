@@ -245,7 +245,8 @@ class Thread(Base):
     asked_slots: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default=_EMPTY_TEXT_ARRAY
     )
-    ask_streak: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("0"))
+    # `ask_streak`(旧 A2 用)は 2026-08-06、ADR-0024 で廃止
+    # (migration 0005 で DROP COLUMN)。
     pending_ask: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     resolved_ambiguities: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=_EMPTY_LIST

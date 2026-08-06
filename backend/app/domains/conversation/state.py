@@ -92,7 +92,6 @@ class ContextSnapshot(StateModel):
     last_candidates: list[CandidateReference]
     presented_spot_ids: list[str]
     asked_slots: list[str]
-    ask_streak: int
     pending_ask: dict[str, Any] | None
     resolved_ambiguities: list[Any]
     pending_constraints: list[dict[str, Any]]
@@ -122,15 +121,21 @@ class TurnState(StateModel):
     history_tokens: int = 0
     last_candidates: list[CandidateReference] = Field(default_factory=list)
     presented_spot_ids: list[str] = Field(default_factory=list)
-    # `ask_user` の HITL 抑制ガード(§10 A1/A2/A5)。読み込み時の値を、
+    # `ask_user` の質の規律ガード(§10 A1/A5)。読み込み時の値を、
     # ターン内で質問が実行されるたびにメインループ/SA が更新する。
     asked_slots: list[str] = Field(default_factory=list)
-    ask_streak: int = 0
     resolved_ambiguities: list[Any] = Field(default_factory=list)
     pending_ask: dict[str, Any] | None = None
     pending_constraints: list[dict[str, Any]] = Field(default_factory=list)
-    # このターンで実行できた ask_user の回数(メイン・SA 合算。R4=2)。
+    # このターンで実行できた ask_user の回数(メイン・SA 合算。R4=6。
+    # 2026-08-06 改訂、ADR-0024)。
     ask_user_count: int = 0
+    # §7 のタイムアウト(10 分)が 1 度でも起きたら真になる。ターン内メモリ
+    # のみで永続しない(ContextSnapshot/DB には持たない)。以後、メイン・
+    # レコメンド SA・知識検索 SA のいずれも ask_user をスキーマから外し、
+    # 仮定で進む(2026-08-06 レビュー是正 H-1、ADR-0024: タイムアウトは
+    # 「ユーザーが席を外している」とみなし、同じターンでの再質問を止める)。
+    ask_timed_out: bool = False
     # ask_user への回答(user 行として persist する。§7・data_model.md §4.4)。
     qa_answers: list[dict[str, Any]] = Field(default_factory=list)
     realtime: dict[str, dict[str, int | None]] = Field(default_factory=dict)

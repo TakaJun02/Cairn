@@ -434,8 +434,8 @@ CREATE TABLE app.threads (
   -- ── 会話状態（agent_react_architecture.md §12）─────────────────
   presented_spot_ids    text[] NOT NULL DEFAULT '{}',   -- 反復推薦の防止（ADR-0006）
   last_candidates       jsonb  NOT NULL DEFAULT '[]',   -- 名寄せ・照応の検証語彙（§4.3）
-  asked_slots           text[] NOT NULL DEFAULT '{}',   -- ガードレール A1（同じスロットを 2 回聞かない）
-  ask_streak            smallint NOT NULL DEFAULT 0,    -- ガードレール A2（連続 ask_user は 2 ターンまで）
+  asked_slots           text[] NOT NULL DEFAULT '{}',   -- ガードレール A1（永続は選好スロットのみ。dates/origin はターン内 — ADR-0024 是正 M-3）
+  ask_streak            smallint NOT NULL DEFAULT 0,    -- 廃止（2026-08-06、ADR-0024。旧 A2 用。migration 0005 で DROP）
   pending_ask           jsonb,                          -- 表示中の質問（HITL の回答待ち。リロード復元用 = ADR-0019）
   resolved_ambiguities  jsonb  NOT NULL DEFAULT '[]',   -- ガードレール A5（同じ曖昧さを 2 回聞かない）
   pending_constraints   jsonb  NOT NULL DEFAULT '[]',   -- 旅程がない間の一時制約（§4.5.4）
@@ -454,7 +454,7 @@ CREATE TABLE app.threads (
 **なぜ状態を列に分けるのか**(JSONB 1 本にしない)。
 
 - **旧実装の失敗は「何が状態なのかコードを読まないと分からない」ことだった。**列ならスキーマに書ける
-- これらは**すべてコードが強制するガードレール(A1/A2/A5)や復帰処理の入力**である。スキーマに現れるべきものであり、隠すと「どこかで更新し忘れる」型のバグを検出できない
+- これらは**すべてコードが強制するガードレール(A1/A5。A2 は 2026-08-06 廃止 — ADR-0024)や復帰処理の入力**である。スキーマに現れるべきものであり、隠すと「どこかで更新し忘れる」型のバグを検出できない
 - 各列の**中身**は配列や構造なので JSONB / 配列型を使う。**列に分けることと、値が構造を持つことは別の話**である
 
 ### 4.3 各状態の中身

@@ -205,7 +205,7 @@ async def test_timeout_answer_continues_without_writing_user_row_or_update_profi
     assert outcome.answer_text is None
     assert "未回答" in outcome.digest
     assert "仮定" in outcome.digest
-    # R4/A2/A1 のカウンタ・slot 記録は「質問を提示した」こと自体には効く
+    # R4/A1 のカウンタ・slot 記録は「質問を提示した」こと自体には効く
     # (聞き直しをタイムアウトのたびに許さないため)。
     assert state.ask_user_count == 1
     assert state.asked_slots == ["mobility"]
@@ -253,8 +253,38 @@ async def test_tool_error_from_ask_user_is_not_executed() -> None:
     assert client.calls == []  # update_profile は再実行されない
 
 
+async def test_ask_timed_out_backstop_blocks_execution_without_calling_tools() -> None:
+    """H-1 残穴(2026-08-06 レビュー是正、ADR-0024)の実行時バックストップ。
+
+    `evaluate_ask_user`(ガード検査)より前で `state.ask_timed_out` を検査
+    する。メイン・レコメンド SA は schema 除外(主防御)で通常ここに到達
+    しないが、知識検索 SA は自身の内部ループの `ask_callback` 可否をターン
+    開始時に固定するため、同一 `search_knowledge` 呼び出し内でタイムアウト
+    後に再度 `ask_user` が選ばれる余地があった。`execute_ask_user` は 3 経路
+    すべてが必ず通るチョークポイントなので、ここでの防御が全経路に効く。
+    """
+
+    state = _state(ask_timed_out=True)
+    tools = FakeAskTools()
+    client = ScriptedClient([])
+
+    outcome = await execute_ask_user(
+        state, tools, _preference_question(), step_id=1, client=client
+    )
+
+    assert outcome.executed is False
+    assert outcome.guard_rule == "H1"
+    assert "タイムアウト済み" in outcome.digest
+    assert "最も確からしい解釈" in outcome.digest
+    assert tools.calls == []  # 質問は提示されない
+    assert client.calls == []  # update_profile も回らない
+    # カウンタ・状態は不変(R4/A1 の消費が起きない)。
+    assert state.ask_user_count == 0
+    assert state.asked_slots == []
+
+
 async def test_r4_guard_blocks_execution_without_calling_tools() -> None:
-    state = _state(ask_user_count=2)
+    state = _state(ask_user_count=6)
     tools = FakeAskTools()
     client = ScriptedClient([])
 

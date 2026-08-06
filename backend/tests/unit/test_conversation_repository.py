@@ -36,7 +36,6 @@ def _thread(*, asked_slots: list[str] | None = None) -> Thread:
         presented_spot_ids=[],
         last_candidates=[],
         asked_slots=asked_slots or ["pace"],
-        ask_streak=2,
         pending_ask={
             "kind": "clarify",
             "surface": "2番目",
@@ -60,8 +59,11 @@ def _state(**overrides: object) -> TurnState:
     return TurnState(**base)
 
 
-def test_persist_thread_always_clears_pending_ask_and_resets_ask_streak() -> None:
-    """段2は ask_user を呼ばないため、質問中の状態を持ち越さない。"""
+def test_persist_thread_always_clears_pending_ask() -> None:
+    """段2は ask_user を呼ばないため、質問中の状態を持ち越さない。
+
+    `ask_streak`(旧 A2 用のカウンタ)は 2026-08-06、ADR-0024 で廃止した。
+    """
 
     row = _thread()
     state = _state()
@@ -71,9 +73,30 @@ def test_persist_thread_always_clears_pending_ask_and_resets_ask_streak() -> Non
     repository._persist_thread(row, state, asked_at_message_id=87)
 
     assert row.pending_ask is None
-    assert row.ask_streak == 0
-    # asked_slots(段5で使う)は state の値をそのまま素通りする。
+    # asked_slots(段5で使う)は選好スロットのみ永続する(M-3。"pace" は
+    # 選好スロットなのでそのまま残る)。
     assert row.asked_slots == ["pace"]
+
+
+def test_persist_thread_asked_slots_persists_preference_slots_only() -> None:
+    """M-3(2026-08-06 レビュー是正、ADR-0024): `asked_slots` に永続するのは
+
+    選好スロット(onboarding/party/mobility/pace/interests)だけ。
+    `dates`/`origin` はターン内だけの照合で、次ターンには持ち越さない
+    (旅程ごとに変わる情報をスレッド生涯で封じると、「別の日程でもう一本」
+    で日付を聞けなくなる)。
+    """
+
+    row = _thread(asked_slots=[])
+    state = _state()
+    state.asked_slots = ["dates", "party", "origin", "mobility", "onboarding"]
+    repository = ConversationRepository(cast(AsyncSession, None))
+
+    repository._persist_thread(row, state)
+
+    assert sorted(row.asked_slots) == sorted(["party", "mobility", "onboarding"])
+    assert "dates" not in row.asked_slots
+    assert "origin" not in row.asked_slots
 
 
 def test_persist_thread_updates_presented_spot_ids_and_last_candidates() -> None:

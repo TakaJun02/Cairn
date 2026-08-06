@@ -65,10 +65,29 @@ async def execute_ask_user(
     existing_spot_ids: set[str] | None = None,
     run_update_profile: bool = True,
 ) -> AskExecutionOutcome:
+    # 2026-08-06 レビュー是正(H-1 残穴、ADR-0024): `state.ask_timed_out` の
+    # 実行時バックストップ。メイン・レコメンド SA・知識検索 SA それぞれの
+    # 呼び出し元は guided schema から `ask_user` を外すことでタイムアウト後
+    # の再質問を主に防ぐが、知識検索 SA は自身の内部ループの `ask_callback`
+    # 可否をターン開始時に固定するため、同一 `search_knowledge` 呼び出し内で
+    # タイムアウト後に再度 `ask_user` が選ばれる余地が残っていた。
+    # `execute_ask_user` は 3 経路すべてが必ず通るチョークポイントなので、
+    # ここで防ぐのがスキーマ除外(主防御)を経由しない経路にも効く唯一の
+    # 場所である(§7 の追記どおり)。
+    if state.ask_timed_out:
+        return AskExecutionOutcome(
+            executed=False,
+            digest=(
+                "このターンでは質問がタイムアウト済みのため、これ以上質問"
+                "できません。最も確からしい解釈を採り、仮定を明示して"
+                "進めてください。"
+            ),
+            guard_rule="H1",
+        )
+
     guard = evaluate_ask_user(
         question,
         ask_user_count=state.ask_user_count,
-        ask_streak=state.ask_streak,
         asked_slots=state.asked_slots,
         resolved_ambiguities=state.resolved_ambiguities,
         allowed_spot_ids=allowed_spot_ids,
@@ -108,7 +127,7 @@ async def execute_ask_user(
     answer_text = str(result.data.get("answer", ""))
     answered_by = str(result.data.get("answered_by", "free_text"))
 
-    # R4/A2 のカウンタ・A1(質問済み slot)は「質問を実際に提示した」ことに
+    # R4 のカウンタ・A1(質問済み slot)は「質問を実際に提示した」ことに
     # 対して回す。timeout でも聞いたこと自体は変わらないので増やす
     # (増やさないと同じ slot をタイムアウトのたびに聞き直せてしまう)。
     state.ask_user_count += 1
@@ -125,6 +144,11 @@ async def execute_ask_user(
         #     不当に禁止しない)
         # (c) `update_profile` を回さない(回答が無いのに再実行しない)
         # (d) 軌跡には「未回答(タイムアウト)。仮定して進めよ」を返す
+        # (e) 2026-08-06 レビュー是正(H-1、ADR-0024): `state.ask_timed_out`
+        #     を立てる。これが無いと呼び出し元(SA)はタイムアウトを観測
+        #     できず(executed=True・answer_text=None でプロンプトが変わら
+        #     ない)、同じ質問を選び続けて最大 R4 回 × 10 分ブロックしうる。
+        state.ask_timed_out = True
         return AskExecutionOutcome(
             executed=True,
             digest=(

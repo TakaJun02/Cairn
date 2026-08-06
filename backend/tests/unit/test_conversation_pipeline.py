@@ -112,7 +112,6 @@ class MemoryConversationRepository:
             last_candidates=[],
             presented_spot_ids=[],
             asked_slots=[],
-            ask_streak=0,
             pending_ask=None,
             resolved_ambiguities=[],
             pending_constraints=[],
