@@ -1,0 +1,1248 @@
+"""③ ReAct メインループの層 1 仕様(段2〜段5)。
+
+`Docs/30_design/agent_react_architecture.md` §3・§7・§10 と、受け入れ条件
+(単純推薦・QA が「Tool → done」の2周で完了する / R1〜R4 / ToolError の
+recoverable 分岐 / state:step の発火順 / 名前解決 / ask_user の HITL 接続)
+を検査する。実 LLM(127.0.0.1:8000)は一切叩かない(すべてスクリプト化した
+モッククライアント)。
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from app.domains.conversation.events import MemoryEventSink
+from app.domains.conversation.history import estimate_tokens
+from app.domains.conversation.main_agent import (
+    HARD_BUDGET_TOKENS,
+    MAX_EXECUTED_STEPS,
+    SOFT_BUDGET_TOKENS,
+    run_main_agent,
+)
+from app.domains.conversation.prompts import build_main_agent_messages
+from app.domains.conversation.state import ProfileState, SpotFact, TurnState
+from app.domains.conversation.types import ToolError, ToolErrorCode, ToolName, ToolResult
+
+
+def _turn_json(tool: str, args: dict[str, Any], *, thought: str = "考える") -> str:
+    return json.dumps(
+        {"thought": thought, "action": {"tool": tool, "args": args}},
+        ensure_ascii=False,
+    )
+
+
+def _recommend_act_json(
+    *,
+    filter: dict[str, Any] | None = None,
+    assumptions: list[str] | None = None,
+    thought: str = "条件を考える",
+) -> str:
+    """段3: レコメンド SA の判定 LLM(`recommend_agent`)の guided 応答。
+
+    `run_main_agent` は `recommend` action を実行するたびに、まずこの SA を
+    1 回呼んでから既存のレコメンド処理へ渡す。`ScriptedMainAgentClient` は
+    メインループと SA で同じ応答キューを共有するため、`recommend` action の
+    直後にはこの形の応答を 1 つ挟む。
+    """
+
+    return json.dumps(
+        {
+            "thought": thought,
+            "action": {
+                "tool": "done",
+                "args": {
+                    "filter": filter or {},
+                    "assumptions": assumptions or [],
+                },
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
+class ScriptedMainAgentClient:
+    """`generate()` を呼ぶたびに、スクリプトした応答を 1 つずつ返す。"""
+
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    async def generate(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+        self.calls.append({"messages": messages, **kwargs})
+        return self.responses.pop(0)
+
+
+class FakeTools:
+    """`ConversationToolPort` を満たす、queue 方式のスクリプト化 Tool。"""
+
+    def __init__(self) -> None:
+        self.recommend_queue: list[Any] = []
+        self.plan_queue: list[Any] = []
+        self.edit_queue: list[Any] = []
+        self.search_queue: list[Any] = []
+        self.ask_queue: list[Any] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def recommend(
+        self, *, step_id: int, args: Any, context: Any, use_specialist: bool
+    ) -> Any:
+        self.calls.append(("recommend", {"step_id": step_id, "args": args}))
+        return self.recommend_queue.pop(0)
+
+    async def plan_itinerary(self, *, step_id: int, user_id: int, args: Any, **kwargs: Any) -> Any:
+        self.calls.append(("plan_itinerary", {"step_id": step_id, "args": args, **kwargs}))
+        return self.plan_queue.pop(0)
+
+    async def edit_itinerary(self, *, step_id: int, user_id: int, args: Any, **kwargs: Any) -> Any:
+        self.calls.append(("edit_itinerary", {"step_id": step_id, "args": args, **kwargs}))
+        return self.edit_queue.pop(0)
+
+    async def search_knowledge(
+        self, *, step_id: int, args: Any, ask_callback: Any = None
+    ) -> Any:
+        self.calls.append(
+            ("search_knowledge", {"step_id": step_id, "args": args, "ask_callback": ask_callback})
+        )
+        return self.search_queue.pop(0)
+
+    async def ask_user(self, *, step_id: int, args: Any) -> Any:
+        self.calls.append(("ask_user", {"step_id": step_id, "args": args}))
+        if self.ask_queue:
+            return self.ask_queue.pop(0)
+        raise AssertionError(
+            "ask_user が呼ばれましたが、FakeTools.ask_queue に応答が積まれていません"
+        )
+
+
+def _spots() -> dict[str, SpotFact]:
+    return {
+        "spot_001": SpotFact(spot_id="spot_001", name_ja="鶴間池", kind="poi", tags_ja=["自然"]),
+        "spot_002": SpotFact(spot_id="spot_002", name_ja="元滝伏流水", kind="poi", tags_ja=["滝"]),
+    }
+
+
+def _state() -> TurnState:
+    spots = _spots()
+    return TurnState(
+        turn_id="turn",
+        thread_id=1,
+        user_id=1,
+        utterance="滝が見たい",
+        profile=ProfileState(),
+        spot_id_vocab=list(spots),
+        spot_names={key: value.name_ja for key, value in spots.items()},
+        spot_catalog=spots,
+        # レコメンド SA の guided schema/検証が読む生タグ 80 語相当(§4)。
+        # テストでは実データを模した小さな語彙で十分。
+        tag_vocabulary=["自然", "滝", "登山", "温泉"],
+        default_origin_spot_id="spot_001",
+    )
+
+
+def _recommend_result(step_id: int = 1) -> ToolResult:
+    return ToolResult(
+        step_id=step_id,
+        tool=ToolName.RECOMMEND,
+        data={
+            "spot_ids": ["spot_001"],
+            "candidates": [
+                {
+                    "spot_id": "spot_001",
+                    "rank": 1,
+                    "reason_materials": {
+                        "matched_tags": ["自然"],
+                        "travel_time_text": "車で10分",
+                    },
+                }
+            ],
+            "provisional_spot_ids": ["spot_001"],
+            "rerank_used": True,
+        },
+    )
+
+
+def _search_result(step_id: int = 1) -> ToolResult:
+    return ToolResult(
+        step_id=step_id,
+        tool=ToolName.SEARCH_KNOWLEDGE,
+        data={
+            "answer_ja": "由来は江戸期の伝承です。",
+            "sources": [{"kind": "knowledge", "doc_id": "d1", "title": "由来資料"}],
+            "coverage": "full",
+            "spot_id": None,
+        },
+    )
+
+
+def _itinerary_payload(version: int = 1) -> dict[str, Any]:
+    return {
+        "days": [
+            {
+                "date": "2026-08-05",
+                "start_min": 540,
+                "end_min": 1020,
+                "origin": {"kind": "spot", "spot_id": "spot_001"},
+                "destination": {"kind": "spot", "spot_id": "spot_001"},
+                "items": [],
+            }
+        ],
+        "concessions": [],
+        "version": version,
+    }
+
+
+def _plan_result(step_id: int = 1) -> ToolResult:
+    return ToolResult(
+        step_id=step_id,
+        tool=ToolName.PLAN_ITINERARY,
+        data={
+            "itinerary": _itinerary_payload(),
+            "alternatives": [],
+            "concessions": [],
+            "selection_used": False,
+            "spot_ids": [],
+            "unmodeled": [],
+        },
+    )
+
+
+async def test_recommend_then_done_completes_in_two_turns() -> None:
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [_recommend_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _recommend_act_json(filter={"tags": ["滝"]}),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    # main_agent_turns はメインループの周回だけを数える(SA の判定 LLM は
+    # 別カウンタで、main_agent_turns には含まれない)。
+    assert state.main_agent_turns == 2
+    assert state.executed_tool_count == 1
+    assert [call[0] for call in tools.calls] == ["recommend"]
+    assert len(state.trajectory) == 1
+    assert state.trajectory[0].tool == "recommend"
+    assert "鶴間池" in state.trajectory[0].observation
+    assert "spot_001" not in state.trajectory[0].observation
+    assert state.step_results[1].tool is ToolName.RECOMMEND
+    # SA が翻訳した filter がそのまま既存のレコメンド処理へ渡っている。
+    recommend_call = next(call for call in tools.calls if call[0] == "recommend")
+    assert recommend_call[1]["args"].filter == {"tags": ["滝"]}
+
+
+async def test_recommend_dispatch_drops_invalid_tag_element_and_keeps_valid() -> None:
+    """23_ux_issues.md §0.3 / §7-2 の実害シナリオ(C4: 要素単位で落とす)。
+
+    「滝や湧水などの自然が好きです。車で回ります」のような指示から、SA が
+    実在しないタグ(「山」)や不正な mobility(「car」— 歩行耐性ではなく
+    移動手段)を返しても、その要素だけが落ち、有効な「滝」は残ったまま
+    既存のレコメンド処理が実行される(0 件応答にしない)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [_recommend_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", {"instruction": "滝や湧水が好きです。車で回ります"}),
+            _recommend_act_json(filter={"tags": ["滝", "山"], "mobility": "car"}),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    recommend_call = next(call for call in tools.calls if call[0] == "recommend")
+    # 「山」はタグ語彙に無いため落ち、「滝」だけが残る。mobility の
+    # "car" も enum(avoid_walk/short_walk_ok/hike_ok)に無いため落ちる。
+    assert recommend_call[1]["args"].filter == {"tags": ["滝"]}
+    assert "mobility" not in recommend_call[1]["args"].filter
+    # 落とした事実は結果ダイジェスト(このターンの軌跡)に必ず現れる(無言破棄の禁止)。
+    observation = state.trajectory[0].observation
+    assert "山" in observation
+    assert "car" in observation
+    assert "除外した条件" in observation
+
+
+async def test_recommend_dispatch_executes_with_empty_filter_when_all_elements_invalid() -> None:
+    """C4: 全要素が不正でも filter なしで実行し、0 件応答にしない。"""
+
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [_recommend_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", {"instruction": "よくわからないけど何か教えて"}),
+            _recommend_act_json(filter={"tags": ["架空タグ"], "mobility": "car"}),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    recommend_call = next(call for call in tools.calls if call[0] == "recommend")
+    # tags/mobility とも全滅しても、生き残った要素だけの filter(= 実質
+    # 絞り込み無し)になり、tools.recommend は実行される(手ごと破棄されない)。
+    assert recommend_call[1]["args"].filter == {"tags": []}
+    assert [call[0] for call in tools.calls] == ["recommend"]
+    assert state.trajectory[0].error is None
+
+
+async def test_recommend_dispatch_reports_assumptions_in_digest() -> None:
+    """A7: 質問できない場面では仮定して推薦し、置いた仮定を結果で報告する。"""
+
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [_recommend_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", {"instruction": "おすすめを教えて"}),
+            _recommend_act_json(
+                filter={},
+                assumptions=["同行者の情報が無いため、対象者は絞りませんでした"],
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    observation = state.trajectory[0].observation
+    assert "置いた仮定" in observation
+    assert "同行者の情報が無いため、対象者は絞りませんでした" in observation
+
+
+async def test_recommend_dispatch_falls_back_to_no_filter_when_subagent_call_fails() -> None:
+    """SA の判定 LLM 呼び出し自体が壊れても、推薦そのものは止めない(NFR-5)。"""
+
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [_recommend_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", {"instruction": "おすすめを教えて"}),
+            "not a json",
+            "not a json",  # 再試行後も契約違反 → SA はフォールバックする
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    recommend_call = next(call for call in tools.calls if call[0] == "recommend")
+    assert recommend_call[1]["args"].filter == {"tags": []}
+    assert any(value.code == "recommend_agent_degraded" for value in state.degraded)
+
+
+async def test_search_knowledge_then_done_completes_in_two_turns() -> None:
+    state = _state()
+    tools = FakeTools()
+    tools.search_queue = [_search_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("search_knowledge", {"request": "由来を教えて", "spot_name": None}),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert state.main_agent_turns == 2
+    assert state.executed_tool_count == 1
+    assert [call[0] for call in tools.calls] == ["search_knowledge"]
+    assert "由来は江戸期の伝承です" in state.trajectory[0].observation
+
+
+async def test_search_knowledge_omits_ask_callback_when_r4_budget_already_exhausted() -> None:
+    """裁定16(2026-08-04レビュー是正・2026-08-06 R4=6 に改訂、ADR-0024): R4
+
+    (メイン・SA合算で1ターン6回まで)に既に到達していれば、知識検索 SA へは
+    `ask_callback` 自体を渡さない。`KnowledgeSearchAgent._available_tools` は
+    `ask_callback is None` のとき `ask_user` を guided schema の enum から
+    外すため、narration 側へカウンタを持ち込まずに同じ効果が得られる。
+    """
+
+    state = _state()
+    state.ask_user_count = 6  # 既に上限に到達済み。
+    tools = FakeTools()
+    tools.search_queue = [_search_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("search_knowledge", {"request": "由来を教えて", "spot_name": None}),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    search_call = next(call for call in tools.calls if call[0] == "search_knowledge")
+    assert search_call[1]["ask_callback"] is None
+
+
+async def test_r1_step_budget_switches_to_done_only_schema() -> None:
+    state = _state()
+    tools = FakeTools()
+    tools.search_queue = [_search_result(index) for index in range(1, MAX_EXECUTED_STEPS + 1)]
+    responses = [
+        _turn_json("search_knowledge", {"request": f"質問{index}", "spot_name": None})
+        for index in range(1, MAX_EXECUTED_STEPS + 1)
+    ]
+    responses.append(_turn_json("done", {}))
+    client = ScriptedMainAgentClient(responses)
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert state.executed_tool_count == MAX_EXECUTED_STEPS
+    assert state.main_agent_turns == MAX_EXECUTED_STEPS + 1
+    # 9 手目(縮小スキーマ)の呼び出しは done のみを許す。
+    ninth_schema = client.calls[MAX_EXECUTED_STEPS]["extra_body"]["response_format"]["json_schema"][
+        "schema"
+    ]
+    assert ninth_schema["properties"]["action"]["properties"]["tool"]["enum"] == ["done"]
+    # 1〜8 手目は通常スキーマ(anyOf で6つの Tool を許す。ask_user 含む)。
+    first_schema = client.calls[0]["extra_body"]["response_format"]["json_schema"]["schema"]
+    assert len(first_schema["properties"]["action"]["anyOf"]) == 6
+
+
+def _pad_history_to_reach(target_tokens: int) -> str:
+    baseline_state = _state()
+    baseline_messages = build_main_agent_messages(baseline_state, reduced=False)
+    baseline_tokens = sum(estimate_tokens(value["content"]) for value in baseline_messages)
+    needed = max(0, target_tokens - baseline_tokens)
+    return "あ" * needed
+
+
+async def test_r2_soft_budget_switches_to_reduced_schema_without_stopping() -> None:
+    state = _state()
+    state.history = _pad_history_to_reach(SOFT_BUDGET_TOKENS + 300)
+    tools = FakeTools()
+    client = ScriptedMainAgentClient([_turn_json("done", {})])
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert len(client.calls) == 1
+    schema = client.calls[0]["extra_body"]["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["action"]["properties"]["tool"]["enum"] == ["done"]
+    assert state.main_agent_failed is False
+
+
+async def test_r2_hard_budget_forces_done_without_calling_llm() -> None:
+    state = _state()
+    state.history = _pad_history_to_reach(HARD_BUDGET_TOKENS + 500)
+    tools = FakeTools()
+    client = ScriptedMainAgentClient([])
+    sink = MemoryEventSink()
+
+    await run_main_agent(state, tools=tools, client=client, event_sink=sink)
+
+    assert client.calls == []
+    assert state.trajectory == []
+    assert any(value.code == "context_budget_hard" for value in state.degraded)
+    error_events = [event for event in sink.events if event.event == "error"]
+    assert error_events[0].data["code"] == "context_budget_hard"
+    assert error_events[0].data["degraded"] is True
+
+
+async def test_r3_repeated_action_is_not_executed_twice() -> None:
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [_recommend_result()]
+    same_args = {"instruction": "滝が見たい"}
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", same_args),
+            _recommend_act_json(),
+            _turn_json("recommend", same_args),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert [call[0] for call in tools.calls] == ["recommend"]
+    assert state.executed_tool_count == 1
+    assert len(state.trajectory) == 2
+    assert "繰り返し" in state.trajectory[1].observation
+
+
+async def test_tool_error_recoverable_continues_loop() -> None:
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [
+        ToolError(
+            code=ToolErrorCode.EMPTY_RESULT,
+            message_ja="候補が見つかりませんでした。",
+            recoverable=True,
+        )
+    ]
+    tools.search_queue = [_search_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _recommend_act_json(),
+            _turn_json("search_knowledge", {"request": "由来", "spot_name": None}),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert [call[0] for call in tools.calls] == ["recommend", "search_knowledge"]
+    assert state.trajectory[0].error is not None
+    assert state.trajectory[0].error["recoverable"] is True
+    assert state.trajectory[1].error is None
+    assert state.executed_tool_count == 2
+
+
+async def test_tool_error_non_recoverable_aborts_loop() -> None:
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [
+        ToolError(
+            code=ToolErrorCode.INTERNAL,
+            message_ja="処理中に予期しない問題が発生しました。",
+            recoverable=False,
+        )
+    ]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _recommend_act_json(),
+            _turn_json("search_knowledge", {"request": "この行は呼ばれない", "spot_name": None}),
+        ]
+    )
+    sink = MemoryEventSink()
+
+    await run_main_agent(state, tools=tools, client=client, event_sink=sink)
+
+    assert [call[0] for call in tools.calls] == ["recommend"]
+    # 1回目はメインループの action 選択、2回目はレコメンド SA の判定 LLM。
+    # ToolError(非回復)でループが打ち切られるため、3個目(search_knowledge 用)
+    # は消費されない。
+    assert len(client.calls) == 2
+    assert state.trajectory[0].error["recoverable"] is False
+    error_events = [event for event in sink.events if event.event == "error"]
+    # 2026-08-04、レビュー是正(M-1): stage は SSE 契約(chat_sse.md
+    # ErrorStage)の語彙内なら落ちた Tool 名(ここでは "recommend")を
+    # そのまま残す。語彙外へ一律 "main_agent" に落とすと、語彙内 Tool の
+    # stage 情報を不要に失っていた(旧是正の過剰対応)。
+    assert error_events[0].data["stage"] == "recommend"
+    assert error_events[0].data["degraded"] is False
+
+
+async def test_tool_error_non_recoverable_ask_user_stage_falls_back_to_main_agent() -> None:
+    """M-1: "ask_user" は SSE 契約の ErrorStage 語彙に無いため、非回復の
+
+    ToolError で打ち切るときだけ stage は "main_agent" へフォールバックする
+    (語彙内の Tool は Tool 名をそのまま残す。上の
+    `test_tool_error_non_recoverable_aborts_loop` と対になる回帰テスト)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    tools.ask_queue = [
+        ToolError(
+            code=ToolErrorCode.INTERNAL,
+            message_ja="質問の送出に失敗しました。",
+            recoverable=False,
+        )
+    ]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="preference",
+                    slot="mobility",
+                    reason="どのくらい歩けますか",
+                ),
+            ),
+        ]
+    )
+    sink = MemoryEventSink()
+
+    await run_main_agent(state, tools=tools, client=client, event_sink=sink)
+
+    assert [call[0] for call in tools.calls] == ["ask_user"]
+    assert state.trajectory[0].error["recoverable"] is False
+    error_events = [event for event in sink.events if event.event == "error"]
+    assert error_events[0].data["stage"] == "main_agent"
+    assert error_events[0].data["degraded"] is False
+
+
+async def test_dispatch_recommend_args_validation_error_is_recoverable_and_continues() -> None:
+    """M-2: `_dispatch` の包括 except の手前で `ValidationError` を捕捉し、
+
+    どの Tool でも recoverable=true の観測として差し戻す(guided スキーマが
+    通常防ぐ型不一致でも、ターンを打ち切らない)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    tools.search_queue = [_search_result()]
+    client = ScriptedMainAgentClient(
+        [
+            # instruction が str ではなく int(型不一致)。
+            _turn_json("recommend", {"instruction": 123}),
+            _turn_json("search_knowledge", {"request": "由来", "spot_name": None}),
+            _turn_json("done", {}),
+        ]
+    )
+    sink = MemoryEventSink()
+
+    await run_main_agent(state, tools=tools, client=client, event_sink=sink)
+
+    # recommend は Tool 本体まで到達せず(args 検証で落ちる)、
+    # search_knowledge は通常どおり実行される。
+    assert [call[0] for call in tools.calls] == ["search_knowledge"]
+    assert state.trajectory[0].tool == "recommend"
+    assert state.trajectory[0].error is not None
+    assert state.trajectory[0].error["recoverable"] is True
+    assert "recommend の引数が契約に違反しています" in state.trajectory[0].observation
+    assert "最も妥当な解釈で引数を直して再実行してください" in state.trajectory[0].observation
+    assert state.executed_tool_count == 1  # search_knowledge のみ(recommend は数えない)
+    error_events = [event for event in sink.events if event.event == "error"]
+    assert error_events == []  # recoverable=true はループを打ち切らない
+
+
+async def test_ask_user_invalid_kind_slot_combination_is_recoverable_and_continues() -> None:
+    """欠陥1(25 §1-6): guided スキーマが防いでも、契約違反の生 args が来た
+
+    場合に備え `_dispatch_ask_user` は `AskUserArgs` の ValidationError を
+    recoverable=true の ToolError として観測に差し戻す。以前は `_dispatch`
+    の包括 except が recoverable=false の INTERNAL に変換し、ループを
+    打ち切っていた(このテストはその回帰を防ぐ)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                # kind=clarify なのに slot が非 null(排他違反)。
+                _ask_user_action(kind="clarify", slot="mobility", surface="鶴間池"),
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+    sink = MemoryEventSink()
+
+    await run_main_agent(state, tools=tools, client=client, event_sink=sink)
+
+    # ask_execution/ask_registry へは一切到達しない(検証で落ちるため)。
+    assert tools.calls == []
+    assert state.trajectory[0].tool == "ask_user"
+    assert state.trajectory[0].error is not None
+    assert state.trajectory[0].error["recoverable"] is True
+    assert "契約に違反しています" in state.trajectory[0].observation
+    assert "最も妥当な解釈を採って進めてください" in state.trajectory[0].observation
+    # ループは打ち切られず done まで到達する。
+    assert state.main_agent_turns == 2
+    # L-3(2026-08-04、レビュー是正): 実行されなかった手は R1(§3.5)の
+    # 手数上限に数えない(A4/A6 の他の早期リターンと同じ扱い)。
+    assert state.executed_tool_count == 0
+    error_events = [event for event in sink.events if event.event == "error"]
+    assert error_events == []
+
+
+async def test_state_step_fires_started_then_finished_and_never_plan() -> None:
+    state = _state()
+    tools = FakeTools()
+    tools.recommend_queue = [_recommend_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("recommend", {"instruction": "滝が見たい"}),
+            _recommend_act_json(),
+            _turn_json("done", {}),
+        ]
+    )
+    sink = MemoryEventSink()
+
+    await run_main_agent(state, tools=tools, client=client, event_sink=sink)
+
+    kinds_and_status = [
+        (event.data.get("kind"), event.data.get("status"))
+        for event in sink.events
+        if event.event == "state"
+    ]
+    # started(メイン) → progress(レコメンド SA の判定 LLM 実行中) → finished。
+    assert kinds_and_status == [("step", "started"), ("step", "progress"), ("step", "finished")]
+    assert all(value[0] != "plan" for value in kinds_and_status)
+
+
+async def test_plan_itinerary_resolves_names_and_reports_dropped() -> None:
+    # ADR-0022 是正 H-2: `_state()` の `default_origin_spot_id` は
+    # "spot_001"(= "鶴間池")と同じで、origin_name 未指定だと must_visit が
+    # 起点と同一 spot に解決してしまい実効プールがゼロになる
+    # (precondition_unmet に飲まれる)。この既存テストは名前解決・dropped
+    # 報告そのものを検査したいので、起点を独立した施設スポットにした
+    # 専用の state を組む。
+    spots = {
+        **_spots(),
+        "spot_origin": SpotFact(spot_id="spot_origin", name_ja="道の駅", kind="facility"),
+    }
+    state = TurnState(
+        turn_id="turn",
+        thread_id=1,
+        user_id=1,
+        utterance="滝が見たい",
+        profile=ProfileState(),
+        spot_id_vocab=list(spots),
+        spot_names={key: value.name_ja for key, value in spots.items()},
+        spot_catalog=spots,
+        tag_vocabulary=["自然", "滝", "登山", "温泉"],
+        default_origin_spot_id="spot_origin",
+    )
+    tools = FakeTools()
+    tools.plan_queue = [_plan_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "plan_itinerary",
+                {
+                    "days": [
+                        {
+                            "date": "2026-08-05",
+                            "start": "09:00",
+                            "end": "17:00",
+                            "origin_name": None,
+                            "destination_name": None,
+                        }
+                    ],
+                    "must_visit": ["鶴間池", "架空スポット"],
+                    "constraints": None,
+                    "notes": None,
+                },
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    tool_name, call_args = tools.calls[0]
+    assert tool_name == "plan_itinerary"
+    assert call_args["args"].must_visit == ["spot_001"]
+    assert "架空スポット" in state.trajectory[0].observation
+    assert "解決できなかった" in state.trajectory[0].observation
+    assert "spot_001" not in state.trajectory[0].observation
+
+
+# ---------------------------------------------------------------------------
+# ask_user(§7): メインエージェント自身の HITL 接続
+# ---------------------------------------------------------------------------
+
+
+def _ask_user_action(
+    *,
+    kind: str,
+    slot: str | None = None,
+    surface: str | None = None,
+    reason: str = "確認させてください",
+    options: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "slot": slot,
+        "surface": surface,
+        "reason": reason,
+        "options": options
+        or [
+            {"label": "はい", "value": "yes"},
+            {"label": "いいえ", "value": "no"},
+        ],
+    }
+
+
+def _update_profile_json(*, mobility: str | None = None) -> str:
+    delta = None
+    if mobility is not None:
+        delta = {
+            "interests": {},
+            "party": None,
+            "mobility": mobility,
+            "pace": None,
+            "avoid": [],
+            "notes": None,
+        }
+    return json.dumps({"profile_delta": delta, "score_adjustments": []}, ensure_ascii=False)
+
+
+def _ask_result(*, answer: str, answered_by: str = "chip") -> ToolResult:
+    return ToolResult(
+        step_id=1, tool=ToolName.ASK_USER, data={"answer": answer, "answered_by": answered_by}
+    )
+
+
+async def test_ask_user_preference_answer_updates_profile_and_continues_to_done() -> None:
+    """メイン: ask_user → 回答 → update_profile 再実行 → ループ続行 → done。"""
+
+    state = _state()
+    tools = FakeTools()
+    tools.ask_queue = [_ask_result(answer="30分程度なら")]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="preference",
+                    slot="mobility",
+                    reason="どのくらい歩けますか",
+                    options=[
+                        {"label": "あまり歩きたくない", "value": "avoid_walk"},
+                        {"label": "30分程度なら", "value": "short_walk_ok"},
+                    ],
+                ),
+            ),
+            _update_profile_json(mobility="short_walk_ok"),  # execute_ask_user の再実行分
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert [call[0] for call in tools.calls] == ["ask_user"]
+    assert state.ask_user_count == 1
+    assert state.asked_slots == ["mobility"]
+    assert state.profile.mobility == "short_walk_ok"
+    assert state.qa_answers[0]["answer"] == "30分程度なら"
+    assert "30分程度なら" in state.trajectory[0].observation
+    assert state.trajectory[0].tool == "ask_user"
+    assert state.main_agent_turns == 2  # ①ask_user ②done(done は軌跡に載らない)
+
+
+async def test_ask_user_clarify_resolves_spot_names_to_ids_before_dispatch() -> None:
+    """§3.3: メインは spot_id を書かない。options[].value は名前で渡す。"""
+
+    state = _state()
+    tools = FakeTools()
+    tools.ask_queue = [_ask_result(answer="鶴間池")]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="clarify",
+                    surface="2番目のやつ",
+                    reason="候補が 2 つあります",
+                    options=[
+                        {"label": "鶴間池", "value": "鶴間池"},
+                        {"label": "元滝伏流水", "value": "元滝伏流水"},
+                    ],
+                ),
+            ),
+            _update_profile_json(),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    ask_call = next(call for call in tools.calls if call[0] == "ask_user")
+    resolved_values = [option.value for option in ask_call[1]["args"].options]
+    assert resolved_values == ["spot_001", "spot_002"]
+    assert state.resolved_ambiguities == [
+        {"surface": "2番目のやつ", "resolved_to": "spot_001"}
+    ]
+
+
+async def test_ask_user_clarify_with_unresolvable_name_is_not_executed() -> None:
+    """A4: 選択肢が具体値(spot_id)に解決できない質問は実行せず落とす。"""
+
+    state = _state()
+    tools = FakeTools()
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="clarify",
+                    surface="どこか",
+                    reason="どちらのことですか",
+                    options=[
+                        {"label": "鶴間池", "value": "鶴間池"},
+                        {"label": "架空スポット", "value": "架空スポット"},
+                    ],
+                ),
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert tools.calls == []  # 実行されない(ガード前に名前解決で落ちる)
+    assert "解決" in state.trajectory[0].observation
+    assert state.ask_user_count == 0
+
+
+async def test_ask_user_clarify_short_circuits_when_surface_already_resolves() -> None:
+    """A6(2026-08-04レビュー是正・裁定17): surface 自体が既に一意に解決
+
+    できるなら聞かない。R1(裁定18)もこの手を「実行された手」に数えない。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="clarify",
+                    surface="鶴間池",
+                    reason="念のため確認します",
+                    options=[
+                        {"label": "鶴間池", "value": "鶴間池"},
+                        {"label": "元滝伏流水", "value": "元滝伏流水"},
+                    ],
+                ),
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert tools.calls == []
+    assert "解決済み" in state.trajectory[0].observation
+    assert state.ask_user_count == 0
+    assert state.executed_tool_count == 0
+
+
+async def test_ask_user_preference_short_circuits_when_slot_already_in_profile() -> None:
+    """A6: プロフィールに既に値がある slot は聞かない(仮定して進める)。"""
+
+    state = _state()
+    state.profile.mobility = "avoid_walk"
+    tools = FakeTools()
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="preference",
+                    slot="mobility",
+                    reason="どのくらい歩けますか",
+                    options=[
+                        {"label": "あまり歩きたくない", "value": "avoid_walk"},
+                        {"label": "30分程度なら", "value": "short_walk_ok"},
+                    ],
+                ),
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert tools.calls == []
+    assert state.ask_user_count == 0
+    assert state.executed_tool_count == 0
+    assert "最も確からしい解釈" in state.trajectory[0].observation
+
+
+async def test_ask_user_guard_rejection_reports_reason_and_continues() -> None:
+    """A1: 質問済み slot への再質問はガードで落ち、仮定して進める指示が残る。"""
+
+    state = _state()
+    state.asked_slots = ["mobility"]
+    tools = FakeTools()
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(
+                    kind="preference",
+                    slot="mobility",
+                    reason="どのくらい歩けますか",
+                ),
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert tools.calls == []
+    assert "質問できませんでした" in state.trajectory[0].observation
+    assert "最も確からしい解釈" in state.trajectory[0].observation
+    assert state.ask_user_count == 0
+
+
+async def test_ask_user_r4_limit_removes_ask_user_from_schema_after_six_questions() -> None:
+    """R4: 1 ターンに ask_user は 6 回まで(2026-08-06 改訂、ADR-0024)。
+
+    6 回目までは受理され、7 周目のスキーマから `ask_user` が外れる。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    # A1/A6 に触れないよう、質問ごとに異なる slot を使う(slot_values() の
+    # 7 語彙のうち 6 つ)。redecision は毎回 profile_delta=None(差分なし)
+    # を返すため、A6(既知の slot は聞かない)には一切引っかからない。
+    slots = ["party", "mobility", "pace", "interests", "dates", "origin"]
+    assert len(slots) == 6
+    tools.ask_queue = [_ask_result(answer=f"回答{index}") for index in range(1, 7)]
+
+    responses: list[str] = []
+    for index, slot in enumerate(slots, start=1):
+        responses.append(
+            _turn_json(
+                "ask_user",
+                _ask_user_action(kind="preference", slot=slot, reason=f"質問{index}"),
+            )
+        )
+        responses.append(_update_profile_json())
+    responses.append(_turn_json("done", {}))
+    client = ScriptedMainAgentClient(responses)
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert state.ask_user_count == 6
+    assert state.main_agent_turns == 7  # ①〜⑥ ask_user ⑦done
+
+    # client.calls には update_profile 再実行分も混ざるので、
+    # メインループ自身の周(schema に "action" プロパティを持つ)だけを拾う。
+    main_loop_schemas = [
+        call["extra_body"]["response_format"]["json_schema"]["schema"]
+        for call in client.calls
+        if "action" in call["extra_body"]["response_format"]["json_schema"]["schema"]["properties"]
+    ]
+    assert len(main_loop_schemas) == 7
+    seventh_schema = main_loop_schemas[6]
+    seventh_tools = [
+        branch["properties"]["tool"]["enum"][0]
+        for branch in seventh_schema["properties"]["action"]["anyOf"]
+    ]
+    assert "ask_user" not in seventh_tools
+    first_tools = [
+        branch["properties"]["tool"]["enum"][0]
+        for branch in main_loop_schemas[0]["properties"]["action"]["anyOf"]
+    ]
+    assert "ask_user" in first_tools
+    # R1(2026-08-06 改訂、ADR-0024): ask_user は手数上限から除外されるため、
+    # 6 回質問しても executed_tool_count は増えない。
+    assert state.executed_tool_count == 0
+
+
+async def test_r1_step_budget_excludes_ask_user_from_executed_count() -> None:
+    """R1(§3.5・§10、2026-08-06 改訂、ADR-0024): 手数上限は ask_user を数えない。
+
+    質問を複数回挟んでも `executed_count` は search_knowledge 等の実行手
+    だけを数え、質問後も MAX_EXECUTED_STEPS(8)回の実行手を使い切れる
+    (質問がループ予算を食って recommend/plan ができなくなる逆転を防ぐ)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    ask_slots = ["party", "mobility", "pace"]
+    tools.ask_queue = [_ask_result(answer=f"回答{index}") for index in range(1, len(ask_slots) + 1)]
+    tools.search_queue = [_search_result(index) for index in range(1, MAX_EXECUTED_STEPS + 1)]
+
+    responses: list[str] = []
+    for index, slot in enumerate(ask_slots, start=1):
+        responses.append(
+            _turn_json(
+                "ask_user",
+                _ask_user_action(kind="preference", slot=slot, reason=f"質問{index}"),
+            )
+        )
+        responses.append(_update_profile_json())
+    for index in range(1, MAX_EXECUTED_STEPS + 1):
+        responses.append(
+            _turn_json("search_knowledge", {"request": f"由来{index}", "spot_name": None})
+        )
+    responses.append(_turn_json("done", {}))
+    client = ScriptedMainAgentClient(responses)
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert state.ask_user_count == len(ask_slots)
+    assert state.executed_tool_count == MAX_EXECUTED_STEPS
+    assert (
+        len([call for call in tools.calls if call[0] == "search_knowledge"])
+        == MAX_EXECUTED_STEPS
+    )
+    assert len([call for call in tools.calls if call[0] == "ask_user"]) == len(ask_slots)
+
+
+async def test_ask_user_timeout_disables_ask_user_for_rest_of_turn() -> None:
+    """H-1(2026-08-06 レビュー是正、ADR-0024): タイムアウトが起きたら
+
+    `state.ask_timed_out` が立ち、以後このターンはメインの schema からも
+    `ask_user` が外れる(SA と共通の `TurnState` フラグ)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    tools.ask_queue = [
+        ToolResult(
+            step_id=1,
+            tool=ToolName.ASK_USER,
+            data={
+                "answer": "(タイムアウトのため回答がありませんでした)",
+                "answered_by": "timeout",
+            },
+        )
+    ]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(kind="preference", slot="mobility", reason="どのくらい歩けますか"),
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert state.ask_timed_out is True
+    assert [call[0] for call in tools.calls] == ["ask_user"]
+    assert state.main_agent_turns == 2
+    second_schema = client.calls[1]["extra_body"]["response_format"]["json_schema"]["schema"]
+    second_tools = [
+        branch["properties"]["tool"]["enum"][0]
+        for branch in second_schema["properties"]["action"]["anyOf"]
+    ]
+    assert "ask_user" not in second_tools
+
+
+async def test_knowledge_search_ask_callback_backstop_after_timeout() -> None:
+    """H-1 残穴の統合確認(2026-08-06 レビュー是正、ADR-0024)。
+
+    知識検索 SA は自身の内部ループの中で `ask_callback` を複数回呼びうる
+    (`ask_callback is not None` かどうかの可否判定はターン開始時に固定され、
+    `state.ask_timed_out` の変化を見ない)。1 回目がタイムアウトしたら
+    `state.ask_timed_out` が立ち、同一 `search_knowledge` 呼び出し内で渡さ
+    れた**同じ** `ask_callback` への 2 回目の呼び出しは
+    `execute_ask_user` 冒頭のバックストップ(guard_rule="H1")で弾かれ、
+    実際の `tools.ask_user`(HITL 待ち受け)は 1 回しか呼ばれない。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    tools.ask_queue = [
+        ToolResult(
+            step_id=1,
+            tool=ToolName.ASK_USER,
+            data={
+                "answer": "(タイムアウトのため回答がありませんでした)",
+                "answered_by": "timeout",
+            },
+        )
+    ]
+    tools.search_queue = [_search_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("search_knowledge", {"request": "由来を教えて", "spot_name": None}),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    search_call = next(call for call in tools.calls if call[0] == "search_knowledge")
+    ask_callback = search_call[1]["ask_callback"]
+    assert ask_callback is not None
+    assert state.ask_timed_out is False  # まだ 1 度も呼ばれていない
+
+    def _clarify_kwargs(reason: str) -> dict[str, Any]:
+        return {
+            "kind": "clarify",
+            "surface": "どちらの池",
+            "reason": reason,
+            "options": [
+                {"label": "鶴間池", "value": "鶴間池"},
+                {"label": "元滝伏流水", "value": "元滝伏流水"},
+            ],
+        }
+
+    # 知識検索 SA の内部ループが 1 回目に ask_user を選んだと仮定する
+    # (同じ `ask_callback` を直接呼ぶ)。
+    first_observation = await ask_callback(**_clarify_kwargs("候補が複数あります"))
+    assert "未回答" in first_observation
+    assert state.ask_timed_out is True
+
+    # 内部ループが同一 search_knowledge 呼び出し内で 2 回目の ask_user を
+    # 選んでも、バックストップで弾かれ HITL 待ち受けは発生しない
+    # (`tools.ask_queue` は既に空なので、弾かれなければ FakeTools.ask_user
+    # の AssertionError で検出される)。
+    second_observation = await ask_callback(**_clarify_kwargs("念のためもう一度"))
+    assert "タイムアウト済み" in second_observation
+    assert [call[0] for call in tools.calls].count("ask_user") == 1
+
+
+async def test_r4_budget_shared_between_main_and_recommend_subagent() -> None:
+    """R4 会計はメイン・SA 合算(2026-08-06、ADR-0024 の回帰確認)。
+
+    メインが 5 問使った後の `recommend` では、レコメンド SA は残り 1 問
+    だけ聞ける(6 問目で R4 に到達し、SA の 2 周目は done のみに縮小する)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    main_slots = ["onboarding", "dates", "origin", "pace", "interests"]
+    tools.ask_queue = [
+        _ask_result(answer=f"回答{index}") for index in range(1, len(main_slots) + 2)
+    ]
+    tools.recommend_queue = [_recommend_result()]
+
+    responses: list[str] = []
+    for index, slot in enumerate(main_slots, start=1):
+        responses.append(
+            _turn_json(
+                "ask_user",
+                _ask_user_action(kind="preference", slot=slot, reason=f"質問{index}"),
+            )
+        )
+        responses.append(_update_profile_json())
+    responses.append(_turn_json("recommend", {"instruction": "おすすめを教えて"}))
+    # SA 内 1 問目(party。main は使っていないので A1 に触れない)は許可され
+    # 成功する。回答後の update_profile 再実行を挟み、2 周目は
+    # ask_user_count が R4(=6)に達しているため done のみのスキーマになる。
+    responses.append(
+        json.dumps(
+            {
+                "thought": "同行者が不明なので聞く",
+                "action": {
+                    "tool": "ask_user",
+                    "args": {
+                        "slot": "party",
+                        "reason": "どなたと行かれますか",
+                        "options": [
+                            {"label": "家族", "value": "family_kids"},
+                            {"label": "一人", "value": "solo"},
+                        ],
+                    },
+                },
+            },
+            ensure_ascii=False,
+        )
+    )
+    responses.append(_update_profile_json())
+    responses.append(_recommend_act_json(filter={"tags": ["温泉"]}))
+    responses.append(_turn_json("done", {}))
+    client = ScriptedMainAgentClient(responses)
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert state.ask_user_count == len(main_slots) + 1  # 6 = R4 の上限
+    recommend_call = next(call for call in tools.calls if call[0] == "recommend")
+    assert recommend_call[1]["args"].filter == {"tags": ["温泉"]}
+    ask_calls = [call for call in tools.calls if call[0] == "ask_user"]
+    assert len(ask_calls) == len(main_slots) + 1  # 5(メイン) + 1(SA)
+    # main_agent_turns: メインの 5 質問 + recommend + done = 7 周
+    # (SA 内部の周・update_profile の再実行は含まない)。
+    assert state.main_agent_turns == len(main_slots) + 2
+    # ask_user は R1 の手数から除外される(2026-08-06 改訂)ので、
+    # 実行手数は recommend の 1 回だけ。
+    assert state.executed_tool_count == 1

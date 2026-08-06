@@ -1,0 +1,695 @@
+# 残タスク(次のセッションの起点)
+
+- 最終更新: **2026-08-05**
+- 用途: **会話セッションをまたぐときの引き継ぎ。**新しいセッションはこの文書から読み始める
+
+> # ✅ 現在地(2026-08-05)— **フロントエンド表示層をデザインシステム「Chokai Signal」で作り直した(実装・レビュー・受け入れ完了。未コミット)**
+>
+> **体制**: 仕様設計・受け入れ = Fable 5 / 実装 = Sonnet 5 / 実装レビュー = Opus 5(Codex リミット中の代行)。
+>
+> - **発端**: ユーザー指示「今のフロントの UI デザインはかなりダサいので、カッコよく作り直してください。チャット画面は [TakaJun02/sarutahiko](https://github.com/TakaJun02/sarutahiko) を参考に。旅程計画のウィンドウも見にくく使いにくいので作り直して」
+> - **ADR-0017 との衝突を先に解消**: 同 ADR の影響節「新しいデザインシステムを導入しない」の**1 行だけ**を [ADR-0023](adr/0023-frontend-design-system.md) で撤回(NavView 分割見送り・SW 作り直し見送り・リファクタ禁止は維持)。[23_ux_issues.md §9-2](23_ux_issues.md) が予告していた手順どおり
+> - **設計**: [frontend_design_system.md](30_design/frontend_design_system.md)(決定稿)+ [frontend_design_system.mockup.html](30_design/frontend_design_system.mockup.html)(実トークンで組んだ完成目標)。参考実装の構造・余白・タイポグラフィ・モーションを踏襲し、**配色だけ鳥海山に差し替え**(シグナル = 丸池様の碧 `#2fc9b0` / オーロラ = 藍→碧→白銀)。**ユーザー判断: 窓はフローティングのまま / NavView は見た目だけ / アプリアイコンは CPSlab ロゴを維持**(§2.1 で「色を敷かない置き方」を規定)
+> - **範囲**: 表示層のみ。`stores/` `lib/`(新規 `profileLabels.js` を除く)`public/sw.js` `router/` `PlanView` `PlanForm` `NavMap` は**一切変更なし**(受け入れ時に `git status` で実測)
+> - **レビューの主要指摘と対処**: **High 1 —— `token/alpha` の Tailwind ユーティリティが 1 つも生成されていなかった**(色を生の `var()` で写しており `<alpha-value>` が無い。18 箇所が無言で無効化され、**ログイン副題が白地に白文字 = コントラスト 1.0:1**)。**原因は設計文書 §3.4 の欠陥**だったので、先に文書(§3.0 新設・§3.4 書き換え)を直してから実装を戻した。Medium 4(空状態ピルが横持ちでコンポーザに埋没 = §4-6 の再発 / モバイルのピンが 3px に潰れる / ドロワーの `inert` が論理的に常に false / 44px 未達が申告 3 件に対し実際 9 種類)。Low 12。全件対処済み
+> - **受け入れ条件は 15 → 18 項目に増やした**(§13)。追加分は条件 16(空状態ピルの到達性)・17(`token/alpha` がビルド出力に実在)・18(ログインシートのコントラスト)—— **同じ失敗が無言で再発しないようにするため**
+> - **受け入れ検証(Fable が実機実測)**: `token/alpha` **0 → 12 種類**生成 / ログイン副題 `rgba(18,23,26,0.6)` で可読 / 844×390 でピル 3 枚とも `elementFromPoint` が自身を返す + スクロール可 / トグルが通常 `click` で開閉 / 44px 未満は Leaflet のピン 2 件のみ(`NavMap` 不可侵・UI 操作子ではない)/ `npm test` 49 passed / `vite build` 成功
+> - **積み残し(小粒)**: (a) `/plan`(legacy)で地図窓が自動で開かない —— **本作業の退行ではない**(`PlanView.vue:120-122` に `// 削除: isNavWindowVisible.value = true` が残っており以前から開かない。ADR-0017 が「未使用の残骸」と分類したルート)(b) 旅程ストリップの「現在地に最も近い/到達済み」チップ強調は**信頼できるデータ源が無く見送り**(§8.3 で対象外と明記済み。`rtStore`/旅程の進行状態から設計し直す)(c) 混雑バッジ・退場アニメーション・ストリーミング中のフォーカス時オーロラ枠はコード確認のみで実機再現していない(d) ログイン画面の言語選択がリロードで失われる(`stores/user.js` に persist が無い。store は不可侵のため未対処)(e) ヒーロー副題が写真の上で `--color-text-muted`。写真次第でコントラストが揺れる
+> - **候補カード・旅程行を押せるようにする(旧 [23 §5-1 / §5-2](23_ux_issues.md))は本作業のスコープ外。**機能追加であり表示層の作り直しではない。1 手 40〜90 秒の系では手入力の往復を減らす価値が大きいので、**次に取り組む価値が高い残タスク**
+>
+> ### 追記: ログイン画面はユーザー指示で旧構成に差し戻した(2026-08-05)
+>
+> 当初は参考実装に倣って「写真の hero + 下から立ち上がる**明るいシート**」に作り替えたが、**ユーザーの指示で旧実装の構成に戻した。**
+>
+> > ログイン画面は以前のものに戻してください。以前のログイン画面をベースに、ブラッシュアップしてください。**ログイン画面は参考にせずに**、以前のものをブラッシュアップする。
+>
+> - **戻した構成**: `chokai.jpg` の全面背景 + 上部に 2 行タイトル + **中央に浮くグラス調のダークパネル**([frontend_design_system.md §10](30_design/frontend_design_system.md) を全面改訂)。**ログイン画面だけは参考実装を参照しない**方針を文書に明記
+> - **磨いた点**: slate/blue 系 → Chokai Signal のトークン(focus = 碧、送信 = 反転面)/ タイトルを `Chokai Guide` + 「鳥海山エリア観光ガイド」に統一 / **§4-8(タイトルとパネルの重なり)を組み方から解消** / 44px
+> - **戻さなかった点(退行になるため)**: 文言の英語化(§6-2 として解消済み)・登録/ログインの 2 モード(§6-4 として解消済み。`POST /login` はユーザー名のみで未登録なら作成する)。**文書 §10.2 に判断と理由を明記済み** —— 文言や 2 モードも旧に戻す意図なら、その 2 行を差し戻せばよい
+> - **受け入れ時に見つけて直した問題**: 旧実装の暗幕 `from-black/90 via-black/60 to-transparent` をそのまま使うと**画面が高いほど暗幕が早く尽き、1440×900 でパネルが写真の最も彩度の高い領域に浮く**(780×493 では出ない = **広い画面でだけ壊れる**)。§10.2.1 を追記し、**暗幕を透明で終わらせず下端に floor を残す / 色を `--color-canvas` 基準に / パネルの不透明度を上げる**を規定。実測でプレースホルダのコントラストが 4.6:1(余裕なし)→ **5.15:1**(トークン設計値 5.2:1 相当)に回復
+> - **副次的効果**: 明るいシートが無くなり、**P1「1 画面 1 テーマ」の例外がゼロ**になった(§13 条件 1 の但し書きも削除)
+> - **受け入れ検証(Fable が実機実測)**: 正常系ログイン通し(`ux-accept-0804` → `/app/chat`)/ 780×493 でタイトル底 144・パネル上端 192 で交差なし + スクロール可 / 明るい面は送信ボタン(意図的な反転面)のみ / `npm test` 49 passed
+> - **未確認(申告どおり)**: Chromium 以外のレンダラ、`prefers-reduced-motion` 有効時のログイン画面の見た目、キーボードのみの操作性
+>
+> ### 追記: フォーカス表示の是正(2026-08-05・ユーザー報告)
+>
+> > 入力フォームで入力している時に出現する四角枠が、元からある枠からはみ出る形で表示されてかなりカッコ悪いです。
+>
+> **原因は 2 件とも「枠を出す相手を間違えていた」こと。**設計文書に **§11.1 フォーカス表示の規則(F1〜F4)** を新設して一般化した。判定は 1 つの問いに落ちる —— **「いま出ている枠は、どの要素の輪郭をなぞっているか」。**
+>
+> | # | 箇所 | 何が起きていたか | 直し方 |
+> | --- | --- | --- | --- |
+> | 1 | **チャット入力欄** | アウトラインが `textarea`(**角丸 0**)に付いており、**25.6px 角丸のシェルの中で矩形が描かれ、角がピルを突き破っていた**。**設計文書 §7.3 の書き方が曖昧だったのが原因**(`textarea:focus-visible outline 1px` としか書いておらず、参考実装は器に付けていた) | 枠を `.composer-shell:has(textarea:focus-visible)` へ移し、`textarea` は `outline: none`(**中 → 器**) |
+> | 2 | **旅程カードの「仮の前提あり」チップ** | **受け入れ条件 13(44px・例外ゼロ)を満たす作業が新たに作った不具合。**当たり判定を広げるため `<summary>`(角丸 0・44px)で小さいピルを包んだ結果、**小さなピルの周りに 44px の四角い枠**が出た | 枠を中の `rounded-full` の `<span>` へ移した(**器 → 中**)。これを **F4** として一般化 |
+>
+> - **`ask_user` の自由入力欄**も `outline-none` が無く、枠の変化とグローバルの外周線が**二重**になっていた → ログイン画面と同じ F3 に統一
+> - **44px 化した 9 か所を全数見直し済み。**F4 該当は上記 1 件のみ。他は「自前の枠 = 当たり判定」で問題なし(うち `NavView` の `.menu-detail__btn` / `.tour-mode-bar__exit` の 2 件は**静的確認のみ・実機未確認** —— 実バックエンド状態が要るため)
+> - **見送り(判断済み)**: Leaflet の `.map-container` と現在地マーカーは構造的には一致するが、`.nav-window` の `overflow: hidden` にクリップされて**見えない**。`NavMap.vue` は不可侵でもある
+> - 受け入れ条件に **22(枠が器からはみ出さない)/ 23(枠が二重にならない)** を追加
+>
+> ### 追記: 旅程カードとガイダンスマップのブラッシュアップ(2026-08-06・ユーザー指示)
+>
+> > 1. 旅程計画カードのデザインがかなり AI らしさが出ていて(テンプレ感が出ている)
+> > 2. 黒ベースにしたことで、ガイダンスマップで必要な情報が見にくくて使いにくい。**以前の色を参考にしながら**ブラッシュアップして
+>
+> **1. 旅程カード(§7.6 全面改訂)** —— 「テンプレ感」の原因を 7 つに分解した(§7.6.1)。最も効いていたのは **見出しが「旅程 v1」**(版番号はシステムの帳簿で旅の言葉ではない)、**ISO 日付**、**`10:31` という分刻み**(計画に分の精度は無い)、そして **移動が表現されていないので順路でなく表の行に見える**こと。
+> - 見出しを `8月5日(水)` に / 版番号はフッタ右へ降格 / 仮の前提を `<details>` から出して平文で常時表示 / 時刻を 5 分丸め(**元データは不変**)/ **行間に移動時間**(`次の到着 −(今の到着 + 滞在)`。**サーバー契約は不変**)/ 日付見出しの右に `n か所 · 開始 → 終了`
+> - **実装担当が日跨ぎ**(`arrive_min` > 1440)**に気づいてレンジ見出しに対応**した(data_model.md §7.2)
+>
+> **2. ガイダンスマップ(§8.3.1 新設)** —— 原因は「**タイルは明るい図版なのに、地図に接する面をアプリの黒のままにした**」こと。旧実装を読み直すと**情報を読ませる面は白**だった(Spots List `#ffffff`/`#0f172a`、番号バッジ `#3b82f6`)。**旧実装の失敗は色ではなく配置**(4 枚が地図を覆っていた = §4-3)で、配置は既に直したので**色のほうを引き継いだ。**
+> - P1 を「1 画面 1 テーマ、**ただし地図は別**」に改訂(例外ではなく性質。根拠は外部制約)
+> - **`--color-signal-deep`(#12756a)を新設**。`#2fc9b0` は paper 上で **1.9:1** しか出ずバッジにも文字にも使えない。**同じ 1 色の明暗なので差し色は増えていない**
+> - ストリップを `--color-paper` 地に / 番号バッジを `signal-deep` に / **地図のピンを番号入り `divIcon`** にしてストリップと目で結んだ / 経路線を `opacity 0.7 → 0.95`・車 `#2f4fd8`・徒歩 `signal-deep` 破線 / 1 段化 / ⋯ に状態ドット
+> - **[§12.1] `NavMap.vue` を限定解除**(経路線の定数と POI アイコンの 2 点のみ。**レイヤのライフサイクルは不変**)。ADR-0017 が守った理由は「Leaflet 連携が動いているから」であり、色定数とアイコンの差し替えはその構造に触れない
+> - **白い縁取り(casing)は不採用**(レイヤが増えるため)。可読性が足りなければ改めて設計する
+>
+> **受け入れ検証(Fable が実機実測)**: チップ文字 18.05:1 / 番号バッジ 4.93:1 / 経路線 `opacity` 0.95 / ピンとバッジの色・数字が一致 / カード本文に `\d{4}-\d{2}-\d{2}` と `旅程 v\d` が**いずれも 0 件** / `npm test` **58 passed**
+>
+> **是正した判断ミス 1 件**: 実装担当が仮の前提の ISO 日付を「サーバー契約上の完成文だからフロントは手を出せない」と判断したが、**本システムの方針は逆**。`spot_id` は発生源を直したうえで**表示層でも `maskSpotIds` で防いでいる**(`af6eb0b`)—— 理由は「旧形式で永続化済みの文が undo や `GET /thread` で再浮上するから」で、**ISO 日付も同じ**。`lib/dateDisplay.js` に純関数を置いて整形した(不正な日付は素通し。テスト 9 件)。§7.7.1 に明文化
+>
+> ### 追記: 旅程カードの読みやすさブラッシュアップ第 2 弾(2026-08-06・ユーザー指示)
+>
+> > デザイン自体はカッコよくなってきているのですが、まだ見にくいです。現在の最先端の、宿・ホテル予約サイトや旅行計画アプリなどの UI デザインを参考に、かっこよさを残しつつも、見やすさ・使いやすさの観点でブラッシュアップしてほしいです。
+>
+> **体制**: 仕様設計・受け入れ = Fable 5 / 実装 = Sonnet 5 / 実装レビュー = **Opus 5(Codex が利用上限。8/9 まで)**。
+>
+> - **設計([frontend_design_system.md §7.6.4〜7.6.5](30_design/frontend_design_system.md))**: 現行を 736px 実寸で再現して読みにくさを 6 つ名指し(h〜m。右端に孤立した裸の「40分」/ 見えない縦線 / 最も暗い時刻 / 詰まった行間 / 浮いた黄色の前提 1 行 / 弱い日区切り)。**宿泊予約サイト・旅程アプリの共通様式**(番号ピン + タイムライン=Wanderlog・Google マップ / タイトル主導 2 行構成=Airbnb・Booking.com / 注意書きは帯)を採用し、直し 8〜16 として規定
+> - **実装**: 番号ピン(22px・日の先頭のみ碧塗り)/ 滞在は名前直下に「滞在 40分」/ 時刻 muted 13px / 60 分以上は `n時間m分` / warn の帯(前提ごとに改行)/ `DAY {n}` キッカー + 日区切り罫 / カード `p-5`。`lib/dateDisplay.js` に `formatDurationJa` 追加(テスト 8 件)
+> - **レビュー(Opus 5)の主要指摘と対処**: ①フッタのラベルと内容が whitespace condense で密着(`mr-1` で是正)②**時刻だけ 5 分丸めで滞在・移動が生値のため、行を縦に足すと表示時刻と合わない** → 設計判断として「**移動は丸めた時刻から導く**」を採用(§7.6.4 の 16。受け入れ 27(g) に「縦の足し算が合う」を追加)③縦線 `left:68.5px` が **DPR=1 で 2 ピクセルに滲み実効 8.5%**(= 直したはずの「見えない線」が再発)→ 68px 整数化 ④「調整中」バッジ・前提帯が日ループ内に入り days 空で消える退行 → 空状態の形を §7.6.5 に新設して是正 ⑤受け入れ条件 15 の文面が §7.7.1 の `lib/` 新規追加指示と矛盾 → 条件 15 を訂正
+> - **受け入れ検証(Fable が実機実測)**: `npm test` 66/66 / 復元経路(`GET /thread`)で新カード描画(単一停留 = 線なし・塗りピン・帯)/ **10 停留の実機カードで全区間の縦の足し算が一致**(例: 9:35 + 滞在30分 + 移動15分 = 10:20)/ 縦線が **1 デバイスピクセルに 17% フル濃度**で乗ることをピクセル実測(68px 整数化の狙いどおり)/ 移動 0 分の区間に移動行が出ないことを実機確認
+> - **実機確認の環境メモ**: 検証ブラウザ(Playwright MCP)は **URL 末尾が `/login` の要求を合成 400(`{"detail":"bad request"}`)で遮る**(25_known_issues §5 の正体。アプリの不具合ではない)。回避は curl でトークン取得 → `sessionStorage` の `user` に注入 → `/app/chat` へ直接遷移
+>
+> ### 次にやる価値が高い残タスク(このセッションで積んだもの)
+>
+> | # | 内容 |
+> | --- | --- |
+> | 1 | **候補カード・旅程行を押せるようにする**(旧 [23 §5-1 / §5-2](23_ux_issues.md))。1 手 40〜90 秒の系では手入力の往復を減らす価値が大きい |
+> | 2 | **`assumptions` の ISO 日付を発生源(バックエンド)で直す。**表示層の防御(§7.7.1)は永続化済みの文のために残す |
+> | 3 | **旅程ストリップの「現在地に最も近い / 到達済み」チップ強調**(§8.3 で対象外にした分)。`rtStore` / 旅程の進行状態から設計し直す |
+> | 4 | **経路線の白い縁取り(casing)**(§12.1 で不採用にした分)。可読性が足りないと分かった場合 |
+> | 5 | `NavView` の `.menu-detail__btn` / `.tour-mode-bar__exit` の 44px を**実機で**確認(実バックエンド状態が要るため静的確認のみ) |
+> | 6 | **地図窓の実機での退行確認**(検証ブラウザのログイン 400 で一度取り逃した分。`Docs/25_known_issues.md §5`。**正体は判明済み**: Playwright MCP が `/login` 末尾 URL を遮る。回避手順は上の環境メモ) |
+| 7 | **旅程カードの `<ol>` セマンティクス**(2026-08-06 レビュー指摘の見送り分): 移動行の `<li>` が混ざり支援技術に伝わる項目数が訪問数と食い違う + `list-style:none` で VoiceOver がリスト性を落とす。移動行を停留 `<li>` 内へ移す案は §7.6.5 の形に影響するため、形の再設計とセットで |
+>
+> ---
+
+> # ✅ 現在地(2026-08-04 深夜・ADR-0022 + 1-6)— **「1 スポット指名で複数スポットのプランが返る」を設計変更で解消(`51deed5`)。実機確認中に検出した [25 §1-6](25_known_issues.md)(ask_user クラッシュ連鎖)も実装・レビュー・実機確認まで完了**
+>
+> **体制**: 仕様設計・受け入れ = Fable 5 / 実装 = Sonnet 5 / 実装レビュー = Opus 5(Codex リミット中の代行)。
+>
+> - **発端**: ユーザー実機テストで「〇〇に行きたいです」(1 スポット指名)に複数スポット入りのプランが返った。**他ユーザーのデータ混入疑いは調査で否定**(全クエリ user_id スコープ済み・共有 wishlist テーブル自体が不存在)。原因は `plan_itinerary` の挿入プール無制限(カタログ 43 件からの自動充填)= 仕様どおりの挙動だった
+> - **決定([ADR-0022](adr/0022-plan-turn-explicit-candidate-pool.md))**: `plan_itinerary` に `candidate_spots`(任意候補・既定空)を追加し、挿入プールを `must_visit ∪ candidate_spots` に限定。両方空(実効プール空)は `precondition_unmet`。「おすすめで組んで」はメインが `recommend` → 候補名転記で表現(ツールは柔軟・駆動はメインエージェントの判断)
+> - **レビュー指摘と対処(ADR-0022 追記)**: High 2 件 — ①解 C が must_visit を落として空旅程になり空 v1 が確定保存されうる → `_relaxed_solution` の除去対象に required を追加 + 任意候補ゼロは単一解・選択 LLM 省略 ②起終点にしか解決しないと空判定をすり抜け → 実効プール(起終点除外後)で判定。Medium: 全滅時メッセージへ dropped/ambiguous 付記・弱アサーション強化・退化テスト追従。全て修正済み
+> - **テスト**: バックエンド 373 passed(skip 12 は DB 統合の既知ベースライン)/ ruff 新規違反ゼロ
+> - **実機確認(2026-08-04 深夜、新規ユーザー)**: 「道の駅象潟を起点に元滝伏流水に行きたい」→ HITL「他に立ち寄りたい場所は?」→「特になし」→ **旅程は元滝伏流水 1 件のみ**(v1・DB 照合済み)。エージェントは候補ゼロ差し戻しから自律回復
+> - **[25 §1-6](25_known_issues.md) も解消**: `ask_user` の引数不正 → 契約外 stage → 防御ログの LogRecord 予約キー KeyError、という 3 欠陥連鎖の修正。guided スキーマの kind 排他(anyOf 分岐・実機 A/B で xgrammar 適合確認)/ ValidationError の recoverable 差し戻しを `_dispatch` へ一般化 / `resolve_error_stage` ヘルパ / `error_message` 改名。**実機: 同一シナリオでクラッシュせず HITL 質問 → done 到達・応答保存**。テスト 382 passed
+> - **積み残し(小粒)**: (a) pending の `require` が有効なターンで must_visit 空の plan がガードに弾かれる false positive(1 手の浪費。メインは有効制約を見て回復可能 — ADR-0022 追記 5)(b) `insertion_pool` の実在しない spot_id は黙って無視(`required_spot_ids` の ValueError と非対称。resolve_names 経由なら実害なし)(c) `candidate_spots` 最大 12 件が軌跡テキストで毎周ダンプされ R2 予算を数百トークン圧迫(実害が出る規模ではない)(d) **起点が解決できないときのエージェントの試行錯誤が長い**(実測: HITL 回答で正しい起点名を渡しても `plan_itinerary` を 8 回再試行して R1 停止・85 秒。ターンは安全に着地するが UX 改善余地 — `ask_user` の options に解決可能な施設名を入れる誘導、観測文での候補提示などを検討)(e) `ask_user` の options 配列直前でも xgrammar 空白無限出力の再現条件あり(25 §2-1 追記済み。実運用プロンプトでは未発生・監視のみ)
+>
+> ---
+>
+> # ✅ 旧・現在地(2026-08-04・既知問題解消ラウンド)— **[25_known_issues.md](25_known_issues.md) §1 の実害 4 件を解消(実装・レビュー・実機確認済み)**
+>
+> **体制**: 仕様設計・受け入れ = Fable 5 / 実装 = Sonnet 5 / **実装レビュー = Opus 5(Codex がリミットのため代行。ユーザー指示 2026-08-04)**。
+>
+> - **解消した 4 件**(詳細と正の文書は [25_known_issues.md §1](25_known_issues.md)): ① routes 404 競合(**ADR-0020**: route を専用短寿命 session で即時 commit。SSE 契約化)② 編集の勝手な入れ替え(**ADR-0021**: 集合固定 + `allow_refill`)③ 「確定」バッジ(廃止 + `assumptions` の「仮の前提あり」チップ)④ 既定起点の暗黙採用(廃止。起点未指定は ask_user で質問)
+> - **§4-1 認証も決着**: プロトタイプ段階として保護なしを許容([10_requirements.md FR-5.2](10_requirements.md) に明記)
+> - **レビューの主要指摘と対処**: Critical 1(集合固定が順序まで固定 → `removal_protected_spot_ids` 新設で是正)/ High 3(接続プール枯渇 → OSRM を session 外 + Semaphore 4、プロンプトの起点矛盾 → 統一、data_model 追従)。全て修正・再テスト済み
+> - **テスト**: バックエンド(app コンテナ内)374 passed / フロント 34 passed / vite build 成功 / ruff 新規違反ゼロ
+> - **実機確認**(新規ユーザー通し): 経路 GET 全件一発 200・コンソールエラー 0 / 起点の HITL 質問 / 「仮の前提あり」チップ / 編集 diff が削除 1 件のみ
+> - **積み残し(小粒・次イテレーション)**: (a) 実行可能化フォールバック削除の Concession 化(ADR-0021 の明記済み例外)(b) 旅程が無い段階の推薦へ起点を渡す口(`recommend` の引数追加の要否)(c) `state:itinerary` の `assumptions` を SSE 層で検証するテストは tool_adapters 層まで(d) §2-1 の xgrammar 監視・§3 の UI 残存分は従来どおり 25 が正
+>
+> ---
+>
+> # ✅ 旧・現在地(2026-08-04 深夜)— **ReAct 構成への作り替えが実装・レビュー・実機確認まで完了**
+>
+> **体制(2026-08-04 改訂)**: 仕様設計 = Fable 5 / 実装 = Sonnet 5 / 実装レビュー = Codex(CLAUDE.md)。この体制で 5 段実装 → Codex レビュー(Critical 2・High 15・Medium 8・テスト穴 7 を全件修正)→ compose 立ち上げ直し → Fable がブラウザ通し確認、まで完了した。
+>
+> - **コミット**: `0fc5fe7`(段1: 履歴要約+update_profile)→ `bdd4d18`(段2: ReAct ループ)→ `350d78b`(段3: レコメンド SA)→ `571cbd7`(段4: 旅程 SA)→ `790bd31`(段5: ask_user HITL)→ `a14d7b1`/`6e522dc`(レビュー修正)→ `d66d1e6`(実機確認修正)
+> - **テスト**: バックエンド 339 passed / DB 統合込み +10 / フロント 26 passed。migration 0004 適用済み
+> - **実機確認済みシナリオ**: HITL(質問→チップ回答→**同一ターン継続**→候補5件)/ 旅程作成(仮定の明示)/ 編集+diff / 自然言語 undo(時刻完全復元)/ QA(ナレッジ根拠)/ 編集系発話のプロフィール更新
+> - **実機で発見し修正した問題**: ① xgrammar の guided decoding が「配列要素内の number」直後に空白無限ループ(実機再現済み)→ update_profile は guided 失敗時に非 guided フォールバック ② respond クローズドワールド検査が起点施設名を誤検知 → 軌跡テキストの名前を許可語彙に
+> - **残る既知問題・監視項目は [25_known_issues.md](25_known_issues.md) が正**(2026-08-04 新設。routes 404 競合 / ILS の編集時入れ替え / xgrammar の number-in-array 監視 / UI 残存分 / 認証の仕様判断、を集約)
+> - **文書の後追いは完了(2026-08-04)**: [24_architecture_as_built.md](24_architecture_as_built.md) を ReAct 構成で再執筆(照合済み・食い違い 5 件は同書 §7)。agent_react_architecture.md §2 に guided フォールバックの実装補足を追記。[23_ux_issues.md](23_ux_issues.md) は凍結し 25 へ引き継ぎ
+>
+> ---
+>
+> # 🔄 旧・現在地(2026-08-04 昼)— **計画フェーズのエージェントを ReAct 構成へ完全作り替え(設計決定済み・実装未着手)**
+>
+> **ユーザー指示(2026-08-03/04)により、一括プラン方式を廃止し、ReAct メインエージェント + サブエージェント構成に「完全に作り替える」ことが決まった(修正ではない)。**
+>
+> - **設計の正: [30_design/agent_react_architecture.md](30_design/agent_react_architecture.md)(決定稿。論点 9 件は 2026-08-04 に全決着)**
+> - **[ADR-0019](adr/0019-react-main-agent-subagents.md) 承認**(ADR-0008・0009・**0018** を supersede)
+> - **`ask_user` は Human-in-the-Loop の通常ツール**(2026-08-04 ユーザー訂正)。**ターンを中断しない** — UI 経由で質問し、回答(`POST /api/v1/chat/answer`)を**同一ターン内で**呼び出し元エージェントの act に持ち帰る。旧案の `pending_turn`・scope 復帰・SA 再実行は廃止
+> - **[agent_planning_phase.md](30_design/agent_planning_phase.md) / [understand_node.md](30_design/understand_node.md) は廃止(凍結)。**実装の参照先にしない
+> - **契約文書の改訂も完了(2026-08-04)**: [chat_sse.md](40_api/chat_sse.md)(`state:step` 新設・`plan` 廃止・`searching` 統合・**`POST /chat/answer` 新設**)/ [data_model.md](30_design/data_model.md)(`history_summary`・`summarized_until_message_id` 追加、`pending_ask` は表示中の質問の復元用に再定義 = migration 0004、§6 を LLM 要約方式に)/ [narration_qa.md](30_design/narration_qa.md)(内側 Tool に `ask_user`)/ [20_architecture.md](20_architecture.md) §4 / [frontend_nav.md](30_design/frontend_nav.md) §2.2〜2.3
+> - **次の作業**: [agent_react_architecture.md §16](30_design/agent_react_architecture.md) の **5 段で Codex へ実装委譲**(`gpt-5.6-sol` / Effort max。各段の指示書を作ってから)
+> - 現行実装(下記 2026-08-02 の成果)は**旧方式のまま動いている**。[23_ux_issues.md](23_ux_issues.md) の §1-2〜1-5(地図消失の競合)等の個別修正は、エージェント外の問題を除き**作り替え後に再評価**する
+
+> # ✅ 現在地(2026-08-02)— **Phase 1〜4 の実装が完了し、ブラウザから通しで動く**
+>
+> **§C-1 / §D-1 / §E-1 の全項目を実装し、`docker compose` を立ち上げ直してブラウザから通し確認した。**
+> ブランチ **`feat/rebuild-implementation`**(develop から分岐、16 コミット)。**まだ develop にマージしていない。**
+>
+> | Phase | 実装 | 検証 |
+> | --- | --- | --- |
+> | 1 | 骨格 / DB / 知識索引 / 認証 / ソルバー / 推薦 / 知識検索 / 対話 / SSE / フロント接続 | 実 LLM で推薦・旅程・編集・undo が動く |
+> | 2 | geo / voice / パック用原稿 / パック生成ジョブ / API / 進捗 UI | **41 アセットのパックが `ready`(failed 0)** |
+> | 3 | realtime(codec / スケジューラ / シミュレータ / MQTT) | codec 往復・フェアユース上限・値の NULL 保持 |
+> | 4 | 観光フェーズ / LoRa decode / 実害バグ / 旧構成の削除 | compose が **5 コンテナ**、約 31 GiB 解放 |
+>
+> **テスト: バックエンド 194 件 + フロント 10 件が通過。**
+>
+> **実装中に設計文書を改訂した箇所**(いずれも実データ・実測に基づく):
+> - **[geo.md §2.3.1](30_design/geo.md)** — 接近の候補に「車道スナップ点」を追加。`access_points` 33 件が 43 地点をカバーせず、**赤田の大仏の徒歩が 394 分**になっていた。`travel_times.car` の平均が **136.8 → 71.6 分**に是正
+> - **[geo.md §1.2](30_design/geo.md)** — 1 レッグのセグメントを 1〜2 → **1〜3**(`foot → car → foot` を認める)
+> - **[data_model.md §4.7](30_design/data_model.md)** — `app.realtime_simulator_state` を新設
+> - **[README.md](README.md)** — 文書中の `spot_id` の例が実データと一致しない旨を注記
+> - **[frontend_nav.md §3](30_design/frontend_nav.md)** — foot バッファの記述を 50 m に訂正
+>
+> **この環境固有の適合**(設計の変更ではない):
+> - **`app` と `frontend` を `network_mode: host` にした。**ホストの vLLM が `127.0.0.1:8000` にしか bind しておらず、docker bridge → ホストの通信もこのマシンでは落ちるため。**app のポートは 8080 が別プロセスに占有されているので 8090**
+> - **vLLM の xgrammar は JSON Schema の `uniqueItems` を実装していない**(400 になる)。guided decoding で使わないこと
+>
+> **残っている調整項目は §H。**
+
+> # 🚀 現在地(2026-08-01)— **設計は完了。実装に入れる**
+>
+> **Phase 1〜4 の設計文書がすべて決定稿になった。**ADR は **0001〜0017**。**未決の設計論点はゼロ。**
+> **「Docs/ で全部定義してから実装」(2026-07-31 のユーザー方針)の条件を満たした。**
+>
+> | Phase | 設計文書 | 状態 |
+> | --- | --- | --- |
+> | 1 | `agent_planning_phase` / `recommendation_planning` / `data_model` / `chat_sse` / `narration_qa` / `understand_node` | ✅ |
+> | 2 | `geo` / `packs_pipeline` / `50_operations/osrm` | ✅(§A1) |
+> | 3 | `realtime_lora` | ✅(§A2) |
+> | 4 | `offline_field_mode` / `frontend_nav` | ✅(§A2) |
+>
+> **⚠ 着手前に片付けることが 5 件ある(§C-0)。**うち **`enrichment.json` の目視補正はユーザーにしかできない**(§B)。他の 4 件は Codex に委譲できる。
+> **⚠ Phase 2 の一部は Phase 1 の前提である。**ILS ソルバーは `static.travel_times` を必要とするので、**OSRM の切り出しと `build-geo` / `build-travel-times` は Phase 1 の着手前**に済ませる(§C-0 項目 5)。
+>
+> **2026-08-01 の変更**: ① NFR-7(計測可能性)を削除(§A0-3) ② 会話履歴の構築方式を決定(§A0-3) ③ 知識検索をサブエージェント化(§A0-5) ④ **Phase 2 を全面設計**(§A1) ⑤ **Phase 3・4 を全面設計。フロントは差分改修に限ると決定**(§A2)
+
+---
+
+## A0. 決着済み — エージェント設計(2026-07-31)
+
+**17 論点をまとめて決着させた。**記録は [agent_planning_phase.md §23](30_design/agent_planning_phase.md)、改訂の理由と採らなかったものは同 **§24**。
+
+**設計を変えた主なもの**
+
+| 変更 | 理由 | 反映先 |
+| --- | --- | --- |
+| **`understand` のフィールド順を入れ替えた**(`references` → 抽出系 → `intent` → `plan`) | EMNLP 2024 の実測: **JSON のキー順が生成順を強制する。**改訂前は「2 番目のやつ」を解決する前に `plan` を書かせていた | §3.1 / §3.1.1 |
+| **`selection_hints` を追加** | 経路 3 の行き先がなく、無言破棄禁止の不変条件が数えられなかった | §3.1 |
+| **`constraints` を旅程行に永続化 + `constraints_remove` を追加** | ターン限りだと過去の要望が再ソルブで消える。永続化する以上、取り消せないと制約が張り付く | **§4.4** |
+| **`ToolError` 型を追加** | executor のスキップ / 中止の判断材料が「例外が飛んだか」だけでは粗かった | §18.2 |
+| **P4(`$N` 検証)を強化** | 現行方式は **LLMCompiler**(ICML 2024)型。型整合・戻り値の種類・循環検出が抜けていた | §1.3 |
+| **反復ループ対策を縮退表に追加** | vLLM issue #40080: **`gemma-4-31B` で構造化出力時に顕著** | §9 |
+| **プロンプトの並び順を規定** | prefix cache と "lost in the middle" に同時に効く | §7.1 |
+| **`plan_itinerary` の `days` 不足時は仮定して実行** | 質問だけを返さない(G4 と同じ理由) | §20.2 |
+| **`persist` は `respond` の成否に関わらず走る** | §1.4 と §9 が矛盾していた | §16.6 |
+| **制約をターン全体の値に移した** | 二重記述を避け、将来の分割を安くする | §18.1 |
+
+**採らなかったもの**(理由は §24.2): 検証失敗時の再計画 / 手の並列実行 / LLM 呼び出しの並列化 / 自由記述の思考欄 / 常時 self-consistency・LLM critic / span の先行導入。
+
+**[ADR-0009](adr/0009-no-subagents.md) を起こした** — サブエージェントを持たない。逐次計画タスクで単一エージェント比 **−70.0%**、MAST の失敗率 **41〜86.7%** という実証が根拠。**覆す条件も ADR に明記した。**
+
+### A0-2. `understand` に聞き返しを持たせた(ユーザー提案、[ADR-0010](adr/0010-understand-bounded-agent.md))
+
+**`understand` を `ask_user` と `done` の 2 Tool だけを持つ有界エージェントにした。**発話が理解できないとき、**plan を出す代わりに聞き返す**。
+
+- **なぜ Tool ではなくノードの分岐か**: 参照が解けていないのに plan を書かせるのは矛盾している。**理解できていないなら、そう言うのが先**([agent_planning_phase.md §3.4.1](30_design/agent_planning_phase.md))
+- **ADR-0008(ReAct を採らない)と矛盾しない**: LLM 呼び出しは増えず(2〜3 回のまま)、ターン内にループがなく、判断は 2 択 1 回。グラフに増えるのは片道の辺 1 本(E6)
+- **ガードレール G6〜G9 を追加**: 選択肢を 2〜4 個具体的に出せないなら聞かない / 同じ曖昧さを 2 回聞かない / 連続は 1 ターンまで / plan を出せるなら聞かない
+- **スレッド状態が 3 つ増えた**: `pending_clarification` / `resolved_ambiguities` / `clarify_streak` → **`data_model.md` に反映が要る**
+- **最大のリスクは「聞きすぎ」。**G6〜G9 と、**§7 の会話履歴(第一防衛線)**で抑える。計測はしない(A0-3)
+
+### A0-3. NFR-7(計測可能性)を削除し、会話履歴の構築方式を決めた(2026-08-01)
+
+**NFR-7 を要求から削除した。**計測データを DB に貯めて取り出す機能は作らない。廃止したもの: `turn_metrics` / `unmodeled_log` テーブル、`export-metrics` CLI、SSE `done` の `metrics`、[recommendation_planning.md §7](30_design/recommendation_planning.md) の「層 0 システム計測」。**残るのは構造化ログ(stdout)だけ**で、縮退の明示は NFR-5 が引き続き要求する。反映済み: `10_requirements.md` / `20_architecture.md` / `agent_planning_phase.md`(§10 を全面改訂)/ `recommendation_planning.md` / `understand_node.md` / ADR-0004・0006・0008・0009・0010。**NFR の番号は詰めていない**(NFR-8・NFR-9 への参照があるため)。
+
+**会話履歴を「近いほど詳しい 3 層」で構築すると決めた**([agent_planning_phase.md §7](30_design/agent_planning_phase.md))。直近 3 ターンは user も assistant も生テキスト、それ以前は user 発話は生 + assistant はイベント要約 1 行、予算(4,000 トークン)超過分は古い順に破棄。**要約 LLM は呼ばない**(イベント要約は `messages.meta` からコードが組み立てる)。
+
+- **`understand` にも assistant の生テキストを渡す**(当初案の非対称をやめた)。「そこ、混むって言ってたよね」のような**応答本文への指示語**は構造化状態では解けないため
+- **会話履歴と `last_candidates` は別物として両方持つ。**履歴は LLM が読む文脈、`last_candidates` は**コードが `spot_id` を検証する語彙**
+- 副次効果として **ADR-0010 の聞き返し発火率が下がる**(履歴が第一防衛線)
+
+### A0-4. `data_model.md` の設計判断を確定させた(2026-08-01)
+
+執筆前に議論して決めた 6 点。**これで `data_model.md` は執筆のみになった。**
+
+| # | 決定 |
+| --- | --- |
+| 1 | **`spots` と `facilities` を 1 テーブルに統合**し `kind` で区別。根拠: 両者のフィールドが完全一致し、`spot_id` 空間も共有していて衝突ゼロ(POI 30 + 施設 13 = 43) |
+| 2 | **タグ語彙を 2 層にする。**選好語彙(15〜20 語、`interests` のキーはここだけ)と生タグ(80 語、検索・説明用)を対応表で結ぶ。根拠: **80 語のうち 48 語(60%)が 1 地点にしか付いていない** |
+| 3 | **1 ユーザー 1 旅程、1 ユーザー 1 スレッド。**profile / 旅程 / 履歴 / `presented_spot_ids` のスコープがすべて揃う |
+| 4 | **undo は旅程の版を戻す操作**(メッセージの再送ではない)。**追記のみ + 現在位置ポインタ + `parent_version`** で表現し、履歴は消さない。redo が副産物として得られる |
+| 5 | **NFR-7 削除**(§A0-3) |
+| 6 | **実験条件(A/B arm)は持たない。**リランク ON/OFF は設定 1 個 |
+
+**私が決めて書く分**(異論が出れば直す): `itineraries` は JSONB スナップショット / 制約は旅程行の JSONB 配列で **id を version コピー時に維持** / 旅程がない間の一時制約はスレッド行 / スレッド状態 8 個は**列に分ける** / 旅程内の時刻は `date` + **その日 00:00 からの分(整数)** / enrichment はソルバーが読む値を列・根拠を JSONB / `static.travel_times` に 43×43×2 mode / `profiles` は 1 ユーザー 1 行 JSONB(`profile_events` は NFR-7 削除により**不要になった**)/ 多言語 JSONB はデータとして残しランタイムは ja のみ / DDL は Alembic・データはシード CLI。
+
+### A0-5. 知識検索をサブエージェント化した(ユーザー指示、2026-08-01)
+
+**`answer_qa` を `search_knowledge` に置き換え、独立したサブエージェント(Agent as a Tool)にした。**[ADR-0011](adr/0011-knowledge-search-subagent.md) / [ADR-0012](adr/0012-knowledge-retrieval-pgvector.md) / [narration_qa.md](30_design/narration_qa.md)。
+
+**きっかけ**: ユーザーから **埋め込みサーバ(`Qwen/Qwen3-Embedding-8B`、4096 次元)は常時利用可能**であること、**`.env` に `tavily_APIkey` を追加した**ことが示された。設計は先行実装 [TakaJun02/sarutahiko](https://github.com/TakaJun02/sarutahiko) を参照した(コードを直接読んで確認)。
+
+| # | 決定 |
+| --- | --- |
+| 1 | **Agent as a Tool。**メインから見た Tool は 1 つ(`search_knowledge`)。**道具の数は 5 のまま** |
+| 2 | **返すのは検索結果ではなく回答**(`answer_ja` + `sources` + `coverage`)。ただし**第二の話者にはしない** — `respond` の素材である |
+| 3 | **回数上限を置かず、コンテキスト予算で縛る**(soft 70% / hard 85%)。「最大 3 周」のような固定回数は**難しい質問だけを体系的に失敗させる** |
+| 4 | サブの Tool は **`semantic_search` / `lexical_search` / `get_document` / `web_search`(Tavily)/ `answer`** |
+| 5 | **pgvector を同一 Postgres に足す**(ADR-0002 が用意した発動条件)。**データストアは増やさない** |
+| 6 | **Web 検索の結果は `spot_id` の供給源にしない**(クローズドワールドの外) |
+
+**[ADR-0009](adr/0009-no-subagents.md) の適用範囲を限定した。**同 ADR が自ら書いた「覆す条件」3 つすべてに該当したため。**メインの `understand` → `act` → `respond` を分けない方針は変わらない。**
+
+**実データから見つけた根拠**: 知識 MD 118 本を `##` で割ると **`## 概要` が 115 ファイル・`## アクセス` が 58 ファイル**に現れ、「あがりこ大王」の `## アクセス` チャンクは本文に「あがりこ大王」を 1 度も含まない。→ **埋め込み対象を `title + heading + 本文` にすることで解消**(MD の書き直しは不要)。
+
+**代償**: QA ターンの LLM 呼び出しが 2〜3 回固定ではなくなる。SSE の `state{kind:"searching"}` で実況して体感を保つ。
+
+**実装後に一度だけ測るもの**(§24.3): フィールド順入れ替えの効果 / guided decoding の有無 / ILS の最適性ギャップ / prefix cache のヒット率。
+**評価集合はシナリオ台本(層 2)から派生させ、別途 authoring しない。**
+
+---
+
+## A1. 決着済み — Phase 2 の設計(2026-08-01、Opus 5 が単独で決定)
+
+**ユーザー指示: 「Phase 1 は議論して決めた。Phase 2 は Opus 5 が設計・仕様を全て決定する」**(2026-08-01)。3 本の設計文書と 3 本の ADR を起こし、**Phase 2 に未決の論点は残っていない。**
+
+| 文書 | 状態 |
+| --- | --- |
+| [30_design/geo.md](30_design/geo.md) | **決定稿。**決定 17 件は同文書 §9 |
+| [30_design/packs_pipeline.md](30_design/packs_pipeline.md) | **決定稿。**決定 22 件は同文書 §13 |
+| [50_operations/osrm.md](50_operations/osrm.md) | **決定稿。**決定 9 件は同文書 §8 |
+
+### A1-1. 経路を「レッグ単位・door-to-door」にした([ADR-0013](adr/0013-leg-route-door-to-door.md))
+
+**きっかけは仕様の破れを見つけたこと。**旧実装は「車で駐車場まで → 徒歩で滝へ」を分割していたが、**徒歩ぶんが旅程の時間に入っていなかった**。時間割付き旅程([recommendation_planning.md §4.0](30_design/recommendation_planning.md))を採った以上、これは直さなければならない。
+
+| # | 決定 |
+| --- | --- |
+| 1 | **1 レッグ = door-to-door の 1 本**(内部に car / foot の 1〜2 セグメント) |
+| 2 | **`static.spot_approach`(43 行)を新設**し、「車でどこまで入れるか」を事前に解く。**実行時に判定しない** |
+| 3 | **`travel_times` は door-to-door**(両端の徒歩を含む)。`car` 行列に欠損があればコマンドを失敗させる |
+| 4 | **`car_to_trailhead` / `return_to_origin` を削除**([20 §6](20_architecture.md) で保留されていた論点への回答) |
+| 5 | **`app.routes` はレッグ単位・`params_hash` で冪等・`params` に `osrm_build` を含める**(地図を作り直すと経路キャッシュが自動で無効化される) |
+| 6 | **旅程の時間計算は DB だけを使う。**OSRM が落ちても旅程は作れ、失われるのは地図の線だけ |
+| 7 | 沿道 POI は **PostGIS 1 クエリ**。`nearest_idx` を **`route_position`(0〜1)** に置換。foot バッファは 10 m → **50 m** |
+
+**`static.access_points` の DDL がどこにも無かった**ことが判明した(旧構成は GeoJSON 直読み)。geo.md で定義した。
+
+### A1-2. OSRM データを鳥海山エリアに切り出す([ADR-0014](adr/0014-osrm-area-extract.md))
+
+**実測: `car` 15 GB + `foot` 17 GB = 32 GB**(日本全国)。しかも**作り方がリポジトリのどこにも書かれていない**([22 §8-6](22_current_issues.md))ので、クリーン clone から起動できない(NFR-2 違反)。
+
+| # | 決定 |
+| --- | --- |
+| 1 | **bbox `139.55,38.80,140.60,39.65`**(43 地点の外接矩形 + 各辺 20 km)。**32 GB → 1 GB 未満・生成 10 分** |
+| 2 | 元データは Geofabrik の **`tohoku`**(全国版ではない) |
+| 3 | 手順を **`scripts/build_osrm.sh`** にする |
+| 4 | **`backend/data/map/BUILD`(ビルド識別子)を Git で追跡する。**経路キャッシュの無効化キーになる |
+| 5 | compose の healthcheck を**実際の `/route` 照会**にし、`--max-table-size 200` を明示する |
+
+**副産物として `.gitignore` の不具合を 1 つ見つけた**: `.env*` が **`.env.example` も無視している**。このままでは Phase 1 の C-0 項目 3(「`.env.example` を追跡して全キーに説明を付ける」)が成立しない。`!.env.example` を足す。
+
+### A1-3. パックのアセットを base + overlay の合成にした([ADR-0015](adr/0015-pack-asset-composition.md))
+
+旧構成の状況 variant は**排他 5 種**で、「雨で、しかも混雑」が表現できなかった。**実測すると成果物はすでに「本編 54 秒 + 注記 5 秒」**になっていたので、設計をその実態に合わせる。
+
+| # | 決定 |
+| --- | --- |
+| 1 | **`base` 1 本 + overlay 4 本**(`weather_cloudy` / `weather_rain` / `congestion_mid` / `congestion_high`)。天気と混雑は**独立した軸**として重ねる |
+| 2 | 生成対象は **`pack_assets.role`**(`visit` = 5 本 / `pass_by` = base のみ)。7 箇所に散っていた暗黙ルール([22 §5-5](22_current_issues.md))を列にする |
+| 3 | **`pass_by` の base は 20〜40 秒。**時速 40 km で 300 m バッファの通過は約 27 秒しかない |
+| 4 | **再生規則(`playback_rules`)を manifest にデータとして載せる。**フロントのコードに書かない |
+| 5 | **Phase 3 への制約**: LoRa ダウンリンクは**天気と混雑を独立したコードとして送る**(単一の「状況コード」にしない) |
+
+### A1-4. 保留されていた論点への回答
+
+| 論点(出どころ) | 回答 |
+| --- | --- |
+| **`car_to_trailhead` / `return_to_origin` を実装するか削るか**([20 §6](20_architecture.md)) | **削る。**データから決まる挙動 + `destination` が持つ(A1-1) |
+| **雨天代替行程を事前計算して同梱するか**([recommendation_planning.md §4.2](30_design/recommendation_planning.md)) | **しない。**FR-4.3 は案内内容の変化であって行程の差し替えではない。組合せが爆発し、端末 UI(Phase 4)に強く依存する。**代わりに雨 overlay が「近くの雨に強い場所」を 1 件だけ挙げる**([packs_pipeline.md §2](30_design/packs_pipeline.md)) |
+| **variant の確定セット** | **base + overlay 4**(A1-3) |
+| **旅程 version とパックの対応規則** | **冪等キーは `(user_id, itinerary_version, options)`。`route_id` は含めない。**`partial` / `failed` の再要求は同じ `pack_id` で再開する |
+| **43×43 距離行列の生成タイミング** | **`build-geo` → `build-travel-times` の 2 段。**再計算は明示操作(`--force`)のみ |
+| **OSRM の leg 取得の並列化** | **`asyncio.gather` + Semaphore(8)、20 秒で打ち切り、残りは `route_id: null`** |
+| **OSRM 障害時の直線距離係数** | **持たない。**時間は行列にあるので、偽の線を引いて得るものがない |
+
+### A1-5. Phase 1 の文書に入った差分
+
+**[data_model.md](30_design/data_model.md) を改訂した**(決定稿のまま、Phase 2 の決定を反映):
+
+- `static.access_points` / `static.spot_approach` を新設(§2.6)
+- `travel_times` を **door-to-door** と定義、`foot` の閾値を **30 分 / 2.5 km** に確定(§3)
+- `app.routes` をレッグ単位に変更(`waypoints_info` 列は廃止)、`pack_jobs` に `user_id` / `itinerary_version` / `params_hash`、`pack_assets` に `role` / `duration_s` / `bytes` を追加(§4.7)
+- 決定の記録に 18〜22 を追加(§8)
+
+---
+
+## A2. 決着済み — Phase 3・Phase 4 の設計(2026-08-01、Opus 5 が単独で決定)
+
+**ユーザー指示(2026-08-01)**: 「LoRaWAN に関わるところは今回のシステムであまり拘るつもりはないので、Opus 5 が適切に仕様と設計を決定して実装に移れる状態にしてください」/ 「**フロントエンド UI は、現在の状態から変更しなくて良い部分は変更しないでください。**変更や追加する必要がある部分(`ask_user` 用の入力欄など)があれば実装して OK です」
+
+| 文書 | 状態 |
+| --- | --- |
+| [30_design/realtime_lora.md](30_design/realtime_lora.md) | **決定稿。**決定 13 件は同文書 §10 |
+| [30_design/offline_field_mode.md](30_design/offline_field_mode.md) | **決定稿。**決定 12 件は同文書 §10 |
+| [30_design/frontend_nav.md](30_design/frontend_nav.md) | **決定稿。**決定 11 件は同文書 §6 |
+
+### A2-1. LoRa は端末駆動・1 通で全スポット([ADR-0016](adr/0016-lora-terminal-driven-batch.md))
+
+**2 つの物理的制約が設計を決めた。**
+
+| 制約 | 帰結 |
+| --- | --- |
+| **LoRaWAN Class A** はダウンリンクを uplink 直後の受信ウィンドウでしか届けられない | **サーバー push は原理的に作れない。**端末が聞き、サーバーが答える |
+| **TTN フェアユースの下りは 10 通 / 日** | 現行の「1 スポット 1 往復」では **10 か所で 1 日ぶんを使い切る** |
+
+| # | 決定 |
+| --- | --- |
+| 1 | **1 通のダウンリンクでパックの全スポットを返す。**`[ver, pack_epoch, code_0 … code_{N-1}]` = **2 + N バイト**(20 スポットで 22 バイト。AS923 の上限 51 バイトに収まる) |
+| 2 | **索引を送らず `manifest.spots` の順に並べる。**1 スポット 1 バイト(上位 4 bit = 天気 / 下位 4 bit = 混雑) |
+| 3 | **`0xF` = 不明。**値が無いことを表現できる(旧実装の乱数捏造[22 §6-2](22_current_issues.md)が構造的に不可能になる) |
+| 4 | **`pack_epoch`(1 バイト)で並びの一致を保証する。**不一致ならコードを捨てる |
+| 5 | **フェアユースの上限は `app.lora_downlinks`(DB)で数える。**プロセス内カウンタは再起動で消える |
+| 6 | シミュレータはシナリオ JSON + CLI(`rt-load` / `rt-start` / `rt-set` / `rt-show`) |
+| 7 | **端末側の変更は decode 1 関数だけ。**AT コマンド・Join・Android ブリッジは触らない |
+
+**「拘らない」の具体化**: 適応的スケジューリング・ACK 再送・差分送信・予報の配信は**すべて採らない**(同文書 §11)。
+
+### A2-2. フロントエンドは差分改修に限る([ADR-0017](adr/0017-frontend-incremental-change.md)、ユーザー指示)
+
+**[20 §10](20_architecture.md) の一部を撤回した。**
+
+| やらないこと(撤回) | 理由 |
+| --- | --- |
+| **`NavView.vue`(2,119 行)の分割** | バックエンド全面改修と同時に行うと**不具合の切り分けができなくなる**。正しい分割線は実機でオフラインを通してからでないと引けない |
+| **Service Worker の作り直し** | 空回りの原因は **`TILE_HOSTS` の不一致 1 点**([22 §13-5](22_current_issues.md))。URL 判定を直せば済む |
+| 動いているモジュールへの手入れ | `NavMap` / `audioManager` / `usePosition` / `geoutils` / `loraBridge`(AT 部)/ `useNavWindow` |
+| 残骸の削除 | `PlanView` / `PlanForm` / `counter.js` / `icons/*`。**消してよいが優先しない** |
+
+**触るのは 2 種類だけ**([frontend_nav.md §2・§3](30_design/frontend_nav.md)):
+
+- **接続の差分**: SSE 化 / Bearer 認証 / **`ask_user`・`clarify` のチップ(新規)** / 旅程カードと undo ボタン / パック進捗パネル / `GET /spots`(フロントの POI コピー廃止)/ LoRa decode
+- **実害のあるバグ**: Pinia 二重初期化 / DOMPurify / SW のタイルホスト / 閾値の二重定義 / 供給源のないデッド UI
+
+### A2-3. 観光フェーズのオフライン動作([offline_field_mode.md](30_design/offline_field_mode.md))
+
+| # | 決定 |
+| --- | --- |
+| 1 | **観光モードは明示的に切り替える**(`navigator.onLine` を当てにしない)。**モード中は HTTP を一切呼ばない**(FR-4.5 の抜け道を作らない) |
+| 2 | manifest は **localStorage**、音声と経路は **Cache Storage**(既存 `sw.js` が `packs-` プレフィックスと Range に対応済み) |
+| 3 | **取り込みの完了を自己検証する**(「入ったつもりで入っていない」を現地で気づかない事故を防ぐ) |
+| 4 | 到達判定の閾値は **manifest の `trigger_radius_m`** から受け取る(定数を 2 か所に持たない) |
+| 5 | 再生は **base → overlay** を既存の再生キューに積むだけ。**雨かつ混雑なら 2 本鳴る** |
+| 6 | **音声が欠けていればテキストを字幕で出す**(部分成功のパックでも使える) |
+| 7 | **室内で検証できる項目(3〜6)と実機が要る項目(機内モード通し・タイル)を分けた**(同文書 §9) |
+
+---
+
+## 進め方(このプロジェクトの原則)
+
+- Docs 駆動開発。文書 → 承認 → 実装([/CLAUDE.md](../CLAUDE.md))
+- 実装・調査は **Codex に委譲**(`--model gpt-5.6-sol`、`--effort` は付けない)。Claude は仕様・設計・レビュー
+- **調査の成果物は Claude が一次資料で検証してから採用する**(2026-07-31 の調査では、Codex 報告 25 項目のうち **3 件に食い違い**があった)
+- ~~ただし「Docs/ で全部定義してから」が解除されるまでは実装を委譲しない~~ → **✅ 2026-08-01 に条件を満たした。**Phase 1〜4 の設計文書がすべて決定稿になったので、**実装の委譲を開始してよい**
+- **委譲の単位は §C-1 / §D-1 / §E-1 の「順」を 1〜2 個ずつ。**1 回で全部投げない(成果物のレビューが破綻する)
+
+---
+
+## A. 設計文書 — **全部揃った(2026-08-01)**
+
+**文書名は [20_architecture.md §14](20_architecture.md) の Phase 表を正とする。**各文書は「書く」だけでなく**その文書で決める設計判断**を持っている。
+
+| 優先 | 文書 | その文書で決めること | Phase |
+| --- | --- | --- | --- |
+| ~~高~~ | ~~`30_design/data_model.md`~~ | **✅ 決定稿 2026-08-01。**決定 15 件は同文書 §8 に記録 | **1** |
+| ~~高~~ | ~~`40_api/chat_sse.md`~~ | **✅ 決定稿 2026-08-01。**決定 15 件は同文書 §6 に記録。**副作用: `state` に `kind:"clarify"` を追加**(ADR-0010 の反映漏れ)、**`users.api_token` を `data_model.md` に追加** | **1** |
+| ~~高~~ | ~~`30_design/narration_qa.md`~~ | **✅ 決定稿 2026-08-01。**知識検索を**サブエージェント化**([ADR-0011](adr/0011-knowledge-search-subagent.md))し、**pgvector + Qwen3-Embedding-8B + Tavily の 4 Tool**([ADR-0012](adr/0012-knowledge-retrieval-pgvector.md))。決定 16 件は同文書 §12 | **1** |
+| ~~中~~ | ~~`30_design/geo.md`~~ | **✅ 決定稿 2026-08-01。**決定 17 件は同文書 §9。**[ADR-0013](adr/0013-leg-route-door-to-door.md)** | **2** |
+| ~~中~~ | ~~`30_design/packs_pipeline.md`~~ | **✅ 決定稿 2026-08-01。**決定 22 件は同文書 §13。**[ADR-0015](adr/0015-pack-asset-composition.md)** | **2** |
+| ~~中~~ | ~~`50_operations/osrm.md`~~ | **✅ 決定稿 2026-08-01。**決定 9 件は同文書 §8。**[ADR-0014](adr/0014-osrm-area-extract.md)** | **2** |
+| ~~中~~ | ~~`30_design/realtime_lora.md`~~ | **✅ 決定稿 2026-08-01。**決定 13 件は同文書 §10。**[ADR-0016](adr/0016-lora-terminal-driven-batch.md)** | **3** |
+| ~~低~~ | ~~`30_design/offline_field_mode.md`~~ | **✅ 決定稿 2026-08-01。**決定 12 件は同文書 §10 | **4** |
+| ~~低~~ | ~~`30_design/frontend_nav.md`~~ | **✅ 決定稿 2026-08-01。**決定 11 件は同文書 §6。**[ADR-0017](adr/0017-frontend-incremental-change.md)** | **4** |
+
+**✅ 設計文書は全部揃った(2026-08-01)。**執筆順は `data_model` → `chat_sse` → `narration_qa` → `geo` → `packs_pipeline` → `osrm` → `realtime_lora` → `offline_field_mode` → `frontend_nav` だった。**これ以降に文書を足すのは、実装中に設計との乖離が出たときだけ**([/CLAUDE.md](../CLAUDE.md) の「先に文書を修正して承認を得る」)。
+
+---
+
+## B. データ拡充(A と独立に着手できる)
+
+[recommendation_planning.md](30_design/recommendation_planning.md) §6 で**実施すると決定済み**(必須)。43 POI に 4 フィールドを足す。
+
+**✅ 半自動生成は完了(2026-07-31、Codex)。残るのはユーザーの目視補正。**
+
+成果物: `backend/data/seeds/enrichment/`(`enrichment.json` / `REVIEW.md` / `SOURCES.md`)。**既存の `POI.json` / `facilities.json` は未変更**(マージは目視補正のあと)。
+
+| 検査項目 | 結果(2026-08-01 再確認) |
+| --- | --- |
+| 件数と `spot_id` | **43 件・過不足なし。**`stay_min` の欠損ゼロ |
+| `open_hours` | **知識 MD 由来 9 件のみ**、`no_concept` 20 / `not_found` 14。**推測で埋めていない** |
+| 季節閉鎖 | 15 件を検出 |
+| `confidence` | `medium` 37 / **`low` 6**(spot_017 一ノ瀧神社 / spot_019 鳥海山大物忌神社 / spot_036 花立牧場公園 / spot_004 家族旅行村 / spot_023 西浜コテージ村 / spot_041 猿倉温泉 鳥海荘) |
+| `weather_fit` | `rain_poor` 20 / `indoor` 11 / **`rain_unsafe` 8** / `rain_ok` 4。`rain_unsafe` は安全 pre-filter で除外される値なので**要確認** |
+| `visit_difficulty` | `no_walk` 18 / `short_walk` 17 / `hike` 7 / `long_walk` 1 |
+
+> **⚠ 2026-08-01 に見つけた不整合(対処済み)**: `data_model.md` の当初の CHECK は `weather_fit` 3 値・`visit_difficulty` 3 値だったが、**実データには `indoor` / `rain_unsafe` / `long_walk` があり、そのままではシードが落ちる**。**実データ側の語彙が正しい**(`rain_unsafe` は安全 pre-filter の入力で `rain_poor` と混ぜられない)ため、[data_model.md §1.4.1](30_design/data_model.md) で CHECK を広げ、順序尺度と `mobility` 対応表を定義した。
+
+**目視補正は `REVIEW.md`(`confidence` 昇順)を上から見る。**優先は ① `low` の 6 件 ② `rain_unsafe` の 8 件 ③ 季節閉鎖を推定で入れたもの。`not_found` の営業時間 14 件は、必要になった時点で埋めればよい(`null` のままでもソルバーは動く)。
+
+## C. Phase 1 実装ガイド(2026-08-01 追加)
+
+> **新しいセッションで実装を始めるときは、ここから読む。**Phase 1 の設計文書は全部揃っている(§A)。
+> **どの文書が何の正か**は [README.md](README.md) の表を見ること。矛盾を見つけたらそこで裁定する。
+
+### C-0. 着手前に必ず片付けること(順序の前提)
+
+> **✅ 2026-08-01、5 件すべて着手済み。**残っているのは「アプリのコードが無いとできない部分」だけである(下表の状態欄)。
+
+| # | やること | 状態 |
+| --- | --- | --- |
+| 1 | **データを `backend/worker/data/` から `backend/data/` へ移す** | **✅ 完了**(`git mv` で履歴を保ったまま 358 ファイル)。`seeds/`(POI 30 + 施設 13 + access_points + メモ)と `knowledge/`(354 MD、うち ja 118)。死コードの `rename_md.py` 3 本は削除。**`map/` は移さず作り直した**(項目 5)<br>**⚠ フロントの `src/assets/POI.json` / `facilities.json` は残してある** — 消すと `spotCodes.js` / `poi.js` の import が壊れてビルドが通らない。**`GET /spots` への差し替えと同時に消す**([frontend_nav.md §2.6](30_design/frontend_nav.md)) |
+| 2 | **Postgres イメージに pgvector を足す** | **✅ 完了。**`docker/postgres/Dockerfile` をビルドし、**postgis 3.4.3 / vector 0.8.5**、`vector(4096)` の INSERT、`ST_DWithin(geography)`、`ST_LineLocatePoint` まで実機確認済み([50_operations/database.md §1](50_operations/database.md)) |
+| 3 | **`.env.example` と `.gitignore`** | **✅ 完了。**`.gitignore` に `!.env.example` と `backend/data/map/`(+ `!BUILD`)を追加。`.env.example` は全キーに説明つき。**キー名は `Settings` 実装時に突き合わせること**([20 §11](20_architecture.md)) |
+| 4 | **`enrichment.json` の目視補正** | **✅ ユーザー確認済み(2026-08-01)。**「これで OK」 |
+| **5** | **⚠ OSRM を切り出して再ビルドし、`build-geo` → `build-travel-times` を通す** | **✅ 地図データは完了。**`scripts/build_osrm.sh` で **32 GB → 264 MB**(car 105 MB / foot 159 MB)、所要 9 分。compose も新データを指すよう更新済み。**実機で検証済み**: car / foot のルート、`/nearest`(あがりこ大王 = スナップ 934 m → 駐車場経由と正しく判定)、**43×43 の `/table` が 1 リクエスト 35 ms・欠損ゼロ**([50_operations/osrm.md §4](50_operations/osrm.md))<br>**❌ `build-geo` / `build-travel-times` は未実行** —— `app.cli` がまだ無い。**C-1 の順 1〜2(骨格 + Alembic)の直後、順 5(ソルバー)の前に実行する**<br>**⚠ 旧データ 31 GB(`backend/worker/data/map`)はまだ消していない**([50_operations/osrm.md §6](50_operations/osrm.md)) |
+
+### C-1. 実装の順序と、それぞれの「正」
+
+| 順 | 作るもの | 読む文書 | 完了の判定 |
+| --- | --- | --- | --- |
+| 1 | **`backend/app/` 骨格** — `core/`(config / db / llm / logging)・`main.py`・`/healthz` | [20 §3](20_architecture.md)(構造・依存ルール)/ [20 §11](20_architecture.md)(設定) | `/healthz` が DB・vLLM・OSRM を**実チェック**して返る |
+| 2 | **Alembic + 全テーブル + シード CLI** | **[data_model.md](30_design/data_model.md) 全体** | `init-db` → `seed` で 43 spots・80 タグ・12 選好キー・43×43 travel_times が入る |
+| 3 | **知識インデックス** — `index-knowledge` / `validate-knowledge` | [narration_qa.md §11](30_design/narration_qa.md) | 118 文書・400〜600 チャンクが入り、`spot_id` が 43 件に付く |
+| 4 | **users + 認証**(Bearer トークン) | [40_api/chat_sse.md §4](40_api/chat_sse.md) / [data_model.md §4.1](30_design/data_model.md) | `POST /login` がトークンを返し、`GET /api/v1/thread` が本人の分だけ返す |
+| 5 | **`domains/itinerary/`** — ILS ソルバー・述語レジストリ(17 種)・編集 op | [recommendation_planning.md §4](30_design/recommendation_planning.md) / [ADR-0005](adr/0005-itinerary-solver.md) | 固定シードで同一解。ハード制約 100% |
+| 6 | **`domains/recommendation/`** — スコアラ + リランク | [recommendation_planning.md §3](30_design/recommendation_planning.md) / [ADR-0006](adr/0006-recommendation-hybrid.md) | 全出力 `spot_id` が DB 照合を通る |
+| 7 | **`domains/narration/`** — 知識検索サブエージェント | [narration_qa.md](30_design/narration_qa.md) / [ADR-0011](adr/0011-knowledge-search-subagent.md) | Tool 0 回の `answer` が弾かれる。埋め込み断で字句検索に縮退する |
+| 8 | **`domains/conversation/`** — 6 ノード + 5 Tool + ガードレール | **[agent_planning_phase.md Part II(§14〜24)](30_design/agent_planning_phase.md)** | ガードレール G1〜G9 が層 1 テストで通る |
+| 9 | **SSE エンドポイント** | [40_api/chat_sse.md §1](40_api/chat_sse.md) | 切断してもターンが完走し、`GET /thread` で画面が完全に戻る |
+| 10 | **フロントの chat を SSE 化** | 同 §1.1・§3.1 | `AbortController` で停止でき、停止しても見えた旅程が残る |
+| 11 | **旧構成の削除** — `backend/api/` `backend/worker/` `svc-*` / ChromaDB コンテナ | [20 §14](20_architecture.md) | compose が **db / osrm-car / osrm-foot / app / frontend の 5 つ**になる |
+
+**5〜7 は 8 より先に作る。**`act` が呼ぶ Tool の中身が無いとパイプラインを通しで検証できない。
+
+### C-2. 特に間違えやすい 6 点(2026-08-01 の監査で実際に文書がずれていた箇所)
+
+| # | 落とし穴 | 正 |
+| --- | --- | --- |
+| 1 | **述語は 17 種**。表の「行」は分類 11 個なので数え違えやすい | [§18.2 `PredEnum`](30_design/agent_planning_phase.md) |
+| 2 | **`profile.interests` のキーは選好キー 12 語**。生タグ 80 語ではない | [data_model.md §2](30_design/data_model.md) |
+| 3 | **旅程の時刻は「その日 00:00 からの分」(整数)**。`"09:40"` 文字列ではない | [data_model.md §7.2](30_design/data_model.md) |
+| 4 | **`md_slug` は使わない**(実データで 42 個中 41 個が死んでいる)。知識 MD との対応は `faci_spot/spot_NNN.md` ↔ `spot_id` | [data_model.md §1.2](30_design/data_model.md) |
+| 5 | **`constraints` は旅程行にあり、`Itinerary` の中ではない**。版コピー時に **id を維持する** | [data_model.md §4.5.3](30_design/data_model.md) |
+| 6 | **Web 検索の結果を `spot_id` の供給源にしない** | [narration_qa.md §6.1](30_design/narration_qa.md) |
+
+### C-3. テスト
+
+**層 1 自動テストの仕様書は [agent_planning_phase.md §5](30_design/agent_planning_phase.md) のガードレール表と [recommendation_planning.md §7](30_design/recommendation_planning.md) の検査表**である。実装と同時に書かせる。**計測テーブルは無い**(NFR-7 削除)ので、テストが唯一の自動的な安全網になる。
+
+## D. Phase 2 実装ガイド(2026-08-01 追加)
+
+> **Phase 2 = geo + パック用ナレーション + voice + packs + ジョブ API + 進捗 UI**([20 §14](20_architecture.md))。
+> 決定はすべて済んでいる(§A1)。**未決の論点は無い。**
+
+### D-1. 実装の順序と、それぞれの「正」
+
+| 順 | 作るもの | 読む文書 | 完了の判定 |
+| --- | --- | --- | --- |
+| **0** | **OSRM の切り出しと再ビルド**(`scripts/build_osrm.sh`)+ compose の差し替え | [50_operations/osrm.md](50_operations/osrm.md) | `backend/data/map` が **1 GB 未満**。healthcheck が実 `/route` で通る。**Phase 1 の前に済ませる**(§C-0 項目 5) |
+| **1** | **`domains/geo/`** — OSRM クライアント・`build-geo`・`build-travel-times` | [geo.md §2・§4](30_design/geo.md) | `spot_approach` **43 件**、`travel_times.car` **1,806 行・欠損ゼロ** |
+| 2 | **`app.routes` と `POST /api/v1/routes`** | [geo.md §3](30_design/geo.md) | 同一 `params` が既存行を返す。`osrm_build` が変わると新しい行になる |
+| 3 | **沿道 POI**(PostGIS 1 クエリ) | [geo.md §5](30_design/geo.md) | 全点総当たりが無い。`route_position` が返る |
+| 4 | **`domains/voice/`** — `TTSPort` + gTTS | [packs_pipeline.md §6](30_design/packs_pipeline.md) | **1 件失敗しても他が続く。**ffmpeg に依存しない |
+| 5 | **`domains/narration/pack_text.py`** — テンプレート 1 本 + 検証 | [packs_pipeline.md §5](30_design/packs_pipeline.md) | 空・拒否応答・長さ逸脱が TTS に流れない。**知識は `spot_id` 直引き** |
+| 6 | **`domains/packs/` + `jobs/`** — ジョブランナー | [packs_pipeline.md §3・§4](30_design/packs_pipeline.md) | 途中でプロセスを落として再起動すると**続きから走る**。`partial` で成果物が配れる |
+| 7 | **API**(`POST /packs` / `GET /jobs/{id}` / `GET /packs/{id}`)+ 静的配信 | [packs_pipeline.md §8](30_design/packs_pipeline.md) | 同一キーの再要求が**新しいジョブを作らない** |
+| 8 | **フロントの進捗 UI** | [packs_pipeline.md §8.1](30_design/packs_pipeline.md) | 生成中もアプリが使える。**`partial` を「完了」と表示しない** |
+| 9 | **旧サービスの削除** — `svc-nav` / `svc-routing` / `svc-alongpoi` / `svc-llm` / `svc-voice` | [20 §14](20_architecture.md) | compose が **db / osrm-car / osrm-foot / app / frontend の 5 つ**になる |
+
+**4〜5 は 6 より先に作る。**ジョブランナーだけ先に作ってもアセットの中身が無い。
+
+### D-2. 特に間違えやすい 6 点
+
+| # | 落とし穴 | 正 |
+| --- | --- | --- |
+| 1 | **`travel_times` は door-to-door**(両端の徒歩を含む)。駐車場までの時間ではない | [geo.md §4.1](30_design/geo.md) |
+| 2 | **`leg_from_prev.mode`(行列のどちらの行か)と `routes.mode_summary`(セグメント構成)は別物。**一致させようとしない | [geo.md §1.3](30_design/geo.md) |
+| 3 | **経路の冪等キーに `osrm_build` を含める。**忘れると古い道の線が残り続ける | [geo.md §3.2](30_design/geo.md) |
+| 4 | **パックの冪等キーに `route_id` を含めない**(旅程 version が経路を決める) | [packs_pipeline.md §3.2](30_design/packs_pipeline.md) |
+| 5 | **variant は排他ではない。**base の後に overlay を重ねる。選択規則は manifest の `playback_rules` | [ADR-0015](adr/0015-pack-asset-composition.md) |
+| 6 | **対話では経路断で縮退、パック生成では失敗させる。**向きが逆なのは意図的 | [geo.md §6.3](30_design/geo.md) |
+
+### D-3. テスト
+
+| 層 | 何を検査するか |
+| --- | --- |
+| `unit/` | `spot_approach` の選定ロジック(モックした OSRM 応答)/ variant と `role` の組み合わせ / manifest の組み立て / ジョブ状態遷移 / 原稿の検証規則 |
+| `contract/` | `POST /routes` の冪等性 / `POST /packs` の 202 と再要求 / `GET /jobs` の形(respx で OSRM・vLLM をモック) |
+| `integration/` | PostGIS の沿道 POI クエリ(compose の db を使う) |
+| `smoke/` | **旅程 1 つからパックが `ready` になるまで**(`run_nav_test.sh` の置き換え。ジョブポーリング対応) |
+
+**gTTS は外部 API なので CI では必ずモックする。**実物を叩くのは手元の smoke だけにする。
+
+## E. Phase 3・Phase 4 実装ガイド(2026-08-01 追加)
+
+> **Phase 3 = DB 統合 + realtime(シミュレータ + LoRa)。Phase 4 = 掃除 + 観光フェーズのオフライン動作。**
+> **フロントは差分改修に限る**([ADR-0017](adr/0017-frontend-incremental-change.md))。触ってよい範囲は [frontend_nav.md](30_design/frontend_nav.md) が正。
+
+### E-1. 実装の順序と、それぞれの「正」
+
+| 順 | 作るもの | 読む文書 | 完了の判定 | Phase |
+| --- | --- | --- | --- | --- |
+| 1 | **`domains/realtime/` の状態ストアとシミュレータ**(`rt-load` / `rt-start` / `rt-set` / `rt-show`) | [realtime_lora.md §6](30_design/realtime_lora.md) | シナリオを流すと `spot_realtime` が時刻どおりに変わる。**値の無いスポットは NULL のまま** | 3 |
+| 2 | **`codec.py`**(§2 のエンコード/デコード) | [realtime_lora.md §2](30_design/realtime_lora.md) | 純関数。**単体テストで往復が一致する。**未知の `ver` を捨てる | 3 |
+| 3 | **`scheduler.py`**(フェアユース) | [realtime_lora.md §3](30_design/realtime_lora.md) | 11 通目が publish されず、**ログに `downlink_budget_exceeded` が出る** | 3 |
+| 4 | **`mqtt.py`**(aiomqtt・lifespan で 1 つ) | [realtime_lora.md §5](30_design/realtime_lora.md) | uplink → downlink が往復する。**プロセス内キャッシュを持たない** | 3 |
+| 5 | **フロント: LoRa decode + `rt` ストア** | [frontend_nav.md §4](30_design/frontend_nav.md) | `pack_epoch` 不一致でコードを捨てる。**AT コマンド部を触っていない** | 3 |
+| 6 | **フロント: 接続の差分**(SSE / チップ / 旅程カード / 進捗パネル / `GET /spots`) | [frontend_nav.md §2](30_design/frontend_nav.md) | 同文書 §5 の受け入れ条件 8 項目 | 1〜2 と並行 |
+| 7 | **フロント: 実害のあるバグ 5 件** | [frontend_nav.md §3](30_design/frontend_nav.md) | Pinia が 1 つ。`v-html` に DOMPurify。タイルがキャッシュされる | 4 |
+| 8 | **観光フェーズ**(取り込み・到達判定・再生・タイル) | [offline_field_mode.md](30_design/offline_field_mode.md) | 同文書 §9 の受け入れ条件 7 項目。**うち 3〜6 は室内で確認できる** | 4 |
+| 9 | **旧構成の削除とリポジトリ衛生** | [20 §14](20_architecture.md) / [22 §15](22_current_issues.md) | compose が 5 コンテナ。`backend/worker/` が無い | 4 |
+
+**5 と 6 は独立している。**6(SSE・チップ)は Phase 1 のバックエンドができ次第すぐ必要になるので、**Phase 3 を待たない**。
+
+### E-2. 特に間違えやすい 5 点
+
+| # | 落とし穴 | 正 |
+| --- | --- | --- |
+| 1 | **サーバーから push できると思って設計する** | Class A ではダウンリンクは uplink 直後の窓だけ([ADR-0016](adr/0016-lora-terminal-driven-batch.md)) |
+| 2 | **`manifest.spots` の並びを後から変える** | **並びが通信プロトコルの一部**になっている。変えるなら `pack_epoch` を上げる |
+| 3 | **値が無いスポットを 0 で埋める** | `0xF` = 不明。**捏造しない**([22 §6-2](22_current_issues.md)) |
+| 4 | **フェアユースのカウンタをプロセス内に持つ** | 再起動で上限が消える。`app.lora_downlinks`(DB) |
+| 5 | **「ついでに」フロントを整理する** | [ADR-0017](adr/0017-frontend-incremental-change.md)。**触ってよい範囲は決まっている** |
+
+### E-3. テスト
+
+| 層 | 何を検査するか |
+| --- | --- |
+| `unit/` | **codec の往復**(エンコード → デコードが一致 / 未知の `ver` / `0xF`)/ スケジューラの上限判定 / シミュレータの時刻進行 |
+| `contract/` | 管理 API(`simulator/{action}`)/ `GET /realtime/spots/{id}` の ETag |
+| `integration/` | `lora_downlinks` のカウンタが日をまたいでリセットされる |
+| 手動 | 機内モードでの通し(実機)。**それ以外は室内で再現する**([offline_field_mode.md §9](30_design/offline_field_mode.md)) |
+
+## F. 実装時に決める調整項目(設計判断ではない)
+
+[recommendation_planning.md](30_design/recommendation_planning.md) §8.2。値・見せ方として残るもので、文書を止めない。
+
+1. 暫定 → 確定の UI の見せ方(実機を見て決める)
+2. ペナルティの重み初期値と編集距離の係数 `β`(シナリオ台本で合わせる)
+3. ILS のパラメータ(反復回数・shake 件数・打ち切り)。43 地点の厳密解と比較して一度決める
+4. 述語の初期実装セット(**17 種**のうち `weight`/`require`/`exclude`/`last`/`not_consecutive`/`time_window`/`lunch_break` から)
+5. `stay_min` の初期値
+
+**Phase 2 のぶん**([geo.md §11](30_design/geo.md) / [packs_pipeline.md §15](30_design/packs_pipeline.md)):
+
+6. 並列度とタイムアウト(geo 8 並列・20 秒、narrate 8、speak 3)
+7. 沿道バッファ(car 300 m / foot 50 m)と `trigger_radius_m`(**実機で歩いて決める**)
+8. 原稿の長さの上下限と禁止表現リスト(生成物を見ながら)
+9. `along_poi_limit`(20)と `gc-packs --keep`(3)の既定値
+
+**Phase 3・4 のぶん**([realtime_lora.md §12](30_design/realtime_lora.md) / [offline_field_mode.md §12](30_design/offline_field_mode.md) / [frontend_nav.md §8](30_design/frontend_nav.md)):
+
+10. 端末の自動要求間隔(90 分)・1 日の自制回数(8)・最短送信間隔(5 分)
+11. タイルの zoom 範囲(10〜16)と離脱判定の倍率(2 倍)
+12. チップと進捗パネルの見た目(既存の Tailwind に合わせる)
+13. `VITE_API_BASE` の既定値と Vite プロキシ設定
+
+## G. 決着済みの記録(2026-07-31)
+
+**`agent_planning_phase.md` §13 の 5 論点**(決定内容は同文書の各節に統合済み):
+
+| # | 論点 | 決定 |
+| --- | --- | --- |
+| 1 | `plan` の最大手数 | **3 のまま**。足りなければ破棄がログに出るので、それを見て増やす |
+| 2 | ステップ参照の語彙 | **3 つのまま**。追加は後方互換 |
+| 3 | 知識検索を道具に含めるか | **含める**。方式は 2026-08-01 決定(ADR-0011/0012、`narration_qa.md`) |
+| 4 | undo の UI | **両方**。ボタン = 専用 REST(LLM を通さない)、自然言語 = `edit_itinerary` の `revert` op |
+| 5 | 旅程なしの推薦 | **認める**。推薦は旅程を FK 参照せず、旅程は `plan_itinerary` で遅延生成 |
+
+**文書の承認状態**: `00_project` / `10_requirements` / `20_architecture` / ADR-0001〜0004 を 2026-07-31 に承認(ADR-0005〜0008 は 07-30〜07-31 に承認済み)。**未承認の文書はない。**
+
+`21_architecture_asis.md` / `22_current_issues.md` は凍結(更新しない)。
+
+---
+
+## H. 実装完了後に残っている調整項目(2026-08-02)
+
+**いずれも設計判断ではなく、動かしながら決める値・見せ方である。**機能は動いている。
+
+| # | 項目 | 詳細 |
+| --- | --- | --- |
+| 1 | **`understand` が時間指定を `unmodeled` に落とすことがある** | 「9時から17時で」が `days[].start/end` に正しく反映されているのに、`respond` が「一部システムで未処理」と述べる。**プロンプトの調整**([agent_planning_phase.md §3.1](30_design/agent_planning_phase.md) の `handling` 判定)。機能上の実害はないが、応答が分かりにくい |
+| 2 | **`ask_user` のチップのリロード復元** | `GET /thread` の `pending` が全 kind を返していない。フロントは sessionStorage で補完している。**正しくは `messages.meta` に選択肢を載せて `pending` から返す**(**ADR-0018 の `pending_ask` 統合に合わせて直す**) |
+| 3 | **`build-geo` の徒歩 0 分問題** | 車道スナップ点が選ばれた 4 地点(赤田の大仏 119 m / 遊佐町総合運動公園 55 m / 胴腹滝 96 m / 牛渡川 289 m)は foot グラフ上で同一ノードにスナップし `walk_sec = 0` になる。**誤差は 1 地点あたり最大 ±4 分**([geo.md §2.3.1](30_design/geo.md) に記録) |
+| 4 | **ILS の最適性ギャップが未実測** | 43 地点なら厳密解が計算できる([recommendation_planning.md §7](30_design/recommendation_planning.md))。**一度だけ測ってパラメータを確定する**(現在は反復 160 回・β 0.6) |
+| 5 | **推薦スコアの同点が多い** | 粗いタグ語彙のため上位が同点で並ぶ(例: 温泉選好で 5 件が 3.5 点)。**LLM リランクが差をつける前提**の設計([ADR-0006](adr/0006-recommendation-hybrid.md))だが、重みの調整余地がある |
+| 6 | **ヘッダの表示が "AI Agent by Qwen3"** | 実際のモデルは `gemma-4-31B`。表示だけの問題 |
+| 7 | **フロントの残骸** | `PlanView.vue` / `PlanForm.vue` / `stores/counter.js` / `components/icons/*`。`PlanView` は router から参照されているので、消すなら router も直す |
+| 8 | **実機が要る検証** | 機内モードでの観光フェーズ通し / LoRa 端末での decode / TTN のダウンリンク。**現在いずれも使えないため未検証**([offline_field_mode.md §9](30_design/offline_field_mode.md)) |
+
+## I. 実機を触って出た課題(2026-08-03)
+
+### I-1. UX 問題インベントリ
+
+**`http://localhost:5173/` を実際に操作した所見を [23_ux_issues.md](23_ux_issues.md) に記録した。**計画フェーズを通す 8 手のうち **3 手が行き止まり**になっている。優先度は同文書 §9。
+
+### I-2. `ask_user` を「結果を返す 1 つの Tool」に統合する(**2026-08-03 実装完了**)
+
+**[ADR-0018](adr/0018-ask-user-resumable-tool.md) で決定(2026-08-03、ユーザー指示)。[ADR-0010](adr/0010-understand-bounded-agent.md) を置き換える。**
+
+`ask_user` が 2 系統(T5 Tool と `understand` のノード内分岐)に割れており、**どちらも返り値を持たない**「呼んで終わり」の道具だった。これを **1 つの Tool + ターンの中断・復帰**に統合する。
+
+**文書は反映済み**: [ADR-0018](adr/0018-ask-user-resumable-tool.md) / [agent_planning_phase.md](30_design/agent_planning_phase.md) §1.3・§2・**§3.1**・**§3.4**・§4.1・**§5.1**・§6・§10・§15.3〜15.7・§16.5・§18.7・§19.3・§20.2・§23・§24.3 / [understand_node.md](30_design/understand_node.md) §0・§0.1 / [chat_sse.md](40_api/chat_sse.md) §1.2・**§1.4**・§3.1 / [data_model.md](30_design/data_model.md) §4.2・§4.3
+
+**実装で触るもの**
+
+| 層 | 変更 |
+| --- | --- |
+| `understand` | guided schema から `action` / `clarify` を削除。`plan` の Tool enum に `ask_user` を入れる。`tool_results` をプロンプトに載せる |
+| `guards` | G6〜G9 を `understand` から `validate_plan`/`act` 側へ移し、G1〜G5 と 1 組に統合(旧 G8 は G3 に吸収) |
+| `planner` | P5 を「末尾のみ + plan 全体で 1 手」に |
+| `tool_adapters` / `executor` | `ask_user` が `kind` を受け、`state:ask_user` / `state:clarify` を出し分ける。`pending_ask` を立てる |
+| `context` | `pending_ask` があれば答えを Tool の結果に組み立て `tool_results` に入れる。**1 ターンで失効** |
+| `repository` / DB | `threads.pending_clarification` → **`pending_ask`**、`clarify_streak` を `ask_streak` に統合(**マイグレーション**) |
+| `pipeline` | **E6 の分岐を削除** |
+| `respond` | 「聞き返し」モードを「質問」モードに統合(4 → 3) |
+| フロントエンド | **`ask_user` 専用の入力フォームを新設する**(2026-08-03 追加、ユーザー指示。[frontend_nav.md §2.3](30_design/frontend_nav.md))。`OC_AskUserForm.vue` を 1 つ足し、入力欄の直上にドッキング。**`OC_ChatMessage.vue` のチップ行は削除**(回答 UI を 2 か所に持たない)。SSE の kind と `resolves` の形は変えない |
+
+### I-3. プロンプトに「コードが検証する語彙」を載せる(**2026-08-03 実装完了**)
+
+`understand` プロンプトに**生タグ 80 語**(`static.tag_vocabulary`)と **`recommend.filter.mobility` の enum 値**ほかを載せた。**載せていなかったために、平易な発話で推薦が 0 件になっていた**([agent_planning_phase.md §7](30_design/agent_planning_phase.md) の改訂 / [23_ux_issues.md §0.3](23_ux_issues.md))。
+
+## J. 次にやること
+
+1. **[23_ux_issues.md](23_ux_issues.md) §8 の優先度順に直す。**まず **§1-1(最初の 1 手が空振り)**と **§1-2〜1-5(旅程を作ると地図が消える)**
+2. **判断を仰ぐ 2 件**: **§7-2**(引数 1 項目の不正で手を丸ごと破棄してよいか。[agent_planning_phase.md §23 論点 20](30_design/agent_planning_phase.md))/ **§7-3**(ガードレールが手を破棄したあとのフォールバック。案 A/B/C)
+3. **`feat/rebuild-implementation` を develop にマージするか判断する**
+4. §H の 1〜2 を直す(応答の分かりにくさと復元の穴)
+5. §H の 4 を測って ILS のパラメータを確定する
+6. 実機が用意できたら §H の 8

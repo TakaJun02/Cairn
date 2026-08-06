@@ -1,0 +1,565 @@
+{
+  "type": "FeatureCollection",
+  "generator": "overpass-turbo",
+  "copyright": "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL.",
+  "timestamp": "2025-08-11T13:30:30Z",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/146846812",
+        "access": "permissive",
+        "amenity": "parking",
+        "parking": "surface",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.0934079,
+          39.1903114
+        ]
+      },
+      "id": "way/146846812"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/252601852",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.0913491,
+          39.1919336
+        ]
+      },
+      "id": "way/252601852"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/258228120",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.0245078,
+          39.1708356
+        ]
+      },
+      "id": "way/258228120"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/370050340",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.071522,
+          39.1341723
+        ]
+      },
+      "id": "way/370050340"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/370050341",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.068743,
+          39.1315717
+        ]
+      },
+      "id": "way/370050341"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/374681084",
+        "amenity": "parking",
+        "name": "元滝駐車場",
+        "parking": "surface",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9483716,
+          39.167419
+        ]
+      },
+      "id": "way/374681084"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/567049315",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9907247,
+          39.1224791
+        ]
+      },
+      "id": "way/567049315"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/567049318",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9900313,
+          39.1227527
+        ]
+      },
+      "id": "way/567049318"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/567049322",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9906904,
+          39.1220322
+        ]
+      },
+      "id": "way/567049322"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/567049324",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9904208,
+          39.1216513
+        ]
+      },
+      "id": "way/567049324"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/567049341",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9770118,
+          39.1067773
+        ]
+      },
+      "id": "way/567049341"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/567081399",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.971976,
+          39.1430713
+        ]
+      },
+      "id": "way/567081399"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/744275407",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.0885432,
+          39.2053246
+        ]
+      },
+      "id": "way/744275407"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/744275408",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.087941,
+          39.2052683
+        ]
+      },
+      "id": "way/744275408"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/744275416",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.0902646,
+          39.2048467
+        ]
+      },
+      "id": "way/744275416"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/744275419",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.0899513,
+          39.2063483
+        ]
+      },
+      "id": "way/744275419"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/759513648",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9620895,
+          39.1739599
+        ]
+      },
+      "id": "way/759513648"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/759513651",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9597726,
+          39.1738486
+        ]
+      },
+      "id": "way/759513651"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/759513652",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9591246,
+          39.1730651
+        ]
+      },
+      "id": "way/759513652"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/777260101",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9426421,
+          39.1690122
+        ]
+      },
+      "id": "way/777260101"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/777260107",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9429035,
+          39.1702825
+        ]
+      },
+      "id": "way/777260107"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/810491342",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9441281,
+          39.1807283
+        ]
+      },
+      "id": "way/810491342"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/810491390",
+        "access": "yes",
+        "amenity": "parking",
+        "fee": "no",
+        "name": "金峯神社 駐車場",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9471446,
+          39.1815673
+        ]
+      },
+      "id": "way/810491390"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/810491404",
+        "access": "private",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9445717,
+          39.1823389
+        ]
+      },
+      "id": "way/810491404"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/833117528",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.0456847,
+          39.0667372
+        ]
+      },
+      "id": "way/833117528"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/833117561",
+        "amenity": "parking",
+        "fee": "no",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.0462232,
+          39.0689469
+        ]
+      },
+      "id": "way/833117561"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/954432864",
+        "access": "yes",
+        "amenity": "parking",
+        "capacity": "5",
+        "fee": "no",
+        "parking": "street_side",
+        "smoothness": "bad",
+        "surface": "ground",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9904651,
+          39.0566642
+        ]
+      },
+      "id": "way/954432864"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/954432867",
+        "access": "yes",
+        "amenity": "parking",
+        "capacity": "20",
+        "fee": "no",
+        "maxstay": "no",
+        "name": "ニノ滝駐車場",
+        "parking": "street_side",
+        "smoothness": "excellent",
+        "surface": "asphalt",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9902908,
+          39.0547995
+        ]
+      },
+      "id": "way/954432867"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/954432868",
+        "amenity": "parking",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.1072988,
+          39.0966229
+        ]
+      },
+      "id": "way/954432868"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "way/992989711",
+        "amenity": "parking",
+        "capacity": "2",
+        "fee": "no",
+        "name": "大台野そばP",
+        "parking": "surface",
+        "surface": "concrete",
+        "@geometry": "center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.037919,
+          39.014427
+        ]
+      },
+      "id": "way/992989711"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "node/1360333032",
+        "ele": "1074",
+        "highway": "trailhead",
+        "name": "大平登山口",
+        "operator": "山形県"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9818014,
+          39.107274
+        ]
+      },
+      "id": "node/1360333032"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "node/7578006289",
+        "access": "private",
+        "amenity": "parking"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          139.9445677,
+          39.1823374
+        ]
+      },
+      "id": "node/7578006289"
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "@id": "node/10798323401",
+        "amenity": "parking"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          140.0033721,
+          39.1947136
+        ]
+      },
+      "id": "node/10798323401"
+    }
+  ]
+}

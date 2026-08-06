@@ -5,14 +5,34 @@
 __pycache__/
 *.pyc
 
-# ダウンロードした言語モデルを無視する
-backend/worker/llm_models/
-
 # Dockerが生成するファイルを無視する
-ollama_data/
+/packs/
 
 .env*
+!.env.example
 
-japan-latest.osm.pbf
-backend/worker/data/map/car/*
-backend/worker/data/map/foot/*
+# OSRM の地図データ（scripts/build_osrm.sh で作る。ADR-0014）
+# BUILD だけは追跡する — 「今のリポジトリが想定している地図データはどれか」を残すため
+# ディレクトリごと除外すると中の BUILD を再包含できない（git の仕様）ので /* にする
+backend/data/map/*
+!backend/data/map/BUILD
+
+# Node
+node_modules/
+dist/
+plugins/lorart/node_modules/
+plugins/lorart/dist/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+# ブラウザ操作ツール（Playwright MCP）が吐くログ・スナップショット
+.playwright-mcp/
+
+OC_guidanceLLM/
+.codex
+
+ChokaiGuidance.mp4
