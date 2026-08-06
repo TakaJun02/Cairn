@@ -54,6 +54,8 @@ module.exports = {
         brand: {
           signal: c('signal'),
           soft: c('signal-soft'),
+          // 明るい面(地図まわり)専用の深い碧(frontend_design_system.md §3.2/§8.3.1)。
+          'signal-deep': c('signal-deep'),
         },
         // 本文・補足・ラベルの文字色(§3.1)。`text-text` / `text-text-muted` /
         // `text-text-dim` として使う。

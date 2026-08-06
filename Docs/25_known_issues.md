@@ -100,6 +100,8 @@
   - **レスポンスヘッダが `content-type` と `content-length` の 2 つだけ**。実際のバックエンドは `server: uvicorn` / `x-request-id` / `date` を必ず付ける
   - **`{"detail":"bad request"}` という文字列がバックエンドのソースに存在しない**(`grep -rn "bad request" --include=*.py backend` が 0 件)
   - **同じセッションの数十分前には、同じコードでブラウザからログインできていた**(復旧の契機は不明。`serviceWorker.unregister()` + `caches.delete()` を実行した後に発症した)
+  - **正体を特定(2026-08-06)**: **検証ブラウザ(Playwright MCP)が「URL 末尾が `/login`」の要求だけを合成 400 で遮る**ログイン保護。実測: `/loginx` → 200(vite 到達)、`POST /api/v1/loginx` → 404(バックエンド到達)、`GET /login`(SPA ルートですら)→ 400、`POST /api/v1/login` → 400、いずれも 2〜3ms・最小ヘッダーでバックエンドのログに現れない。Service Worker を解除しても継続するので SW 起因ではない。「数十分前はログインできていた」のは既存 `sessionStorage` のセッションが生きていただけで、ログイン要求自体は常に遮られていたと考えるのが整合的
+  - **回避手順(実機確認で使う)**: ① `curl -X POST http://localhost:5173/api/v1/login -H 'Content-Type: application/json' -d '{"user_name":"<名前>"}'` でトークンを取得 ② ブラウザで任意のページ(例: `/loginx`)を開き `sessionStorage.setItem('user', JSON.stringify({user_id, user_name, token, language:'ja'}))` ③ `/app/chat` へ直接遷移(ストアが sessionStorage から復元し、`GET /thread` で会話が戻る)
   - 発症中は `navigator.serviceWorker.controller` が truthy のまま(`main.js` が読み込みごとに再登録するため、unregister しても次の読み込みで戻る)
   - **回避策は見つかっていない。**ブラウザのコンテキストを作り直すのが確実と思われる
   - **通常のブラウザでも再現するなら SW の実バグとして調べる価値がある**が、本作業では再現していない(`public/sw.js` の `fetch` ハンドラは静的アセット・`/packs/`・タイル画像以外を素通しする実装で、`/api/v1/*` は横取りしていない)

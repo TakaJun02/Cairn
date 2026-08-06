@@ -105,7 +105,7 @@ jobs         →                   domains  →  core
 flowchart TD
   A["POST /api/v1/chat"] --> S1["① load_context（決定的）<br/>context.py — DB から全状態を再構築<br/>履歴 = LLM 要約 + 機械要約 + 候補リスト + 直近 2 ターン生"]
   S1 --> S2["② update_profile（LLM 1 回）<br/>update_profile.py — profile_delta / score_adjustments<br/>差分が空なら書かない・state:profile も送らない"]
-  S2 --> S3["③ main_agent（ReAct ループ）<br/>main_agent.py — 毎周 guided JSON {thought, action}<br/>R1 手数 8 / R2 予算 70·85% / R3 反復拒否 / R4 質問 2 回"]
+  S2 --> S3["③ main_agent（ReAct ループ）<br/>main_agent.py — 毎周 guided JSON {thought, action}<br/>R1 手数 8（done・ask_user 除く） / R2 予算 70·85% / R3 反復拒否 / R4 質問 6 回"]
   S3 -->|"recommend"| T1["レコメンド SA<br/>recommend_agent.py"]
   S3 -->|"plan/edit_itinerary"| T2["旅程計画 SA<br/>itinerary_subagent.py"]
   S3 -->|"search_knowledge"| T3["知識検索 SA<br/>narration/search/"]
@@ -139,7 +139,7 @@ flowchart TD
 
 - **毎周のコンテキスト**(順序固定): ①システムプロンプト + Tool 定義 + スキーマ(byte 同一 = prefix caching)②プロフィール ③現在の旅程ダイジェスト + 有効な制約(id つき)④会話履歴 ⑤このターンの軌跡 ⑥最新のユーザー発話(末尾)
 - **毎周の出力**は guided decoding の `{"thought", "action": {"tool", "args"}}`。`args` は **Tool ごとの anyOf 分岐で厳密スキーマ・分岐の tool enum は排他**(`prompts.py` の `main_agent_guided_schema`)。JSON 不正時は 1 回だけ再試行
-- 停止条件は §3.2 図の R1〜R4。R1/R2 到達で「まとめに入って」+ 縮小スキーマ(`done` のみ)、R4 到達で `ask_user` がスキーマから消える
+- 停止条件は §3.2 図の R1〜R4。R1/R2 到達で「まとめに入って」+ 縮小スキーマ(`done` のみ)、R4 到達・タイムアウト発生後(`ask_timed_out`)で `ask_user` がスキーマから消える(2026-08-06、ADR-0024)
 - Tool の失敗は `ToolError` として軌跡に差し戻され、**メインが次の一手で対処する**(recoverable: false のみ打ち切り)
 
 ### 3.5 Tool は 6 つ(メインエージェントから見た契約)
@@ -155,7 +155,7 @@ flowchart TD
 
 ### 3.6 レコメンド SA(`recommend_agent.py`)
 
-`instruction` + プロフィール + **語彙(生タグ 80 語・mobility enum — この SA のプロンプトにだけ載る)** → guided 判定 1 回で `done{filter, assumptions}` または `ask_user`。質問した場合は回答で `update_profile` を回し、**質問文 + 回答を含めて再判定**(質問は 1 回まで = A7)。`done` 後は**既存の推薦処理そのまま**(ハードフィルタ → スコアリング → provisional → リランク → final)。filter の不正要素は**要素単位で落として報告**し、全滅しても filter なしで実行する(0 件破棄が起きない)。
+`instruction` + プロフィール + **語彙(生タグ 80 語・mobility enum — この SA のプロンプトにだけ載る)** → guided 判定で `done{filter, assumptions}` または `ask_user`。質問した場合は回答で `update_profile` を回し、**質問文 + 回答を含めて再判定**する act 反復(不明な選好スロット interests → party → mobility を R4 の枠内で順に聞く。旧「1 回まで」は 2026-08-06 廃止 — ADR-0024。ガード拒否は理由を次周プロンプトへ返し、同一スロット 2 度拒否・タイムアウトで打ち切り。反復上限 = R4+2)。`done` 後は**既存の推薦処理そのまま**(ハードフィルタ → スコアリング → provisional → リランク → final)。filter の不正要素は**要素単位で落として報告**し、全滅しても filter なしで実行する(0 件破棄が起きない)。
 
 ### 3.7 旅程計画 SA(`itinerary_subagent.py` — 完全ワークフロー)
 
@@ -179,7 +179,7 @@ sequenceDiagram
   participant U as ユーザー（UI）
   participant P as ターン（SSE 開きっぱなし）
   participant AG as エージェント（メイン or SA）
-  AG->>AG: act が ask_user を選ぶ（ガード R4/A1〜A7 検査）
+  AG->>AG: act が ask_user を選ぶ（ガード R4/A1/A3〜A7 + ask_timed_out 検査）
   AG->>P: ①レジストリに waiter 登録
   P-->>U: ②state: ask_user / clarify（専用フォーム）
   P->>P: ③pending_ask を別トランザクションで即時書込（リロード復元用）
@@ -200,8 +200,8 @@ sequenceDiagram
 
 | 系 | 規則 | 実装 |
 | --- | --- | --- |
-| R1〜R4 | 手数 8(実行手のみ数える)/ 予算 70·85% / 同一手反復拒否 / 質問 2 回・超過でスキーマから除外 | `main_agent.py` |
-| A1〜A7 | 同一スロット・同一曖昧さの再質問禁止 / 連続質問ターン 2 まで / options 2〜4(guided + 検査)/ 具体値に解決できない質問は落とす / **A6: clarify は surface が一意に解決できるなら聞かない・preference は既知スロットを聞かない**(コード判定)/ 推薦 SA は質問 1 回まで | `guards.py` の `evaluate_ask_user` |
+| R1〜R4 | 手数 8(done・ask_user を除く実行手)/ 予算 70·85% / 同一手反復拒否 / 質問 6 回(安全弁)・超過とタイムアウト後(`ask_timed_out`。`execute_ask_user` の実行時バックストップ併設)でスキーマから除外 | `main_agent.py` / `ask_execution.py` |
+| A1〜A7 | 同一スロット・同一曖昧さの再質問禁止(A1 の永続は選好スロットのみ。dates/origin はターン内)/ **A2 は廃止(2026-08-06、ADR-0024)** / options 2〜4(guided + 検査)/ 具体値に解決できない質問は落とす / **A6: clarify は surface が一意に解決できるなら聞かない・preference は既知スロットを聞かない**(コード判定)/ A7: 解決不能な選択肢の送出前除去 | `guards.py` の `evaluate_ask_user` / `filter_unresolvable_ask_user_options` |
 | C 系 | クローズドワールド(名寄せ照合・respond の未提示 POI 検査 — 軌跡テキストに出た名前は許可)/ Web を spot 供給源にしない / 地理計算はコード / 部分不正は要素単位で落として必ず報告 / ToolError は結果で差し戻す | `name_resolution.py` / `respond.py` / 各 SA |
 
 ### 3.11 状態はどこにあるか
@@ -210,7 +210,7 @@ sequenceDiagram
 | --- | --- | --- |
 | 寿命 | 1 ターンの中だけ(HITL 待機を含む) | ターンをまたぐ。**DB のみ** |
 
-スレッド状態の実列(models.py 照合済み): `presented_spot_ids` / `last_candidates` / `asked_slots` / `ask_streak` / `pending_ask`(表示中の質問のみ)/ `resolved_ambiguities` / `pending_constraints`(旅程なし edit 失敗時の退避)/ **`history_summary`** / **`summarized_until_message_id`**(migration 0004)。`pending_turn` という列は**存在しない**(HITL 化で不要)。
+スレッド状態の実列(models.py 照合済み): `presented_spot_ids` / `last_candidates` / `asked_slots`(永続は選好スロットのみ。`ask_streak` は migration 0005 で廃止)/ `pending_ask`(表示中の質問のみ)/ `resolved_ambiguities` / `pending_constraints`(旅程なし edit 失敗時の退避)/ **`history_summary`** / **`summarized_until_message_id`**(migration 0004)。`pending_turn` という列は**存在しない**(HITL 化で不要)。
 
 ### 3.12 SSE(api/schemas/chat.py 照合済み)
 
@@ -264,7 +264,7 @@ sequenceDiagram
 | --- | --- | --- |
 | 1 | **`update_profile` は guided decoding 失敗時に非 guided テキスト指示へフォールバックする**(設計 §2 は guided のみを想定)。原因は vLLM/xgrammar の既知不具合(**配列要素内の number フィールド直後に空白トークンを無限出力**。実機再現済み) | 実装が正。設計へ footnote 推奨。関連の監視項目は [25_known_issues.md](25_known_issues.md) |
 | 2 | ask レジストリのキーが `user_id`(設計 §7 は「スレッド id」) | 1 ユーザー 1 スレッドの UNIQUE 制約により等価。許容 |
-| 3 | レコメンド SA の質問後は「回答つき再判定 1 回」で、汎用の act 反復ループではない | 設計 §4 の図(質問 1 回まで)の最小実装。許容 |
+| 3 | レコメンド SA は複数質問の act 反復ループ(2026-08-06、ADR-0024 で「1 回まで」を廃止し拡張) | 設計 §4 どおり。解消 |
 | 4 | `messages.meta` に `presented` と並んで旧互換フィールド(`candidate_spot_ids` 等)が残る | 契約([data_model.md §4.4](30_design/data_model.md))は `presented` が正。互換値は同期して書かれる。許容 |
 | 5 | `pending_constraints` への保存経路は「旅程なしで `edit_itinerary` が失敗したときの退避」のみ | ReAct 化で制約は常に Tool 引数として来るため、これが到達可能な唯一の経路。設計 §5 の「一時保持」の実装形として許容 |
 

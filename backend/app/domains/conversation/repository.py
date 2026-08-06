@@ -30,7 +30,24 @@ from app.domains.conversation.state import (
     SpotFact,
     TurnState,
 )
+from app.domains.conversation.types import Slot
 from app.domains.itinerary.types import Itinerary
+
+# A1 の永続範囲(2026-08-06 レビュー是正 M-3、ADR-0024): `asked_slots` に
+# スレッド生涯で永続するのは選好スロットだけ。`dates`/`origin` は旅程ごとに
+# 変わる情報なので、次ターンへ持ち越すと「別の日程でもう一本」で日付を
+# 二度と聞けなくなる(本 ADR が禁じた仮定進行に逆戻りする)。ターン内での
+# 同一ターン再質問防止(A1)は `state.asked_slots`(メモリ上)がそのまま
+# 担うため、`evaluate_ask_user` 側の変更は不要。
+_PERSISTENT_ASK_SLOTS = frozenset(
+    {
+        Slot.ONBOARDING.value,
+        Slot.PARTY.value,
+        Slot.MOBILITY.value,
+        Slot.PACE.value,
+        Slot.INTERESTS.value,
+    }
+)
 
 
 class ConversationRepository:
@@ -105,7 +122,6 @@ class ConversationRepository:
             last_candidates=_candidate_references(thread.last_candidates, spots),
             presented_spot_ids=list(thread.presented_spot_ids),
             asked_slots=list(thread.asked_slots),
-            ask_streak=int(thread.ask_streak),
             pending_ask=(
                 deepcopy(dict(thread.pending_ask))
                 if thread.pending_ask
@@ -270,12 +286,16 @@ class ConversationRepository:
         thread.last_candidates = [
             value.model_dump(mode="json") for value in state.last_candidates
         ]
-        # A1: 質問済み slot。A5: 同じ曖昧さを 2 回聞かない。
-        thread.asked_slots = list(dict.fromkeys(state.asked_slots))
+        # A1: 質問済み slot。永続するのは選好スロットのみ(2026-08-06
+        # レビュー是正 M-3、ADR-0024)。`dates`/`origin` はこのターンの
+        # `state.asked_slots`(メモリ上)でだけ照合され、次ターンには
+        # 持ち越さない。A5: 同じ曖昧さを 2 回聞かない。
+        thread.asked_slots = list(
+            dict.fromkeys(
+                slot for slot in state.asked_slots if slot in _PERSISTENT_ASK_SLOTS
+            )
+        )
         thread.resolved_ambiguities = list(state.resolved_ambiguities)
-        # A2: 質問を含むターンの連続は 2 ターンまで。このターンで 1 回でも
-        # 質問できていれば streak を伸ばし、無ければリセットする。
-        thread.ask_streak = state.ask_streak + 1 if state.ask_user_count > 0 else 0
         # `pending_ask` はターンの処理が回答を待っている間だけの表示状態
         # (§7)。`ToolAdapters.ask_user` が別トランザクションで即時
         # 書き込み/クリア済みなので、ここでは念のため NULL を保証するだけ。

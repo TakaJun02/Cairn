@@ -360,16 +360,16 @@ async def test_search_knowledge_then_done_completes_in_two_turns() -> None:
 
 
 async def test_search_knowledge_omits_ask_callback_when_r4_budget_already_exhausted() -> None:
-    """裁定16(2026-08-04レビュー是正): R4(メイン・SA合算で1ターン2回まで)に
+    """裁定16(2026-08-04レビュー是正・2026-08-06 R4=6 に改訂、ADR-0024): R4
 
-    既に到達していれば、知識検索 SA へは `ask_callback` 自体を渡さない。
-    `KnowledgeSearchAgent._available_tools` は `ask_callback is None` のとき
-    `ask_user` を guided schema の enum から外すため、narration 側へ
-    カウンタを持ち込まずに同じ効果が得られる。
+    (メイン・SA合算で1ターン6回まで)に既に到達していれば、知識検索 SA へは
+    `ask_callback` 自体を渡さない。`KnowledgeSearchAgent._available_tools` は
+    `ask_callback is None` のとき `ask_user` を guided schema の enum から
+    外すため、narration 側へカウンタを持ち込まずに同じ効果が得られる。
     """
 
     state = _state()
-    state.ask_user_count = 2  # 既に上限に到達済み。
+    state.ask_user_count = 6  # 既に上限に到達済み。
     tools = FakeTools()
     tools.search_queue = [_search_result()]
     client = ScriptedMainAgentClient(
@@ -977,35 +977,37 @@ async def test_ask_user_guard_rejection_reports_reason_and_continues() -> None:
     assert state.ask_user_count == 0
 
 
-async def test_ask_user_r4_limit_removes_ask_user_from_schema_after_two_questions() -> None:
-    """R4: 1 ターンに ask_user は 2 回まで。3 周目のスキーマから外れる。"""
+async def test_ask_user_r4_limit_removes_ask_user_from_schema_after_six_questions() -> None:
+    """R4: 1 ターンに ask_user は 6 回まで(2026-08-06 改訂、ADR-0024)。
+
+    6 回目までは受理され、7 周目のスキーマから `ask_user` が外れる。
+    """
 
     state = _state()
     tools = FakeTools()
-    tools.ask_queue = [
-        _ask_result(answer="30分程度なら"),
-        _ask_result(answer="家族です"),
-    ]
-    client = ScriptedMainAgentClient(
-        [
+    # A1/A6 に触れないよう、質問ごとに異なる slot を使う(slot_values() の
+    # 7 語彙のうち 6 つ)。redecision は毎回 profile_delta=None(差分なし)
+    # を返すため、A6(既知の slot は聞かない)には一切引っかからない。
+    slots = ["party", "mobility", "pace", "interests", "dates", "origin"]
+    assert len(slots) == 6
+    tools.ask_queue = [_ask_result(answer=f"回答{index}") for index in range(1, 7)]
+
+    responses: list[str] = []
+    for index, slot in enumerate(slots, start=1):
+        responses.append(
             _turn_json(
                 "ask_user",
-                _ask_user_action(kind="preference", slot="mobility", reason="歩けますか"),
-            ),
-            _update_profile_json(),
-            _turn_json(
-                "ask_user",
-                _ask_user_action(kind="preference", slot="party", reason="どなたと"),
-            ),
-            _update_profile_json(),
-            _turn_json("done", {}),
-        ]
-    )
+                _ask_user_action(kind="preference", slot=slot, reason=f"質問{index}"),
+            )
+        )
+        responses.append(_update_profile_json())
+    responses.append(_turn_json("done", {}))
+    client = ScriptedMainAgentClient(responses)
 
     await run_main_agent(state, tools=tools, client=client)
 
-    assert state.ask_user_count == 2
-    assert state.main_agent_turns == 3  # ①ask_user ②ask_user ③done
+    assert state.ask_user_count == 6
+    assert state.main_agent_turns == 7  # ①〜⑥ ask_user ⑦done
 
     # client.calls には update_profile 再実行分も混ざるので、
     # メインループ自身の周(schema に "action" プロパティを持つ)だけを拾う。
@@ -1014,15 +1016,233 @@ async def test_ask_user_r4_limit_removes_ask_user_from_schema_after_two_question
         for call in client.calls
         if "action" in call["extra_body"]["response_format"]["json_schema"]["schema"]["properties"]
     ]
-    assert len(main_loop_schemas) == 3
-    third_schema = main_loop_schemas[2]
-    third_tools = [
+    assert len(main_loop_schemas) == 7
+    seventh_schema = main_loop_schemas[6]
+    seventh_tools = [
         branch["properties"]["tool"]["enum"][0]
-        for branch in third_schema["properties"]["action"]["anyOf"]
+        for branch in seventh_schema["properties"]["action"]["anyOf"]
     ]
-    assert "ask_user" not in third_tools
+    assert "ask_user" not in seventh_tools
     first_tools = [
         branch["properties"]["tool"]["enum"][0]
         for branch in main_loop_schemas[0]["properties"]["action"]["anyOf"]
     ]
     assert "ask_user" in first_tools
+    # R1(2026-08-06 改訂、ADR-0024): ask_user は手数上限から除外されるため、
+    # 6 回質問しても executed_tool_count は増えない。
+    assert state.executed_tool_count == 0
+
+
+async def test_r1_step_budget_excludes_ask_user_from_executed_count() -> None:
+    """R1(§3.5・§10、2026-08-06 改訂、ADR-0024): 手数上限は ask_user を数えない。
+
+    質問を複数回挟んでも `executed_count` は search_knowledge 等の実行手
+    だけを数え、質問後も MAX_EXECUTED_STEPS(8)回の実行手を使い切れる
+    (質問がループ予算を食って recommend/plan ができなくなる逆転を防ぐ)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    ask_slots = ["party", "mobility", "pace"]
+    tools.ask_queue = [_ask_result(answer=f"回答{index}") for index in range(1, len(ask_slots) + 1)]
+    tools.search_queue = [_search_result(index) for index in range(1, MAX_EXECUTED_STEPS + 1)]
+
+    responses: list[str] = []
+    for index, slot in enumerate(ask_slots, start=1):
+        responses.append(
+            _turn_json(
+                "ask_user",
+                _ask_user_action(kind="preference", slot=slot, reason=f"質問{index}"),
+            )
+        )
+        responses.append(_update_profile_json())
+    for index in range(1, MAX_EXECUTED_STEPS + 1):
+        responses.append(
+            _turn_json("search_knowledge", {"request": f"由来{index}", "spot_name": None})
+        )
+    responses.append(_turn_json("done", {}))
+    client = ScriptedMainAgentClient(responses)
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert state.ask_user_count == len(ask_slots)
+    assert state.executed_tool_count == MAX_EXECUTED_STEPS
+    assert (
+        len([call for call in tools.calls if call[0] == "search_knowledge"])
+        == MAX_EXECUTED_STEPS
+    )
+    assert len([call for call in tools.calls if call[0] == "ask_user"]) == len(ask_slots)
+
+
+async def test_ask_user_timeout_disables_ask_user_for_rest_of_turn() -> None:
+    """H-1(2026-08-06 レビュー是正、ADR-0024): タイムアウトが起きたら
+
+    `state.ask_timed_out` が立ち、以後このターンはメインの schema からも
+    `ask_user` が外れる(SA と共通の `TurnState` フラグ)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    tools.ask_queue = [
+        ToolResult(
+            step_id=1,
+            tool=ToolName.ASK_USER,
+            data={
+                "answer": "(タイムアウトのため回答がありませんでした)",
+                "answered_by": "timeout",
+            },
+        )
+    ]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json(
+                "ask_user",
+                _ask_user_action(kind="preference", slot="mobility", reason="どのくらい歩けますか"),
+            ),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert state.ask_timed_out is True
+    assert [call[0] for call in tools.calls] == ["ask_user"]
+    assert state.main_agent_turns == 2
+    second_schema = client.calls[1]["extra_body"]["response_format"]["json_schema"]["schema"]
+    second_tools = [
+        branch["properties"]["tool"]["enum"][0]
+        for branch in second_schema["properties"]["action"]["anyOf"]
+    ]
+    assert "ask_user" not in second_tools
+
+
+async def test_knowledge_search_ask_callback_backstop_after_timeout() -> None:
+    """H-1 残穴の統合確認(2026-08-06 レビュー是正、ADR-0024)。
+
+    知識検索 SA は自身の内部ループの中で `ask_callback` を複数回呼びうる
+    (`ask_callback is not None` かどうかの可否判定はターン開始時に固定され、
+    `state.ask_timed_out` の変化を見ない)。1 回目がタイムアウトしたら
+    `state.ask_timed_out` が立ち、同一 `search_knowledge` 呼び出し内で渡さ
+    れた**同じ** `ask_callback` への 2 回目の呼び出しは
+    `execute_ask_user` 冒頭のバックストップ(guard_rule="H1")で弾かれ、
+    実際の `tools.ask_user`(HITL 待ち受け)は 1 回しか呼ばれない。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    tools.ask_queue = [
+        ToolResult(
+            step_id=1,
+            tool=ToolName.ASK_USER,
+            data={
+                "answer": "(タイムアウトのため回答がありませんでした)",
+                "answered_by": "timeout",
+            },
+        )
+    ]
+    tools.search_queue = [_search_result()]
+    client = ScriptedMainAgentClient(
+        [
+            _turn_json("search_knowledge", {"request": "由来を教えて", "spot_name": None}),
+            _turn_json("done", {}),
+        ]
+    )
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    search_call = next(call for call in tools.calls if call[0] == "search_knowledge")
+    ask_callback = search_call[1]["ask_callback"]
+    assert ask_callback is not None
+    assert state.ask_timed_out is False  # まだ 1 度も呼ばれていない
+
+    def _clarify_kwargs(reason: str) -> dict[str, Any]:
+        return {
+            "kind": "clarify",
+            "surface": "どちらの池",
+            "reason": reason,
+            "options": [
+                {"label": "鶴間池", "value": "鶴間池"},
+                {"label": "元滝伏流水", "value": "元滝伏流水"},
+            ],
+        }
+
+    # 知識検索 SA の内部ループが 1 回目に ask_user を選んだと仮定する
+    # (同じ `ask_callback` を直接呼ぶ)。
+    first_observation = await ask_callback(**_clarify_kwargs("候補が複数あります"))
+    assert "未回答" in first_observation
+    assert state.ask_timed_out is True
+
+    # 内部ループが同一 search_knowledge 呼び出し内で 2 回目の ask_user を
+    # 選んでも、バックストップで弾かれ HITL 待ち受けは発生しない
+    # (`tools.ask_queue` は既に空なので、弾かれなければ FakeTools.ask_user
+    # の AssertionError で検出される)。
+    second_observation = await ask_callback(**_clarify_kwargs("念のためもう一度"))
+    assert "タイムアウト済み" in second_observation
+    assert [call[0] for call in tools.calls].count("ask_user") == 1
+
+
+async def test_r4_budget_shared_between_main_and_recommend_subagent() -> None:
+    """R4 会計はメイン・SA 合算(2026-08-06、ADR-0024 の回帰確認)。
+
+    メインが 5 問使った後の `recommend` では、レコメンド SA は残り 1 問
+    だけ聞ける(6 問目で R4 に到達し、SA の 2 周目は done のみに縮小する)。
+    """
+
+    state = _state()
+    tools = FakeTools()
+    main_slots = ["onboarding", "dates", "origin", "pace", "interests"]
+    tools.ask_queue = [
+        _ask_result(answer=f"回答{index}") for index in range(1, len(main_slots) + 2)
+    ]
+    tools.recommend_queue = [_recommend_result()]
+
+    responses: list[str] = []
+    for index, slot in enumerate(main_slots, start=1):
+        responses.append(
+            _turn_json(
+                "ask_user",
+                _ask_user_action(kind="preference", slot=slot, reason=f"質問{index}"),
+            )
+        )
+        responses.append(_update_profile_json())
+    responses.append(_turn_json("recommend", {"instruction": "おすすめを教えて"}))
+    # SA 内 1 問目(party。main は使っていないので A1 に触れない)は許可され
+    # 成功する。回答後の update_profile 再実行を挟み、2 周目は
+    # ask_user_count が R4(=6)に達しているため done のみのスキーマになる。
+    responses.append(
+        json.dumps(
+            {
+                "thought": "同行者が不明なので聞く",
+                "action": {
+                    "tool": "ask_user",
+                    "args": {
+                        "slot": "party",
+                        "reason": "どなたと行かれますか",
+                        "options": [
+                            {"label": "家族", "value": "family_kids"},
+                            {"label": "一人", "value": "solo"},
+                        ],
+                    },
+                },
+            },
+            ensure_ascii=False,
+        )
+    )
+    responses.append(_update_profile_json())
+    responses.append(_recommend_act_json(filter={"tags": ["温泉"]}))
+    responses.append(_turn_json("done", {}))
+    client = ScriptedMainAgentClient(responses)
+
+    await run_main_agent(state, tools=tools, client=client)
+
+    assert state.ask_user_count == len(main_slots) + 1  # 6 = R4 の上限
+    recommend_call = next(call for call in tools.calls if call[0] == "recommend")
+    assert recommend_call[1]["args"].filter == {"tags": ["温泉"]}
+    ask_calls = [call for call in tools.calls if call[0] == "ask_user"]
+    assert len(ask_calls) == len(main_slots) + 1  # 5(メイン) + 1(SA)
+    # main_agent_turns: メインの 5 質問 + recommend + done = 7 周
+    # (SA 内部の周・update_profile の再実行は含まない)。
+    assert state.main_agent_turns == len(main_slots) + 2
+    # ask_user は R1 の手数から除外される(2026-08-06 改訂)ので、
+    # 実行手数は recommend の 1 回だけ。
+    assert state.executed_tool_count == 1

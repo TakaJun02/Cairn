@@ -34,6 +34,13 @@ const {
 const isControlsMenuOpen = ref(false)
 provide('navControlsMenuOpen', isControlsMenuOpen)
 
+// frontend_design_system.md §8.3.1-7: ⋯ ボタンの状態ドット(ライブ同期が
+// 接続 / パック取得中 / LoRa 接続 のいずれかが真のとき)。判定は
+// NavView.vue が持つ状態から行うため、同じ provide/inject の型で共有する
+// (この ref は NavView.vue 側が書き込む)。
+const isMapStatusActive = ref(false)
+provide('navMapStatusActive', isMapStatusActive)
+
 function handleClose() {
   isControlsMenuOpen.value = false
   toggleNavWindow?.()
@@ -83,12 +90,13 @@ function handleMenuToggle() {
         <div class="ml-auto flex shrink-0 items-center gap-0.5">
           <button
             type="button"
-            class="flex h-11 w-11 shrink-0 items-center justify-center rounded-ui-sm text-text-dim transition-colors duration-fast hover:bg-fill-hover hover:text-text"
+            class="relative flex h-11 w-11 shrink-0 items-center justify-center rounded-ui-sm text-text-dim transition-colors duration-fast hover:bg-fill-hover hover:text-text"
             :aria-expanded="isControlsMenuOpen"
             aria-label="メニュー"
             @click.stop="handleMenuToggle"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7" /><circle cx="12" cy="12" r="1.7" /><circle cx="19" cy="12" r="1.7" /></svg>
+            <span v-if="isMapStatusActive" class="menu-trigger-dot" aria-hidden="true"></span>
           </button>
           <button
             type="button"
@@ -127,6 +135,20 @@ function handleMenuToggle() {
   height: 1.5px;
   border-radius: 2px;
   background: currentColor;
+}
+
+/* frontend_design_system.md §8.3.1-7: ⋯ ボタンの状態ドット。中身は開かな
+   くても「何か動いている」ことだけ分かればよい(無限アニメーションは
+   持たせない。P6)。 */
+.menu-trigger-dot {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  background: var(--color-signal);
+  box-shadow: 0 0 0 2px var(--color-raised);
 }
 
 .nav-window {

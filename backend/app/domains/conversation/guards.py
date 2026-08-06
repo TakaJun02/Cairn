@@ -7,9 +7,10 @@
 - `validate_response_spot_names`: `respond` のクローズドワールド検査
 - `find_forbidden_internal_terms`: `respond` の内部語・自己言及の事後検査
   (層 1 の安全網。`Docs/30_design/dialogue_style.md` §3 論点 E・§4)
-- `evaluate_ask_user`(R4・A1〜A6): `ask_user` の HITL 抑制ガード。
+- `evaluate_ask_user`(R4・A1・A3〜A6): `ask_user` の質の規律ガード。
   `ask_execution.execute_ask_user` がメイン・レコメンド SA・知識検索 SA の
-  3 経路共通で呼ぶ(§7・§10)
+  3 経路共通で呼ぶ(§7・§10)。旧 A2(質問ターンの連続制限)は
+  2026-08-06 に廃止した([ADR-0024](../../../../Docs/adr/0024-ask-user-proactive-hitl.md))
 - `filter_unresolvable_ask_user_options`(A7): `ask_user` の選択肢を送出前に
   名寄せし、解決できない選択肢だけを除去する。`tool_adapters.ToolAdapters
   .ask_user` が「送出」の直前(SSE イベント・`pending_ask` 書き込みより前)
@@ -33,10 +34,9 @@ from app.domains.conversation.types import (
 from app.domains.itinerary.predicates import normalize_constraints
 from app.domains.recommendation.types import PreferenceKey
 
-# R4: `ask_user` は 1 ターン 2 回まで(メイン・SA 合算。§3.5・§10)。
-MAX_ASK_USER_PER_TURN = 2
-# A2: 質問を含むターンの連続は 2 ターンまで。
-MAX_ASK_STREAK = 2
+# R4: `ask_user` は 1 ターン 6 回まで(メイン・SA 合算。§3.5・§10)。
+# UX 目標値ではなく暴走時の安全弁(2026-08-06 改訂、ADR-0024)。
+MAX_ASK_USER_PER_TURN = 6
 
 
 def has_repeated_ngram(
@@ -250,19 +250,20 @@ def evaluate_ask_user(
     question: AskUserArgs,
     *,
     ask_user_count: int,
-    ask_streak: int,
     asked_slots: Sequence[str],
     resolved_ambiguities: Sequence[object] = (),
     allowed_spot_ids: set[str] | None = None,
     existing_spot_ids: set[str] | None = None,
     profile: ProfileState | None = None,
 ) -> GuardResult:
-    """`ask_user` の抑制ガード(§10 R4・A1〜A6)。
+    """`ask_user` の質の規律ガード(§10 R4・A1・A3〜A6)。
 
     メイン(`main_agent.py`)・レコメンド SA(`recommend_agent.py`)・知識検索 SA
     (`narration/search/agent.py` の ask コールバック経由)の 3 経路すべてが
     `ask_execution.execute_ask_user` を通じて本関数を呼ぶ。カウンタ
-    (`ask_user_count`/`ask_streak`)はターン全体で合算する(R4・A2)。
+    (`ask_user_count`)はターン全体で合算する(R4)。旧 A2(質問を含む
+    ターンの連続制限)は 2026-08-06 に廃止した(ADR-0024): 不明なものが
+    残っていれば次のターンでも聞いてよい。
 
     `allowed_spot_ids`/`existing_spot_ids` を渡したときだけ A4(clarify の
     選択肢が実在 spot_id に解決できるか)を検査する。呼び出し元が spot_id
@@ -276,10 +277,10 @@ def evaluate_ask_user(
 
     if ask_user_count >= MAX_ASK_USER_PER_TURN:
         return GuardResult(
-            False, "R4", "このターンで質問できる回数の上限(2回)に達しました"
+            False,
+            "R4",
+            f"このターンで質問できる回数の上限({MAX_ASK_USER_PER_TURN}回)に達しました",
         )
-    if ask_streak >= MAX_ASK_STREAK:
-        return GuardResult(False, "A2", "質問を含むターンが連続しています")
     if (
         question.kind == "preference"
         and question.slot is not None

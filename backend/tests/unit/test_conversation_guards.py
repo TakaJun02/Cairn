@@ -123,29 +123,31 @@ def test_validate_response_spot_names_rejects_unpresented_names() -> None:
     assert rejected.rule == "closed_world_response"
 
 
-def test_r4_and_a1_a2_a3_reject_preference_questions() -> None:
+def test_r4_and_a1_a3_reject_preference_questions() -> None:
+    """R4=6(2026-08-06改訂、ADR-0024)。旧 A2(質問ターンの連続制限)は廃止済み。"""
+
     base = AskUserArgs.model_validate(_preference_args())
 
     assert evaluate_ask_user(
-        base, ask_user_count=2, ask_streak=0, asked_slots=[]
+        base, ask_user_count=6, asked_slots=[]
     ).rule == "R4"
     assert evaluate_ask_user(
-        base, ask_user_count=0, ask_streak=2, asked_slots=[]
-    ).rule == "A2"
-    assert evaluate_ask_user(
-        base, ask_user_count=0, ask_streak=0, asked_slots=["pace"]
+        base, ask_user_count=0, asked_slots=["pace"]
     ).rule == "A1"
     one_option = _preference_args()
     one_option["options"] = [{"label": "1つだけ", "value": "one"}]
     assert evaluate_ask_user(
         AskUserArgs.model_validate(one_option),
         ask_user_count=0,
-        ask_streak=0,
         asked_slots=[],
     ).rule == "A3"
     # 通常時は受理される。
     assert evaluate_ask_user(
-        base, ask_user_count=0, ask_streak=0, asked_slots=[]
+        base, ask_user_count=0, asked_slots=[]
+    ).accepted is True
+    # 5 回目までは受理される(R4=6)。
+    assert evaluate_ask_user(
+        base, ask_user_count=5, asked_slots=[]
     ).accepted is True
 
 
@@ -157,7 +159,7 @@ def test_a6_rejects_preference_question_when_profile_already_has_the_slot() -> N
     常に許可する。
     """
 
-    common = {"ask_user_count": 0, "ask_streak": 0, "asked_slots": []}
+    common = {"ask_user_count": 0, "asked_slots": []}
 
     mobility_known = ProfileState(mobility="short_walk_ok")
     assert evaluate_ask_user(
@@ -223,7 +225,7 @@ def _clarification(*, invalid_value: str | None = None) -> AskUserArgs:
 
 def test_a4_and_a5_apply_to_clarify_only() -> None:
     existing = {"spot_001", "spot_002", "spot_003", "spot_004", "spot_005"}
-    common = {"ask_user_count": 0, "ask_streak": 0, "asked_slots": []}
+    common = {"ask_user_count": 0, "asked_slots": []}
 
     assert evaluate_ask_user(
         _clarification(invalid_value="spot_999"),

@@ -61,7 +61,6 @@ async def load_context(
         last_candidates=snapshot.last_candidates,
         presented_spot_ids=snapshot.presented_spot_ids,
         asked_slots=snapshot.asked_slots,
-        ask_streak=snapshot.ask_streak,
         resolved_ambiguities=snapshot.resolved_ambiguities,
         pending_constraints=snapshot.pending_constraints,
         realtime=snapshot.realtime,

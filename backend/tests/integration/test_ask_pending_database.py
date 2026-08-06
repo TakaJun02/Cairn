@@ -54,7 +54,7 @@ async def test_write_pending_ask_now_commits_independently_of_the_caller_transac
             )
             assert main_thread is not None
             # 未コミットの変更をこの session に持たせる(pending_ask 以外の列)。
-            main_thread.ask_streak = 1
+            main_thread.asked_slots = ["pace"]
 
             pending = {
                 "kind": "clarify",

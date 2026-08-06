@@ -49,7 +49,6 @@ from app.domains.conversation.events import (
     state_event,
 )
 from app.domains.conversation.guards import (
-    MAX_ASK_STREAK,
     MAX_ASK_USER_PER_TURN,
     has_repeated_ngram,
 )
@@ -92,7 +91,7 @@ logger = logging.getLogger("app.conversation.main_agent")
 MAX_MODEL_LEN = 16_384
 SOFT_BUDGET_TOKENS = round(MAX_MODEL_LEN * 0.70)
 HARD_BUDGET_TOKENS = round(MAX_MODEL_LEN * 0.85)
-# R1: 手数上限 8(done を除く実行手)。
+# R1: 手数上限 8(done・ask_user を除く実行手。2026-08-06 改訂、ADR-0024)。
 MAX_EXECUTED_STEPS = 8
 # 安全弁。仕様外だが、モックや異常な LLM 応答でループが無限に回るのを防ぐ。
 MAX_LOOP_ITERATIONS = 20
@@ -186,12 +185,11 @@ async def run_main_agent(
             reduced = True
             messages = build_main_agent_messages(state, reduced=True)
 
-        # R4/A2(§10): 上限に達した周は ask_user をスキーマから外す(縮小
+        # R4(§10): 上限に達した周は ask_user をスキーマから外す(縮小
         # スキーマではなく、6 分岐のうち ask_user だけを外した 5 分岐)。
-        allow_ask = (
-            state.ask_user_count < MAX_ASK_USER_PER_TURN
-            and state.ask_streak < MAX_ASK_STREAK
-        )
+        # `ask_timed_out`(2026-08-06 レビュー是正 H-1、ADR-0024): §7 の
+        # タイムアウトが 1 度でも起きたら、以後このターンでは聞かない。
+        allow_ask = state.ask_user_count < MAX_ASK_USER_PER_TURN and not state.ask_timed_out
         schema = (
             main_agent_done_only_schema()
             if reduced
@@ -296,11 +294,13 @@ async def run_main_agent(
                 error=error_payload,
             )
         )
-        # R1(§3.5・§10): 手数上限は「実行された手」だけを数える
-        # (2026-08-04、レビュー是正・裁定18)。`ask_user` がガード
-        # (R4/A1〜A6)で実行されなかった場合は、選ばれただけで実際には
-        # 何も起きていないので加算しない。
-        if executed:
+        # R1(§3.5・§10): 手数上限は done・ask_user を除く実行手だけを数える
+        # (2026-08-06 改訂、ADR-0024)。`ask_user` は実行(質問の提示)が
+        # 成功しても手数に数えない — 質問がループ予算を食って本来の仕事
+        # (recommend/plan)ができなくなる逆転を防ぐ。ガード(R4/A1〜A6)で
+        # 実行されなかった手(2026-08-04、レビュー是正・裁定18)や、args
+        # 契約違反で落ちた手も引き続き数えない。
+        if executed and tool != MainToolName.ASK_USER.value:
             executed_count += 1
         if error_payload is not None and not error_payload.get("recoverable", True):
             # stage は SSE 契約(chat_sse.md)の ErrorStage 語彙に合わせる。
@@ -611,8 +611,10 @@ async def _dispatch_search_knowledge(
     # は `ask_callback is None` のとき `ask_user` を guided schema の enum
     # から外すため、narration 側にカウンタを持ち込まずに同じ効果を得られる
     # (narration → conversation の逆依存を作らない設計を保つ)。
+    # `ask_timed_out`(2026-08-06 レビュー是正 H-1、ADR-0024)も同様に、
+    # タイムアウト後は知識検索 SA へも `ask_callback` を渡さない。
     ask_budget_available = (
-        state.ask_user_count < MAX_ASK_USER_PER_TURN and state.ask_streak < MAX_ASK_STREAK
+        state.ask_user_count < MAX_ASK_USER_PER_TURN and not state.ask_timed_out
     )
     result = await tools.search_knowledge(
         step_id=step_id,
